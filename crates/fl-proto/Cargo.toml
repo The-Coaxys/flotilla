@@ -1,0 +1,19 @@
+[package]
+name = "fl-proto"
+description = "Flotilla wire protocol: frames, messages, versions"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+bytes.workspace = true
+postcard.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tokio-util.workspace = true
+zstd.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

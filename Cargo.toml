@@ -1,0 +1,80 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/fl-proto",
+    "crates/fl-transport",
+    "crates/fl-testkit",
+    "crates/daemon/fld-server",
+    "crates/daemon/flotillad",
+    "crates/client/flc-conn",
+    "crates/client/flc-ui",
+    "crates/client/flotilla",
+]
+# gpui crates (flc-ui, flotilla) are excluded from default builds: on Linux they
+# are type-checked headless in CI; the real build happens on windows-latest.
+default-members = [
+    "crates/fl-proto",
+    "crates/fl-transport",
+    "crates/fl-testkit",
+    "crates/daemon/fld-server",
+    "crates/daemon/flotillad",
+    "crates/client/flc-conn",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+license = "LicenseRef-Proprietary"
+publish = false
+
+[workspace.dependencies]
+fl-proto = { path = "crates/fl-proto" }
+fl-transport = { path = "crates/fl-transport" }
+fl-testkit = { path = "crates/fl-testkit" }
+fld-server = { path = "crates/daemon/fld-server" }
+flc-conn = { path = "crates/client/flc-conn" }
+flc-ui = { path = "crates/client/flc-ui" }
+
+anyhow = "1"
+bytes = "1"
+clap = { version = "4.6", features = ["derive", "env"] }
+dirs = "7"
+futures = "0.3"
+getrandom = "0.3"
+hex = "0.4"
+keyring = "4.2"
+libc = "0.2"
+postcard = { version = "1.1", features = ["use-std"] }
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
+rand = "0.10"
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem", "crypto"] }
+russh = { version = "0.65", default-features = false, features = ["ring", "flate2", "rsa"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tempfile = "3"
+thiserror = "2"
+tokio = { version = "1.54", features = ["full"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+unicode-segmentation = "1.10"
+uuid = { version = "1", features = ["v4", "serde"] }
+zstd = "0.13"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+panic = "unwind"
+
+# Smaller debug binaries (the bootstrap e2e test uploads target/debug/flotillad)
+# and fast crypto/compression in tests.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+opt-level = 2

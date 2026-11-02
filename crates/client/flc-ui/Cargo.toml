@@ -1,0 +1,17 @@
+[package]
+name = "flc-ui"
+description = "Flotilla UI kit: theme tokens, fonts, text input"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+unicode-segmentation.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+gpui = "0.2.2"
+
+[target.'cfg(not(windows))'.dependencies]
+gpui = { version = "0.2.2", default-features = false }
