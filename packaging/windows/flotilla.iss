@@ -1,11 +1,12 @@
 ; Flotilla per-user installer (no admin rights required).
-; Built by CI:  ISCC /DAppVersion=0.1.0 /DSourceExe=<abs path>\flotilla.exe /O<outdir> flotilla.iss
+; Build: cargo build --release --target x86_64-pc-windows-msvc -p flotilla
+; Package: ISCC /DAppVersion=0.1.0 /DSourceExe=<abs path>\flotilla.exe /O<outdir> flotilla.iss
 
 #ifndef AppVersion
   #define AppVersion "0.0.0"
 #endif
 #ifndef SourceExe
-  #define SourceExe "..\..\target\release\flotilla.exe"
+  #define SourceExe "..\..\target\x86_64-pc-windows-msvc\release\flotilla.exe"
 #endif
 
 [Setup]

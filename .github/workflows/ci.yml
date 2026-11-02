@@ -97,17 +97,30 @@ jobs:
           path: dist/daemon
       - name: Portable tests on Windows
         run: |
-          cargo test --locked -p fl-proto -p fl-transport --lib
-          cargo test --locked -p flotilla --bins
+          cargo test --locked --target x86_64-pc-windows-msvc -p fl-proto -p fl-transport --lib
+          cargo test --locked --target x86_64-pc-windows-msvc -p flotilla --bins
       - name: Build flotilla.exe (daemons embedded)
         shell: pwsh
         env:
           FLOTILLA_EMBED_DAEMON_DIR: ${{ github.workspace }}\dist\daemon
-        run: cargo build --locked --release -p flotilla
+        run: cargo build --locked --release --target x86_64-pc-windows-msvc -p flotilla
+      - name: Verify standalone runtime imports
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          $dumpbin = Get-ChildItem "$vs\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" | Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $dumpbin) { throw "MSVC import inspector was not found" }
+          $imports = & $dumpbin.FullName /DEPENDENTS target\x86_64-pc-windows-msvc\release\flotilla.exe
+          if ($LASTEXITCODE -ne 0) { throw "dumpbin failed with $LASTEXITCODE" }
+          $imports | Tee-Object -FilePath dist\runtime-imports.txt
+          if (($imports -join "`n") -match '(?i)\b(?:vcruntime|msvcp|concrt)[\w.]*\.dll\b') {
+            throw "portable executable still requires a separately installed VC++ runtime"
+          }
       - name: Self-test release binary
         shell: pwsh
         run: |
-          $p = Start-Process -FilePath target\release\flotilla.exe -ArgumentList '--self-test=selftest.json' -Wait -PassThru
+          $p = Start-Process -FilePath target\x86_64-pc-windows-msvc\release\flotilla.exe -ArgumentList '--self-test=selftest.json' -Wait -PassThru
           if (-not (Test-Path selftest.json)) { throw "self-test did not write its report" }
           Get-Content selftest.json
           if (-not ((Get-Content selftest.json -Raw | ConvertFrom-Json).ok)) { throw "self-test report failed" }
@@ -120,9 +133,9 @@ jobs:
           $meta = cargo metadata --locked --format-version 1 --no-deps | ConvertFrom-Json
           $ver = ($meta.packages | Where-Object { $_.name -eq 'flotilla' }).version
           New-Item -ItemType Directory -Force dist | Out-Null
-          & $iscc "/DAppVersion=$ver" "/DSourceExe=$PWD\target\release\flotilla.exe" "/O$PWD\dist" packaging\windows\flotilla.iss
+          & $iscc "/DAppVersion=$ver" "/DSourceExe=$PWD\target\x86_64-pc-windows-msvc\release\flotilla.exe" "/O$PWD\dist" packaging\windows\flotilla.iss
           if ($LASTEXITCODE -ne 0) { throw "ISCC failed with $LASTEXITCODE" }
-          Copy-Item target\release\flotilla.exe dist\flotilla.exe
+          Copy-Item target\x86_64-pc-windows-msvc\release\flotilla.exe dist\flotilla.exe
           Get-ChildItem dist
       - name: Smoke per-user install, native window and uninstall
         shell: pwsh
@@ -146,6 +159,7 @@ jobs:
           path: |
             dist/ui-smoke/
             selftest.json
+            dist/runtime-imports.txt
             ~/AppData/Local/Flotilla/logs/
           if-no-files-found: warn
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

@@ -1,0 +1,4 @@
+[target.x86_64-pc-windows-msvc]
+# Keep the per-user installer and portable executable independent of VC++ redist.
+# Use an explicit --target when building so host proc-macros keep their normal CRT.
+rustflags = ["-C", "target-feature=+crt-static"]
