@@ -91,6 +91,7 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: windows
+          cache-on-failure: true
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: daemon
@@ -136,6 +137,11 @@ jobs:
           & $iscc "/DAppVersion=$ver" "/DSourceExe=$PWD\target\x86_64-pc-windows-msvc\release\flotilla.exe" "/O$PWD\dist" packaging\windows\flotilla.iss
           if ($LASTEXITCODE -ne 0) { throw "ISCC failed with $LASTEXITCODE" }
           Copy-Item target\x86_64-pc-windows-msvc\release\flotilla.exe dist\flotilla.exe
+          New-Item -ItemType Directory -Force dist\licenses | Out-Null
+          Copy-Item crates\client\flc-ui\NOTICE dist\licenses\NOTICE.txt
+          Copy-Item crates\client\flc-ui\assets\fonts\*.txt dist\licenses\
+          Copy-Item packaging\windows\Apache-2.0.txt dist\licenses\
+          Compress-Archive -Path dist\licenses -DestinationPath dist\flotilla-windows-licenses.zip
           Get-ChildItem dist
       - name: Smoke per-user install, native window and uninstall
         shell: pwsh
@@ -145,11 +151,23 @@ jobs:
           $installed = Join-Path $env:LOCALAPPDATA 'Programs\Flotilla'
           try {
             if (-not (Test-Path "$installed\flotilla.exe")) { throw "per-user executable is missing" }
+            foreach ($notice in @('NOTICE.txt', 'Apache-2.0.txt', 'Inter-LICENSE.txt', 'JetBrainsMono-OFL.txt')) {
+              if (-not (Test-Path "$installed\licenses\$notice")) { throw "installed license is missing: $notice" }
+            }
             pwsh -NoProfile -STA -File scripts/smoke_windows_ui.ps1 -Exe "$installed\flotilla.exe"
             if ($LASTEXITCODE -ne 0) { throw "installed application UI smoke failed" }
           } finally {
             $uninstaller = Start-Process "$installed\unins000.exe" -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART' -Wait -PassThru
             if ($uninstaller.ExitCode -ne 0) { throw "uninstall failed with $($uninstaller.ExitCode)" }
+          }
+      - name: Collect application logs
+        if: always()
+        shell: pwsh
+        run: |
+          $logs = Join-Path $env:LOCALAPPDATA 'Flotilla\logs'
+          if (Test-Path $logs) {
+            New-Item -ItemType Directory -Force dist\ui-smoke\logs | Out-Null
+            Copy-Item "$logs\*" dist\ui-smoke\logs\
           }
       - name: Upload Windows smoke evidence
         if: always()
@@ -160,7 +178,6 @@ jobs:
             dist/ui-smoke/
             selftest.json
             dist/runtime-imports.txt
-            ~/AppData/Local/Flotilla/logs/
           if-no-files-found: warn
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -168,6 +185,7 @@ jobs:
           path: |
             dist/Flotilla-Setup-x64.exe
             dist/flotilla.exe
+            dist/flotilla-windows-licenses.zip
           if-no-files-found: error
 
   release:
@@ -187,6 +205,7 @@ jobs:
           mkdir -p upload
           cp artifacts/flotilla-windows-x64/Flotilla-Setup-x64.exe upload/
           cp artifacts/flotilla-windows-x64/flotilla.exe upload/flotilla-x64.exe
+          cp artifacts/flotilla-windows-x64/flotilla-windows-licenses.zip upload/
           cp artifacts/daemon/flotillad-* upload/
           (cd upload && sha256sum * > SHA256SUMS.txt)
           ls -l upload
@@ -202,5 +221,5 @@ jobs:
             gh release delete nightly --yes --cleanup-tag || true
             gh release create nightly upload/* --prerelease --target "$GITHUB_SHA" \
               --title "Flotilla nightly (${GITHUB_SHA::7})" \
-              --notes "Automated build of ${GITHUB_SHA}. Install with Flotilla-Setup-x64.exe."
+              --notes "Automated build of ${GITHUB_SHA}. Install with Flotilla-Setup-x64.exe. Portable users should extract flotilla-windows-licenses.zip next to flotilla-x64.exe."
           fi

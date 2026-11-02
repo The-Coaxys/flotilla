@@ -34,6 +34,9 @@ Name: "desktopicon"; Description: "Create a &desktop shortcut"; Flags: unchecked
 
 [Files]
 Source: "{#SourceExe}"; DestDir: "{app}"; DestName: "flotilla.exe"; Flags: ignoreversion
+Source: "..\..\crates\client\flc-ui\NOTICE"; DestDir: "{app}\licenses"; DestName: "NOTICE.txt"; Flags: ignoreversion
+Source: "..\..\crates\client\flc-ui\assets\fonts\*.txt"; DestDir: "{app}\licenses"; Flags: ignoreversion
+Source: "Apache-2.0.txt"; DestDir: "{app}\licenses"; Flags: ignoreversion
 
 [Icons]
 Name: "{userprograms}\Flotilla"; Filename: "{app}\flotilla.exe"; AppUserModelID: "Coaxys.Flotilla"

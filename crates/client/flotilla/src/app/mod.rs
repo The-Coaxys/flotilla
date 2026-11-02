@@ -49,7 +49,9 @@ pub fn run(rt: tokio::runtime::Handle) {
             ..Default::default()
         };
         cx.open_window(options, |window, cx| {
-            cx.new(|cx| Workspace::new(window, cx))
+            let workspace = cx.new(|cx| Workspace::new(window, cx));
+            window.focus(&workspace.read(cx).focus);
+            workspace
         })
         .expect("cannot open the main window");
         cx.on_window_closed(|cx: &mut App| {
