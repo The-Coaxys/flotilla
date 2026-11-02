@@ -1,1 +1,179 @@
-//! Flotilla daemon core (Task 8).
+//! Flotilla daemon core: state home, device registry, control sessions, and
+//! listeners (Unix socket for SSH-forwarded peers, QUIC for direct peers).
+pub mod devices;
+pub mod identity;
+pub mod listen;
+pub mod paths;
+pub mod session;
+
+use std::io::Write;
+use std::net::SocketAddr;
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
+
+use serde::{Deserialize, Serialize};
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
+
+pub use paths::FlotillaHome;
+
+#[derive(Debug, thiserror::Error)]
+pub enum ServerError {
+    #[error("io error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("another flotillad is already serving {}", .0.display())]
+    AlreadyRunning(PathBuf),
+    #[error("corrupt state file {}: {reason}", .path.display())]
+    Corrupt { path: PathBuf, reason: String },
+    #[error("neither FLOTILLA_HOME nor HOME is set")]
+    NoHome,
+    #[error(transparent)]
+    Quic(#[from] fl_transport::quic::QuicError),
+}
+
+#[derive(Debug, Clone)]
+pub struct DaemonConfig {
+    pub home: FlotillaHome,
+    /// `None` disables QUIC.
+    pub quic_bind: Option<SocketAddr>,
+    /// How long a new connection may take to send `Hello`.
+    pub hello_timeout: Duration,
+}
+
+impl DaemonConfig {
+    pub fn new(home: FlotillaHome) -> Self {
+        Self {
+            home,
+            quic_bind: Some(SocketAddr::from(([0, 0, 0, 0], 7443))),
+            hello_timeout: Duration::from_secs(10),
+        }
+    }
+}
+
+/// Contents of `run/daemon.json` while the daemon runs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeInfo {
+    pub pid: u32,
+    pub quic_port: Option<u16>,
+    pub version: String,
+    pub build: String,
+    pub socket_path: String,
+}
+
+pub struct DaemonHandle {
+    pub socket_path: PathBuf,
+    pub quic_addr: Option<SocketAddr>,
+    pub cert_sha256: [u8; 32],
+    home: FlotillaHome,
+    cancel: CancellationToken,
+    tasks: Vec<JoinHandle<()>>,
+    quic: Option<quinn::Endpoint>,
+}
+
+/// Start listening. Fails with `AlreadyRunning` if another daemon owns the socket.
+/// A QUIC bind failure (e.g. port in use) only disables QUIC, with a warning.
+pub async fn start(config: DaemonConfig) -> Result<DaemonHandle, ServerError> {
+    let home = config.home.clone();
+    home.ensure_dirs()?;
+    let identity = identity::load_or_create(&home)?;
+    let socket_path = home.socket_path();
+    let unix = listen::bind_unix(&socket_path)?;
+    let quic = match config.quic_bind {
+        Some(bind) => match fl_transport::quic::server_endpoint(&identity, bind) {
+            Ok(ep) => Some(ep),
+            Err(e) => {
+                tracing::warn!("QUIC disabled: cannot listen on {bind}: {e}");
+                None
+            }
+        },
+        None => None,
+    };
+    let quic_addr = quic.as_ref().and_then(|ep| ep.local_addr().ok());
+    let cancel = CancellationToken::new();
+    let ctx = Arc::new(session::SessionCtx {
+        registry: Arc::new(devices::DeviceRegistry::new(home.devices_path())),
+        hello_timeout: config.hello_timeout,
+        info: session::InfoSource {
+            started: Instant::now(),
+            hostname: session::hostname(),
+            quic_port: quic_addr.map(|a| a.port()),
+            socket_path: socket_path.display().to_string(),
+        },
+        shutdown: cancel.clone(),
+    });
+    let mut tasks = vec![tokio::spawn(listen::unix_accept_loop(unix, ctx.clone()))];
+    if let Some(ep) = &quic {
+        tasks.push(tokio::spawn(listen::quic_accept_loop(
+            ep.clone(),
+            ctx.clone(),
+        )));
+    }
+    let info = RuntimeInfo {
+        pid: std::process::id(),
+        quic_port: quic_addr.map(|a| a.port()),
+        version: fl_proto::PRODUCT_VERSION.to_string(),
+        build: fl_proto::build_id().to_string(),
+        socket_path: socket_path.display().to_string(),
+    };
+    write_json_atomic(&home.runtime_info_path(), &info)?;
+    Ok(DaemonHandle {
+        socket_path,
+        quic_addr,
+        cert_sha256: identity.fingerprint(),
+        home,
+        cancel,
+        tasks,
+        quic,
+    })
+}
+
+impl DaemonHandle {
+    pub fn home(&self) -> &FlotillaHome {
+        &self.home
+    }
+
+    /// Stop accepting, end every session, remove the socket and runtime info.
+    pub async fn shutdown(mut self) {
+        self.cancel.cancel();
+        if let Some(ep) = self.quic.take() {
+            ep.close(0u32.into(), b"daemon shutting down");
+        }
+        for t in std::mem::take(&mut self.tasks) {
+            let _ = t.await;
+        }
+        let _ = std::fs::remove_file(&self.socket_path);
+        let _ = std::fs::remove_file(self.home.runtime_info_path());
+    }
+}
+
+impl Drop for DaemonHandle {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
+}
+
+pub fn read_runtime_info(home: &FlotillaHome) -> Option<RuntimeInfo> {
+    let bytes = std::fs::read(home.runtime_info_path()).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// Write JSON through a unique temp file + rename (mode 0600), so readers
+/// never observe a partially written file.
+pub(crate) fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> std::io::Result<()> {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp = path.with_extension(format!("tmp-{}-{n}", std::process::id()));
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        f.write_all(&serde_json::to_vec_pretty(value).map_err(std::io::Error::other)?)?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)
+}
