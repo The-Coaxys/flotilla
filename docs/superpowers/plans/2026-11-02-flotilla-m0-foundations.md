@@ -6270,3 +6270,1922 @@ git commit -m "feat(flc-conn): connection supervisor with QUIC/SSH race, heartbe
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
+
+---
+
+### Task 13: flotilla client core — runtime, host store, secrets, embedded daemons, self-test
+
+**Files:**
+- Modify (replace stub): `crates/client/flotilla/build.rs`, `crates/client/flotilla/src/main.rs`
+- Create: `crates/client/flotilla/src/{runtime.rs, hosts.rs, secrets.rs, embedded.rs, selftest.rs}`
+
+**Interfaces:**
+- Consumes:
+  - `flc_conn::profile::HostProfile` (Task 1)
+  - `flc_conn::bootstrap::DaemonArtifacts` (Task 10, committed by Lane B; check with `git log --oneline -- crates/client/flc-conn/src/bootstrap.rs`)
+  - `fl_proto::{PRODUCT_VERSION, build_id}`
+- Produces (crate-internal, used by Task 14):
+  - `runtime::start() -> tokio::runtime::Runtime` (2 workers, named `flotilla-io`)
+  - `hosts::HostStore`:
+    - `default_path() -> Option<PathBuf>`, which is `dirs::config_dir()/Flotilla/hosts.json` (`%APPDATA%\Flotilla\hosts.json` on Windows)
+    - `new(path)`
+    - `load() -> anyhow::Result<Vec<HostProfile>>`
+    - `save(&[HostProfile])`
+    - `upsert(HostProfile) -> Result<Vec<HostProfile>>`
+    - `remove(&str) -> Result<Vec<HostProfile>>`
+  - `secrets::{SecretStore (get/set/delete), FileStore, default_store() -> Box<dyn SecretStore>, SERVICE = "Flotilla", account(host_id) = "device-token:<host_id>"}`
+    - On Windows `default_store()` is `CredentialStore` (keyring, Windows Credential Manager).
+  - `embedded::{FLOTILLAD_X86_64, FLOTILLAD_AARCH64, artifacts() -> DaemonArtifacts, is_elf(&[u8]) -> bool}`
+  - `selftest::{report() -> Report, run(&Path) -> i32}`
+  - CLI `flotilla --self-test=<path>`: writes a JSON report; exit 0 only if both embedded daemons are ELF, the secret-store round-trip works, a config dir exists and the Tokio runtime runs.
+  - `build.rs` honours `FLOTILLA_EMBED_DAEMON_DIR`.
+
+- [ ] **Step 1: Write `build.rs`**
+
+```rust
+//! Embed the musl `flotillad` binaries from FLOTILLA_EMBED_DAEMON_DIR (set by CI).
+//! Without it, embed empty placeholders: such dev builds cannot install daemons.
+use std::path::PathBuf;
+
+const NAMES: [&str; 2] = ["flotillad-x86_64-unknown-linux-musl", "flotillad-aarch64-unknown-linux-musl"];
+
+fn main() {
+    println!("cargo:rerun-if-env-changed=FLOTILLA_EMBED_DAEMON_DIR");
+    let out = PathBuf::from(std::env::var_os("OUT_DIR").expect("cargo sets OUT_DIR"));
+    let dir = std::env::var_os("FLOTILLA_EMBED_DAEMON_DIR").map(PathBuf::from);
+    for name in NAMES {
+        let dst = out.join(name);
+        match &dir {
+            Some(dir) => {
+                let src = dir.join(name);
+                println!("cargo:rerun-if-changed={}", src.display());
+                let bytes = std::fs::read(&src).unwrap_or_else(|e| {
+                    panic!("FLOTILLA_EMBED_DAEMON_DIR is set but {} is unreadable: {e}", src.display())
+                });
+                assert!(bytes.starts_with(b"\x7fELF"), "{} is not an ELF binary", src.display());
+                std::fs::write(&dst, bytes).expect("write embedded daemon");
+            }
+            None => std::fs::write(&dst, b"").expect("write placeholder"),
+        }
+    }
+}
+```
+
+- [ ] **Step 2: Write `runtime.rs` and `embedded.rs`**
+
+`runtime.rs`:
+
+```rust
+//! The Tokio runtime that owns all networking; the UI stays on GPUI's executor.
+pub fn start() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .thread_name("flotilla-io")
+        .enable_all()
+        .build()
+        .expect("cannot start the Tokio runtime")
+}
+```
+
+`embedded.rs`:
+
+```rust
+//! Daemon binaries embedded at build time (see build.rs).
+use std::borrow::Cow;
+
+use flc_conn::bootstrap::DaemonArtifacts;
+
+pub static FLOTILLAD_X86_64: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/flotillad-x86_64-unknown-linux-musl"));
+pub static FLOTILLAD_AARCH64: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/flotillad-aarch64-unknown-linux-musl"));
+
+/// The embedded daemons report the same version/build as this client (same CI run).
+pub fn artifacts() -> DaemonArtifacts {
+    DaemonArtifacts {
+        x86_64: Cow::Borrowed(FLOTILLAD_X86_64),
+        aarch64: Cow::Borrowed(FLOTILLAD_AARCH64),
+        version: fl_proto::PRODUCT_VERSION.to_string(),
+        build: fl_proto::build_id().to_string(),
+    }
+}
+
+pub fn is_elf(bytes: &[u8]) -> bool {
+    bytes.starts_with(b"\x7fELF")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn artifacts_report_this_build() {
+        let a = artifacts();
+        assert_eq!(a.version, fl_proto::PRODUCT_VERSION);
+        assert_eq!(a.build, fl_proto::build_id());
+        assert_eq!(a.x86_64.len(), FLOTILLAD_X86_64.len());
+    }
+
+    #[test]
+    fn elf_magic() {
+        assert!(is_elf(b"\x7fELF\x02\x01"));
+        assert!(!is_elf(b""));
+        assert!(!is_elf(b"MZ\x90\x00"));
+    }
+}
+```
+
+- [ ] **Step 3: Write `hosts.rs` with its tests**
+
+```rust
+//! Saved hosts in `<config dir>/Flotilla/hosts.json` (`%APPDATA%` on Windows).
+//! A corrupt file is reported, never silently overwritten.
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result};
+use flc_conn::profile::HostProfile;
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct HostsFile {
+    version: u32,
+    hosts: Vec<HostProfile>,
+}
+
+#[derive(Debug, Clone)]
+pub struct HostStore {
+    path: PathBuf,
+}
+
+impl HostStore {
+    pub fn default_path() -> Option<PathBuf> {
+        dirs::config_dir().map(|d| d.join("Flotilla").join("hosts.json"))
+    }
+
+    pub fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn load(&self) -> Result<Vec<HostProfile>> {
+        match std::fs::read(&self.path) {
+            Ok(bytes) => {
+                let file: HostsFile = serde_json::from_slice(&bytes)
+                    .with_context(|| format!("{} is corrupt; fix or delete it", self.path.display()))?;
+                Ok(file.hosts)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(e) => Err(e).with_context(|| format!("cannot read {}", self.path.display())),
+        }
+    }
+
+    pub fn save(&self, hosts: &[HostProfile]) -> Result<()> {
+        let dir = self.path.parent().context("hosts path has no parent directory")?;
+        std::fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
+        let tmp = self.path.with_extension("json.tmp");
+        let body = serde_json::to_vec_pretty(&HostsFile { version: 1, hosts: hosts.to_vec() })?;
+        std::fs::write(&tmp, body).with_context(|| format!("cannot write {}", tmp.display()))?;
+        std::fs::rename(&tmp, &self.path).with_context(|| format!("cannot replace {}", self.path.display()))?;
+        Ok(())
+    }
+
+    /// Insert or replace (by `id`), then save. Returns the new list.
+    pub fn upsert(&self, host: HostProfile) -> Result<Vec<HostProfile>> {
+        let mut hosts = self.load()?;
+        match hosts.iter_mut().find(|h| h.id == host.id) {
+            Some(existing) => *existing = host,
+            None => hosts.push(host),
+        }
+        self.save(&hosts)?;
+        Ok(hosts)
+    }
+
+    pub fn remove(&self, id: &str) -> Result<Vec<HostProfile>> {
+        let mut hosts = self.load()?;
+        hosts.retain(|h| h.id != id);
+        self.save(&hosts)?;
+        Ok(hosts)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fl_transport::ssh::{SshAuth, SshTarget};
+
+    fn host(id: &str, name: &str) -> HostProfile {
+        HostProfile {
+            id: id.into(),
+            name: name.into(),
+            ssh: SshTarget { host: "203.0.113.7".into(), port: 22, user: "root".into() },
+            auth: SshAuth::Agent { socket: None },
+            host_key: Some("SHA256:abc".into()),
+            quic: None,
+            device_id: Some("dev".into()),
+            socket_path: Some("/root/.flotilla/run/daemon.sock".into()),
+        }
+    }
+
+    fn store() -> (tempfile::TempDir, HostStore) {
+        let dir = tempfile::tempdir().unwrap();
+        let s = HostStore::new(dir.path().join("Flotilla").join("hosts.json"));
+        (dir, s)
+    }
+
+    #[test]
+    fn missing_file_means_no_hosts() {
+        let (_d, s) = store();
+        assert!(s.load().unwrap().is_empty());
+    }
+
+    #[test]
+    fn upsert_inserts_then_replaces() {
+        let (_d, s) = store();
+        s.upsert(host("1", "a")).unwrap();
+        s.upsert(host("2", "b")).unwrap();
+        let hosts = s.upsert(host("1", "renamed")).unwrap();
+        assert_eq!(hosts.len(), 2);
+        assert_eq!(s.load().unwrap()[0].name, "renamed");
+    }
+
+    #[test]
+    fn remove_deletes_by_id() {
+        let (_d, s) = store();
+        s.upsert(host("1", "a")).unwrap();
+        s.upsert(host("2", "b")).unwrap();
+        let hosts = s.remove("1").unwrap();
+        assert_eq!(hosts.iter().map(|h| h.id.as_str()).collect::<Vec<_>>(), vec!["2"]);
+    }
+
+    #[test]
+    fn corrupt_file_is_an_error_and_left_untouched() {
+        let (_d, s) = store();
+        std::fs::create_dir_all(s.path().parent().unwrap()).unwrap();
+        std::fs::write(s.path(), b"{broken").unwrap();
+        let err = s.load().unwrap_err();
+        assert!(format!("{err:#}").contains("corrupt"));
+        assert!(s.upsert(host("1", "a")).is_err());
+        assert_eq!(std::fs::read(s.path()).unwrap(), b"{broken");
+    }
+}
+```
+
+- [ ] **Step 4: Write `secrets.rs` with its tests**
+
+```rust
+//! Device tokens. Windows: Credential Manager (service "Flotilla",
+//! account "device-token:<host id>"). Elsewhere (dev builds, tests): one
+//! private file per host.
+use std::path::PathBuf;
+
+use anyhow::{Result, ensure};
+
+pub const SERVICE: &str = "Flotilla";
+
+pub fn account(host_id: &str) -> String {
+    format!("device-token:{host_id}")
+}
+
+pub trait SecretStore: Send + Sync {
+    fn get(&self, host_id: &str) -> Result<Option<String>>;
+    fn set(&self, host_id: &str, token: &str) -> Result<()>;
+    fn delete(&self, host_id: &str) -> Result<()>;
+}
+
+#[cfg(windows)]
+pub struct CredentialStore;
+
+#[cfg(windows)]
+impl SecretStore for CredentialStore {
+    fn get(&self, host_id: &str) -> Result<Option<String>> {
+        match keyring::Entry::new(SERVICE, &account(host_id))?.get_password() {
+            Ok(token) => Ok(Some(token)),
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    fn set(&self, host_id: &str, token: &str) -> Result<()> {
+        keyring::Entry::new(SERVICE, &account(host_id))?.set_password(token)?;
+        Ok(())
+    }
+
+    fn delete(&self, host_id: &str) -> Result<()> {
+        match keyring::Entry::new(SERVICE, &account(host_id))?.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+}
+
+/// One `<host id>.token` file per host, mode 0600 on Unix.
+pub struct FileStore {
+    dir: PathBuf,
+}
+
+impl FileStore {
+    pub fn new(dir: PathBuf) -> Self {
+        Self { dir }
+    }
+
+    fn path(&self, host_id: &str) -> Result<PathBuf> {
+        ensure!(
+            !host_id.is_empty() && host_id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'),
+            "invalid host id {host_id:?}"
+        );
+        Ok(self.dir.join(format!("{host_id}.token")))
+    }
+}
+
+impl SecretStore for FileStore {
+    fn get(&self, host_id: &str) -> Result<Option<String>> {
+        match std::fs::read_to_string(self.path(host_id)?) {
+            Ok(token) => Ok(Some(token)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    fn set(&self, host_id: &str, token: &str) -> Result<()> {
+        let path = self.path(host_id)?;
+        std::fs::create_dir_all(&self.dir)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        use std::io::Write;
+        options.open(path)?.write_all(token.as_bytes())?;
+        Ok(())
+    }
+
+    fn delete(&self, host_id: &str) -> Result<()> {
+        match std::fs::remove_file(self.path(host_id)?) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+}
+
+pub fn default_store() -> Box<dyn SecretStore> {
+    #[cfg(windows)]
+    {
+        Box::new(CredentialStore)
+    }
+    #[cfg(not(windows))]
+    {
+        let dir = dirs::config_dir().unwrap_or_else(std::env::temp_dir).join("Flotilla").join("secrets");
+        Box::new(FileStore::new(dir))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn account_name_format() {
+        assert_eq!(account("abc-1"), "device-token:abc-1");
+    }
+
+    #[test]
+    fn file_store_roundtrip_and_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = FileStore::new(dir.path().join("secrets"));
+        assert_eq!(s.get("host-1").unwrap(), None);
+        s.set("host-1", "tok").unwrap();
+        assert_eq!(s.get("host-1").unwrap().as_deref(), Some("tok"));
+        s.set("host-1", "tok2").unwrap();
+        assert_eq!(s.get("host-1").unwrap().as_deref(), Some("tok2"));
+        s.delete("host-1").unwrap();
+        s.delete("host-1").unwrap();
+        assert_eq!(s.get("host-1").unwrap(), None);
+    }
+
+    #[test]
+    fn file_store_rejects_path_tricks() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = FileStore::new(dir.path().to_path_buf());
+        assert!(s.set("../evil", "x").is_err());
+        assert!(s.get("").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_store_files_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let s = FileStore::new(dir.path().to_path_buf());
+        s.set("h", "tok").unwrap();
+        let mode = std::fs::metadata(dir.path().join("h.token")).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+}
+```
+
+- [ ] **Step 5: Write `selftest.rs` with its tests**
+
+```rust
+//! `flotilla --self-test=<report.json>`: headless checks CI runs on the release binary.
+use std::path::Path;
+
+use serde::Serialize;
+
+use crate::secrets::SecretStore;
+
+#[derive(Debug, Serialize)]
+pub struct Report {
+    pub version: String,
+    pub build: String,
+    pub daemon_x86_64_bytes: usize,
+    pub daemon_aarch64_bytes: usize,
+    pub daemon_x86_64_elf: bool,
+    pub daemon_aarch64_elf: bool,
+    pub hosts_path: Option<String>,
+    pub secrets_roundtrip: bool,
+    pub tokio_runtime: bool,
+    pub errors: Vec<String>,
+    pub ok: bool,
+}
+
+pub fn report() -> Report {
+    let mut errors = Vec::new();
+    let x86 = crate::embedded::FLOTILLAD_X86_64;
+    let arm = crate::embedded::FLOTILLAD_AARCH64;
+    let (x86_elf, arm_elf) = (crate::embedded::is_elf(x86), crate::embedded::is_elf(arm));
+    if !x86_elf {
+        errors.push("embedded x86_64 daemon is missing or not an ELF binary".to_string());
+    }
+    if !arm_elf {
+        errors.push("embedded aarch64 daemon is missing or not an ELF binary".to_string());
+    }
+    let hosts_path = crate::hosts::HostStore::default_path().map(|p| p.display().to_string());
+    if hosts_path.is_none() {
+        errors.push("no per-user configuration directory".to_string());
+    }
+    let secrets_roundtrip = match secrets_roundtrip(crate::secrets::default_store().as_ref()) {
+        Ok(()) => true,
+        Err(e) => {
+            errors.push(format!("secret store: {e:#}"));
+            false
+        }
+    };
+    let tokio_runtime = {
+        let rt = crate::runtime::start();
+        rt.block_on(async { tokio::spawn(async { 2 + 2 }).await.map(|v| v == 4).unwrap_or(false) })
+    };
+    if !tokio_runtime {
+        errors.push("Tokio runtime did not run a task".to_string());
+    }
+    let ok = errors.is_empty();
+    Report {
+        version: fl_proto::PRODUCT_VERSION.to_string(),
+        build: fl_proto::build_id().to_string(),
+        daemon_x86_64_bytes: x86.len(),
+        daemon_aarch64_bytes: arm.len(),
+        daemon_x86_64_elf: x86_elf,
+        daemon_aarch64_elf: arm_elf,
+        hosts_path,
+        secrets_roundtrip,
+        tokio_runtime,
+        errors,
+        ok,
+    }
+}
+
+pub fn secrets_roundtrip(store: &dyn SecretStore) -> anyhow::Result<()> {
+    let id = format!("selftest-{}", uuid::Uuid::new_v4());
+    store.set(&id, "probe")?;
+    let got = store.get(&id)?;
+    store.delete(&id)?;
+    anyhow::ensure!(got.as_deref() == Some("probe"), "read back {got:?}");
+    anyhow::ensure!(store.get(&id)?.is_none(), "delete did not remove the secret");
+    Ok(())
+}
+
+/// Write the report; exit code 0 = ok, 1 = checks failed, 2 = cannot write report.
+pub fn run(out: &Path) -> i32 {
+    let report = report();
+    let json = serde_json::to_string_pretty(&report).expect("report serializes");
+    if let Err(e) = std::fs::write(out, &json) {
+        eprintln!("flotilla: cannot write {}: {e}", out.display());
+        return 2;
+    }
+    if report.ok { 0 } else { 1 }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn secrets_roundtrip_with_file_store() {
+        let dir = tempfile::tempdir().unwrap();
+        secrets_roundtrip(&crate::secrets::FileStore::new(dir.path().to_path_buf())).unwrap();
+    }
+
+    #[test]
+    fn report_flags_missing_embedded_daemons() {
+        let r = report();
+        assert!(r.tokio_runtime);
+        if crate::embedded::FLOTILLAD_X86_64.is_empty() {
+            assert!(!r.ok);
+            assert!(r.errors.iter().any(|e| e.contains("x86_64")));
+        }
+    }
+
+    #[test]
+    fn run_writes_json_report() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("report.json");
+        let code = run(&out);
+        let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&out).unwrap()).unwrap();
+        assert_eq!(v["ok"].as_bool().unwrap(), code == 0);
+        assert_eq!(v["version"], fl_proto::PRODUCT_VERSION);
+    }
+}
+```
+
+- [ ] **Step 6: Write `main.rs` (UI comes in Task 14)**
+
+```rust
+//! Flotilla: native Windows client for a Flotilla workspace on your VPS.
+#![cfg_attr(windows, windows_subsystem = "windows")]
+// Task 14 wires the remaining items into the UI and removes this allow.
+#![allow(dead_code)]
+
+mod embedded;
+mod hosts;
+mod runtime;
+mod secrets;
+mod selftest;
+
+use std::path::PathBuf;
+
+fn main() {
+    if let Some(path) = std::env::args().find_map(|a| a.strip_prefix("--self-test=").map(PathBuf::from)) {
+        std::process::exit(selftest::run(&path));
+    }
+    eprintln!("flotilla: the UI shell arrives in Task 14");
+}
+```
+
+- [ ] **Step 7: Run the tests and the self-test**
+
+```bash
+cargo test -p flotilla
+cargo run -q -p flotilla -- --self-test=/tmp/flotilla-selftest.json; echo "exit=$?"; cat /tmp/flotilla-selftest.json
+```
+
+Expected: all unit tests pass. The self-test exits 1 locally, because there are no embedded daemons (`daemon_x86_64_elf: false`); everything else is true. Then check that embedding works:
+
+```bash
+D=$(mktemp -d) && cargo build -q -p flotillad && cp target/debug/flotillad $D/flotillad-x86_64-unknown-linux-musl && cp target/debug/flotillad $D/flotillad-aarch64-unknown-linux-musl
+FLOTILLA_EMBED_DAEMON_DIR=$D cargo run -q -p flotilla -- --self-test=/tmp/flotilla-selftest.json; echo "exit=$?"
+```
+
+Expected: `exit=0`. (A glibc debug binary is still ELF, which is all the self-test checks.)
+
+- [ ] **Step 8: Commit**
+
+```bash
+cargo fmt -p flotilla && cargo clippy -p flotilla --all-targets -- -D warnings
+git add crates/client/flotilla/build.rs crates/client/flotilla/src
+git commit -m "feat(flotilla): runtime, host store, credential store, embedded daemons, self-test
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+```
+
+---
+
+### Task 14: flotilla UI shell — title bar with connection status, host sidebar, add-host flow
+
+**Files:**
+- Create: `crates/client/flotilla/src/connect.rs` (pure logic, unit-tested)
+- Create: `crates/client/flotilla/src/app/{mod.rs, titlebar.rs, sidebar.rs, host_view.rs, add_host.rs}`
+- Modify: `crates/client/flotilla/src/main.rs`
+
+**Interfaces:**
+- Consumes:
+  - Task 13 modules
+  - `flc_ui::{theme::{Theme, ActiveTheme, init}, input::TextInput}` (Task 12)
+  - `flc_conn::supervisor::{Supervisor, ConnPhase, ConnectSpec, QuicSpec, Timings, TransportKind}` (Task 11)
+  - `flc_conn::bootstrap::{bootstrap, BootstrapOptions, BootstrapStep}` (Task 10)
+  - `fl_transport::ssh::{SshSession, HostKeyPolicy, SshAuth, SshTarget}`
+  - `fl_transport::quic::parse_fingerprint`
+- Produces: the M0 user experience.
+  - Frameless window: a 36 px title bar (drag area, status pill, Windows caption buttons) above a 260 px sidebar and a center pane.
+  - The status pill reads exactly `Connected · QUIC · 42 ms` (or `SSH`).
+  - Add host → validate → SSH connect → confirm host-key fingerprint → bootstrap with live steps → host saved, token stored, supervisor started.
+  - Saved hosts auto-connect on launch.
+
+**gpui API notes (0.2.2, verified):**
+- `Application::new().run(|cx: &mut App| …)` and `cx.open_window(WindowOptions, |window, cx| cx.new(|cx| View::new(window, cx)))`.
+- `TitlebarOptions { title, appears_transparent, traffic_light_position }`. On Windows, `appears_transparent: true` hides the system title bar; also set `window_decorations: Some(WindowDecorations::Client)`.
+- `.window_control_area(WindowControlArea::{Drag, Min, Max, Close})` makes Windows hit-test those areas (native drag, snap and caption buttons).
+- `cx.spawn(async move |this: WeakEntity<T>, cx: &mut AsyncApp| …).detach()` and `this.update(cx, |view, cx| …)` (returns `Result`).
+- `cx.subscribe(&entity, |this, emitter, event: &E, cx| …)` returns a `Subscription` that must be stored. `impl EventEmitter<E> for T {}`; `cx.emit(e)`.
+- `window.focus(&handle)`, `window.is_maximized()`, `cx.on_window_closed(|cx| …)` (returns a `Subscription`; `.detach()` it).
+- `ElementId` from `(&'static str, usize)`; `.id(..)` is needed before `.on_click`/`.hover` on a `div`.
+- `gpui::prelude::*` brings `FluentBuilder` (`.when`, `.when_some`), `InteractiveElement`, `ParentElement`, `Styled`, `StatefulInteractiveElement`.
+- Tokio primitives (`watch`, `mpsc`, `JoinHandle`) are runtime-agnostic: awaiting them inside `cx.spawn` is fine. Spawn network work on the Tokio runtime through the `Tokio` global.
+
+If any call below differs from the real gpui 0.2.2 API, fix it with `cargo check -p flotilla`. The gpui source is at `$(ls -d ~/.cargo/registry/src/index.crates.io-*/gpui-0.2.2)`; see `examples/` and `src/`. Keep the layout, tokens and behaviour.
+
+- [ ] **Step 1: Write `connect.rs` with its tests (TDD: tests first, then code)**
+
+```rust
+//! UI-independent logic: add-host form validation, profile building,
+//! connection specs, and status/step copy.
+use std::path::PathBuf;
+
+use fl_proto::{EnrollResponse, PRODUCT_VERSION, build_id};
+use fl_transport::quic::parse_fingerprint;
+use fl_transport::ssh::{HostKeyPolicy, SshAuth, SshTarget};
+use flc_conn::bootstrap::BootstrapStep;
+use flc_conn::profile::{HostProfile, QuicEndpoint};
+use flc_conn::supervisor::{ConnPhase, ConnectSpec, QuicSpec, Timings};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Draft {
+    pub name: String,
+    pub target: SshTarget,
+    pub auth: SshAuth,
+}
+
+/// Validate the add-host form. Empty port → 22, empty user → root, empty name → host.
+/// `~/` or `~\` at the start of the key path expands to `home`.
+pub fn parse_draft(
+    name: &str,
+    host: &str,
+    port: &str,
+    user: &str,
+    key_path: &str,
+    use_agent: bool,
+    home: Option<PathBuf>,
+) -> Result<Draft, String> {
+    let host = host.trim();
+    if host.is_empty() {
+        return Err("Enter the server's address.".into());
+    }
+    if host.contains(char::is_whitespace) || host.contains('/') || host.contains('@') {
+        return Err("Enter just the address, e.g. 203.0.113.10 or vps.example.com.".into());
+    }
+    let port = match port.trim() {
+        "" => 22,
+        p => match p.parse::<u16>() {
+            Ok(n) if n > 0 => n,
+            _ => return Err("Port must be a number from 1 to 65535.".into()),
+        },
+    };
+    let user = match user.trim() {
+        "" => "root".to_string(),
+        u if u.contains(char::is_whitespace) => return Err("The user name can't contain spaces.".into()),
+        u => u.to_string(),
+    };
+    let auth = if use_agent {
+        SshAuth::Agent { socket: None }
+    } else {
+        let raw = key_path.trim().trim_matches('"');
+        if raw.is_empty() {
+            return Err("Choose a private key file, or use the SSH agent.".into());
+        }
+        SshAuth::KeyFile { path: expand_home(raw, home) }
+    };
+    let name = match name.trim() {
+        "" => host.to_string(),
+        n => n.to_string(),
+    };
+    Ok(Draft { name, target: SshTarget { host: host.to_string(), port, user }, auth })
+}
+
+fn expand_home(raw: &str, home: Option<PathBuf>) -> PathBuf {
+    match (raw.strip_prefix("~/").or_else(|| raw.strip_prefix("~\\")), home) {
+        (Some(rest), Some(home)) => home.join(rest),
+        _ => PathBuf::from(raw),
+    }
+}
+
+pub fn default_key_path(home: Option<PathBuf>) -> String {
+    home.map(|h| h.join(".ssh").join("id_ed25519").display().to_string()).unwrap_or_default()
+}
+
+pub fn profile_from_enrollment(id: String, draft: &Draft, host_key: &str, enrollment: &EnrollResponse) -> HostProfile {
+    HostProfile {
+        id,
+        name: draft.name.clone(),
+        ssh: draft.target.clone(),
+        auth: draft.auth.clone(),
+        host_key: Some(host_key.to_string()),
+        quic: enrollment.quic_port.map(|port| QuicEndpoint { port, cert_sha256: enrollment.cert_sha256.clone() }),
+        device_id: Some(enrollment.device_id.clone()),
+        socket_path: Some(enrollment.socket_path.clone()),
+    }
+}
+
+/// `None` if the profile was never set up (no pinned host key or socket path).
+/// Without a token, QUIC is skipped and the host is reached over SSH only.
+pub fn connect_spec(profile: &HostProfile, token: Option<String>) -> Option<ConnectSpec> {
+    let host_key = profile.host_key.clone()?;
+    let socket_path = profile.socket_path.clone()?;
+    let quic = match (&profile.quic, &token) {
+        (Some(q), Some(_)) => parse_fingerprint(&q.cert_sha256)
+            .ok()
+            .map(|cert_sha256| QuicSpec { host: profile.ssh.host.clone(), port: q.port, cert_sha256 }),
+        _ => None,
+    };
+    Some(ConnectSpec {
+        ssh: profile.ssh.clone(),
+        auth: profile.auth.clone(),
+        host_key: HostKeyPolicy::Expect(host_key),
+        socket_path,
+        quic,
+        device_id: profile.device_id.clone(),
+        token,
+        client_version: client_version(),
+        timings: Timings::default(),
+    })
+}
+
+pub fn client_version() -> String {
+    format!("flotilla/{PRODUCT_VERSION} ({})", build_id())
+}
+
+/// This PC's name for the daemon's device list.
+pub fn device_name() -> String {
+    std::env::var("COMPUTERNAME").or_else(|_| std::env::var("HOSTNAME")).unwrap_or_else(|_| "windows-pc".to_string())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tone {
+    Neutral,
+    Good,
+    Busy,
+    Bad,
+}
+
+/// Title-bar status, e.g. `Connected · QUIC · 42 ms`.
+pub fn status_line(phase: &ConnPhase) -> (Tone, String) {
+    match phase {
+        ConnPhase::Idle => (Tone::Neutral, "Disconnected".into()),
+        ConnPhase::Connecting => (Tone::Busy, "Connecting…".into()),
+        ConnPhase::Connected { kind, rtt_ms, .. } => (Tone::Good, format!("Connected · {kind} · {rtt_ms} ms")),
+        ConnPhase::Reconnecting { attempt, .. } => (Tone::Busy, format!("Reconnecting… (attempt {attempt})")),
+        ConnPhase::Failed { .. } => (Tone::Bad, "Connection failed".into()),
+    }
+}
+
+/// Install-progress copy; `Uploading` shows the size in MB.
+pub fn step_label(step: &BootstrapStep) -> String {
+    match step {
+        BootstrapStep::Probing => "Checking the server".into(),
+        BootstrapStep::Uploading { bytes } => format!("Uploading the daemon ({:.1} MB)", *bytes as f64 / 1_048_576.0),
+        BootstrapStep::Starting => "Starting the daemon".into(),
+        BootstrapStep::Enrolling => "Registering this PC".into(),
+        BootstrapStep::Done => "Done".into(),
+    }
+}
+
+/// Position of a step in the visible checklist (Probing=0 … Enrolling=3, Done=4).
+pub fn step_index(step: &BootstrapStep) -> usize {
+    match step {
+        BootstrapStep::Probing => 0,
+        BootstrapStep::Uploading { .. } => 1,
+        BootstrapStep::Starting => 2,
+        BootstrapStep::Enrolling => 3,
+        BootstrapStep::Done => 4,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flc_conn::supervisor::TransportKind;
+
+    fn home() -> Option<PathBuf> {
+        Some(PathBuf::from("/home/me"))
+    }
+
+    #[test]
+    fn draft_defaults() {
+        let d = parse_draft("", " 203.0.113.7 ", "", "", "~/.ssh/id_ed25519", false, home()).unwrap();
+        assert_eq!(d.name, "203.0.113.7");
+        assert_eq!(d.target, SshTarget { host: "203.0.113.7".into(), port: 22, user: "root".into() });
+        assert_eq!(d.auth, SshAuth::KeyFile { path: PathBuf::from("/home/me/.ssh/id_ed25519") });
+    }
+
+    #[test]
+    fn draft_with_agent_ignores_key_path() {
+        let d = parse_draft("vps", "vps.example.com", "2222", "dev", "", true, home()).unwrap();
+        assert_eq!(d.auth, SshAuth::Agent { socket: None });
+        assert_eq!(d.target.port, 2222);
+        assert_eq!(d.target.user, "dev");
+        assert_eq!(d.name, "vps");
+    }
+
+    #[test]
+    fn draft_strips_quotes_from_pasted_windows_paths() {
+        let d = parse_draft("", "h", "", "", "\"C:\\Users\\me\\.ssh\\id_ed25519\"", false, None).unwrap();
+        assert_eq!(d.auth, SshAuth::KeyFile { path: PathBuf::from("C:\\Users\\me\\.ssh\\id_ed25519") });
+    }
+
+    #[test]
+    fn draft_errors_are_specific() {
+        assert!(parse_draft("", "", "", "", "k", false, None).unwrap_err().contains("address"));
+        assert!(parse_draft("", "root@host", "", "", "k", false, None).is_err());
+        assert!(parse_draft("", "h", "70000", "", "k", false, None).unwrap_err().contains("Port"));
+        assert!(parse_draft("", "h", "0", "", "k", false, None).is_err());
+        assert!(parse_draft("", "h", "", "a b", "k", false, None).is_err());
+        assert!(parse_draft("", "h", "", "", "  ", false, None).unwrap_err().contains("key"));
+    }
+
+    #[test]
+    fn status_line_copy_matches_spec() {
+        let p = ConnPhase::Connected { kind: TransportKind::Quic, rtt_ms: 42, daemon_version: "0.1.0".into() };
+        assert_eq!(status_line(&p), (Tone::Good, "Connected · QUIC · 42 ms".to_string()));
+        let p = ConnPhase::Connected { kind: TransportKind::Ssh, rtt_ms: 7, daemon_version: "0.1.0".into() };
+        assert_eq!(status_line(&p).1, "Connected · SSH · 7 ms");
+        assert_eq!(status_line(&ConnPhase::Reconnecting { attempt: 2, error: "x".into() }).0, Tone::Busy);
+        assert_eq!(status_line(&ConnPhase::Failed { error: "x".into() }).0, Tone::Bad);
+    }
+
+    fn enrollment(port: Option<u16>) -> EnrollResponse {
+        EnrollResponse {
+            device_id: "dev-1".into(),
+            token: "t".repeat(64),
+            quic_port: port,
+            cert_sha256: "ab".repeat(32),
+            socket_path: "/root/.flotilla/run/daemon.sock".into(),
+        }
+    }
+
+    #[test]
+    fn profile_and_spec_from_enrollment() {
+        let draft = parse_draft("vps", "203.0.113.7", "", "", "~/.ssh/k", false, home()).unwrap();
+        let p = profile_from_enrollment("id-1".into(), &draft, "SHA256:fp", &enrollment(Some(7443)));
+        assert_eq!(p.quic, Some(QuicEndpoint { port: 7443, cert_sha256: "ab".repeat(32) }));
+        let spec = connect_spec(&p, Some("tok".into())).unwrap();
+        assert_eq!(spec.host_key, HostKeyPolicy::Expect("SHA256:fp".into()));
+        let q = spec.quic.expect("QUIC configured");
+        assert_eq!((q.host.as_str(), q.port, q.cert_sha256), ("203.0.113.7", 7443, [0xab; 32]));
+        assert_eq!(spec.token.as_deref(), Some("tok"));
+    }
+
+    #[test]
+    fn spec_without_token_or_port_is_ssh_only() {
+        let draft = parse_draft("", "h", "", "", "k", false, None).unwrap();
+        let p = profile_from_enrollment("id".into(), &draft, "SHA256:fp", &enrollment(Some(7443)));
+        assert!(connect_spec(&p, None).unwrap().quic.is_none());
+        let p = profile_from_enrollment("id".into(), &draft, "SHA256:fp", &enrollment(None));
+        assert!(connect_spec(&p, Some("t".into())).unwrap().quic.is_none());
+    }
+
+    #[test]
+    fn spec_requires_setup() {
+        let draft = parse_draft("", "h", "", "", "k", false, None).unwrap();
+        let mut p = profile_from_enrollment("id".into(), &draft, "SHA256:fp", &enrollment(None));
+        p.host_key = None;
+        assert!(connect_spec(&p, None).is_none());
+    }
+
+    #[test]
+    fn step_copy() {
+        assert_eq!(step_label(&BootstrapStep::Uploading { bytes: 3 * 1_048_576 }), "Uploading the daemon (3.0 MB)");
+        assert_eq!(step_index(&BootstrapStep::Enrolling), 3);
+    }
+}
+```
+
+Run: `cargo test -p flotilla connect` (with `mod connect;` added to main.rs). Expected: 9 tests pass.
+
+- [ ] **Step 2: Write `app/mod.rs`, the application and `Workspace` state**
+
+```rust
+//! The GPUI application: one window with a title bar, a host sidebar and a center pane.
+mod add_host;
+mod host_view;
+mod sidebar;
+mod titlebar;
+
+use std::sync::Arc;
+
+use flc_conn::profile::HostProfile;
+use flc_conn::supervisor::{ConnPhase, Supervisor};
+use flc_ui::theme::ActiveTheme;
+use gpui::prelude::*;
+use gpui::{
+    App, Application, AsyncApp, Bounds, Context, Entity, FocusHandle, Global, KeyBinding, SharedString, Subscription,
+    TitlebarOptions, WeakEntity, Window, WindowBounds, WindowDecorations, WindowOptions, actions, div, px, size,
+};
+
+use crate::hosts::HostStore;
+use crate::secrets::SecretStore;
+
+actions!(flotilla, [Quit, AddHost]);
+
+/// The networking runtime, reachable from every view.
+pub struct Tokio(pub tokio::runtime::Handle);
+
+impl Global for Tokio {}
+
+pub fn run(rt: tokio::runtime::Handle) {
+    Application::new().run(move |cx: &mut App| {
+        flc_ui::theme::init(cx);
+        cx.set_global(Tokio(rt));
+        cx.bind_keys([KeyBinding::new("alt-f4", Quit, None), KeyBinding::new("ctrl-shift-n", AddHost, None)]);
+        cx.on_action(|_: &Quit, cx: &mut App| cx.quit());
+        let bounds = Bounds::centered(None, size(px(1200.), px(780.)), cx);
+        let options = WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(bounds)),
+            titlebar: Some(TitlebarOptions {
+                title: Some("Flotilla".into()),
+                appears_transparent: true,
+                traffic_light_position: None,
+            }),
+            window_decorations: Some(WindowDecorations::Client),
+            window_min_size: Some(size(px(760.), px(480.))),
+            app_id: Some("Coaxys.Flotilla".into()),
+            ..Default::default()
+        };
+        cx.open_window(options, |window, cx| cx.new(|cx| Workspace::new(window, cx)))
+            .expect("cannot open the main window");
+        cx.on_window_closed(|cx: &mut App| {
+            if cx.windows().is_empty() {
+                cx.quit();
+            }
+        })
+        .detach();
+        cx.activate(true);
+    });
+}
+
+pub(crate) struct HostEntry {
+    pub profile: HostProfile,
+    pub phase: ConnPhase,
+    supervisor: Option<Supervisor>,
+    /// Bumped on every (re)connect so stale phase watchers are ignored.
+    generation: u64,
+}
+
+pub(crate) enum Center {
+    Empty,
+    Host,
+    AddHost(Entity<add_host::AddHostForm>),
+}
+
+pub struct Workspace {
+    store: HostStore,
+    secrets: Arc<dyn SecretStore>,
+    pub(crate) hosts: Vec<HostEntry>,
+    pub(crate) selected: Option<usize>,
+    pub(crate) center: Center,
+    banner: Option<SharedString>,
+    focus: FocusHandle,
+    subscriptions: Vec<Subscription>,
+}
+
+impl Workspace {
+    fn new(_window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let path = HostStore::default_path()
+            .unwrap_or_else(|| std::env::temp_dir().join("Flotilla").join("hosts.json"));
+        let store = HostStore::new(path);
+        let secrets: Arc<dyn SecretStore> = Arc::from(crate::secrets::default_store());
+        let (profiles, banner) = match store.load() {
+            Ok(hosts) => (hosts, None),
+            Err(e) => (Vec::new(), Some(SharedString::from(format!("{e:#}")))),
+        };
+        let mut ws = Self {
+            store,
+            secrets,
+            hosts: profiles
+                .into_iter()
+                .map(|profile| HostEntry { profile, phase: ConnPhase::Idle, supervisor: None, generation: 0 })
+                .collect(),
+            selected: None,
+            center: Center::Empty,
+            banner,
+            focus: cx.focus_handle(),
+            subscriptions: Vec::new(),
+        };
+        if !ws.hosts.is_empty() {
+            ws.selected = Some(0);
+            ws.center = Center::Host;
+        }
+        for i in 0..ws.hosts.len() {
+            ws.connect(i, cx);
+        }
+        ws
+    }
+
+    pub(crate) fn selected_phase(&self) -> Option<&ConnPhase> {
+        self.selected.and_then(|i| self.hosts.get(i)).map(|h| &h.phase)
+    }
+
+    pub(crate) fn select(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.selected = Some(index);
+        self.center = Center::Host;
+        cx.notify();
+    }
+
+    /// (Re)start the supervisor for host `index`.
+    pub(crate) fn connect(&mut self, index: usize, cx: &mut Context<Self>) {
+        let token = match self.hosts.get(index) {
+            Some(entry) => self.secrets.get(&entry.profile.id).unwrap_or_else(|e| {
+                tracing::warn!("cannot read the device token: {e:#}");
+                None
+            }),
+            None => return,
+        };
+        let rt = cx.global::<Tokio>().0.clone();
+        let entry = &mut self.hosts[index];
+        if let Some(old) = entry.supervisor.take() {
+            old.stop();
+        }
+        entry.generation += 1;
+        let Some(spec) = crate::connect::connect_spec(&entry.profile, token) else {
+            entry.phase = ConnPhase::Failed { error: "This host was never set up. Remove it and add it again.".into() };
+            cx.notify();
+            return;
+        };
+        let supervisor = Supervisor::spawn_on(&rt, spec);
+        let rx = supervisor.phase();
+        entry.supervisor = Some(supervisor);
+        entry.phase = ConnPhase::Connecting;
+        let (host_id, generation) = (entry.profile.id.clone(), entry.generation);
+        cx.spawn(async move |this: WeakEntity<Workspace>, cx: &mut AsyncApp| {
+            watch_phase(this, cx, host_id, generation, rx).await;
+        })
+        .detach();
+        cx.notify();
+    }
+
+    pub(crate) fn remove_host(&mut self, index: usize, cx: &mut Context<Self>) {
+        if index >= self.hosts.len() {
+            return;
+        }
+        let entry = self.hosts.remove(index);
+        if let Some(sup) = entry.supervisor {
+            sup.stop();
+        }
+        if let Err(e) = self.secrets.delete(&entry.profile.id) {
+            tracing::warn!("cannot delete the device token: {e:#}");
+        }
+        if let Err(e) = self.store.remove(&entry.profile.id) {
+            self.banner = Some(format!("{e:#}").into());
+        }
+        self.selected = if self.hosts.is_empty() { None } else { Some(index.min(self.hosts.len() - 1)) };
+        self.center = if self.selected.is_some() { Center::Host } else { Center::Empty };
+        cx.notify();
+    }
+
+    pub(crate) fn open_add_host(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let form = cx.new(add_host::AddHostForm::new);
+        let sub = cx.subscribe(&form, |ws, _form, event: &add_host::AddHostEvent, cx| ws.on_add_host(event, cx));
+        self.subscriptions.push(sub);
+        form.read(cx).focus_first(window, cx);
+        self.center = Center::AddHost(form);
+        cx.notify();
+    }
+
+    fn on_add_host(&mut self, event: &add_host::AddHostEvent, cx: &mut Context<Self>) {
+        match event {
+            add_host::AddHostEvent::Cancelled => {
+                self.center = if self.selected.is_some() { Center::Host } else { Center::Empty };
+            }
+            add_host::AddHostEvent::Completed { profile, token } => {
+                if let Err(e) = self.secrets.set(&profile.id, token) {
+                    self.banner = Some(format!("Could not store the device token: {e:#}").into());
+                }
+                if let Err(e) = self.store.upsert(profile.clone()) {
+                    self.banner = Some(format!("{e:#}").into());
+                }
+                self.hosts.push(HostEntry { profile: profile.clone(), phase: ConnPhase::Idle, supervisor: None, generation: 0 });
+                let index = self.hosts.len() - 1;
+                self.selected = Some(index);
+                self.center = Center::Host;
+                self.connect(index, cx);
+            }
+        }
+        cx.notify();
+    }
+}
+
+async fn watch_phase(
+    this: WeakEntity<Workspace>,
+    cx: &mut AsyncApp,
+    host_id: String,
+    generation: u64,
+    mut rx: tokio::sync::watch::Receiver<ConnPhase>,
+) {
+    loop {
+        let phase = rx.borrow_and_update().clone();
+        let alive = this
+            .update(cx, |ws, cx| {
+                if let Some(h) = ws.hosts.iter_mut().find(|h| h.profile.id == host_id && h.generation == generation) {
+                    h.phase = phase;
+                    cx.notify();
+                }
+            })
+            .is_ok();
+        if !alive || rx.changed().await.is_err() {
+            break;
+        }
+    }
+}
+
+impl Render for Workspace {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().clone();
+        div()
+            .id("workspace")
+            .key_context("Workspace")
+            .track_focus(&self.focus)
+            .on_action(cx.listener(|ws, _: &AddHost, window, cx| ws.open_add_host(window, cx)))
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(theme.surface_bg)
+            .text_color(theme.text_primary)
+            .font_family(theme.font_ui.clone())
+            .text_size(theme.text_size)
+            .child(self.render_titlebar(window, cx))
+            .when_some(self.banner.clone(), |d, message| {
+                d.child(
+                    div()
+                        .id("banner")
+                        .px(px(14.))
+                        .py(px(8.))
+                        .bg(theme.danger.opacity(0.15))
+                        .text_color(theme.text_primary)
+                        .child(message)
+                        .on_click(cx.listener(|ws, _, _, cx| {
+                            ws.banner = None;
+                            cx.notify();
+                        })),
+                )
+            })
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .flex()
+                    .child(self.render_sidebar(cx))
+                    .child(self.render_center(cx)),
+            )
+    }
+}
+```
+
+- [ ] **Step 3: Write `app/titlebar.rs`**
+
+```rust
+//! 36 px client-drawn title bar: drag area, connection status, caption buttons.
+use flc_ui::theme::{ActiveTheme, Theme};
+use gpui::prelude::*;
+use gpui::{Context, FontWeight, Hsla, Window, WindowControlArea, div, px, rgb};
+
+use super::Workspace;
+use crate::connect::{Tone, status_line};
+
+pub(crate) fn tone_color(tone: Tone, t: &Theme) -> Hsla {
+    match tone {
+        Tone::Good => t.success,
+        Tone::Busy => t.warning,
+        Tone::Bad => t.danger,
+        Tone::Neutral => t.text_tertiary,
+    }
+}
+
+impl Workspace {
+    pub(super) fn render_titlebar(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let t = cx.theme().clone();
+        let (tone, text) = match self.selected_phase() {
+            Some(phase) => status_line(phase),
+            None => (Tone::Neutral, "No host".to_string()),
+        };
+        let maximized = window.is_maximized();
+        div()
+            .h(px(36.))
+            .w_full()
+            .flex_none()
+            .flex()
+            .items_center()
+            .bg(t.chrome_bg)
+            .border_b_1()
+            .border_color(t.border)
+            .child(
+                div()
+                    .id("titlebar-drag")
+                    .flex_1()
+                    .h_full()
+                    .flex()
+                    .items_center()
+                    .pl(px(14.))
+                    .window_control_area(WindowControlArea::Drag)
+                    .child(div().text_color(t.text_secondary).font_weight(FontWeight::MEDIUM).child("Flotilla")),
+            )
+            .child(
+                div()
+                    .id("status-pill")
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .px(px(10.))
+                    .h(px(22.))
+                    .mr(px(8.))
+                    .rounded(px(11.))
+                    .bg(t.surface_raised)
+                    .text_size(t.text_size_sm)
+                    .text_color(t.text_secondary)
+                    .child(div().size(px(7.)).rounded_full().bg(tone_color(tone, &t)))
+                    .child(text),
+            )
+            .child(caption_button("caption-min", "\u{E921}", WindowControlArea::Min, t.raised_hover, &t))
+            .child(caption_button(
+                "caption-max",
+                if maximized { "\u{E923}" } else { "\u{E922}" },
+                WindowControlArea::Max,
+                t.raised_hover,
+                &t,
+            ))
+            .child(caption_button("caption-close", "\u{E8BB}", WindowControlArea::Close, rgb(0xC42B1C).into(), &t))
+    }
+}
+
+/// 46×36 Windows caption button using the Segoe MDL2 Assets glyphs.
+fn caption_button(id: &'static str, glyph: &'static str, area: WindowControlArea, hover_bg: Hsla, t: &Theme) -> impl IntoElement {
+    div()
+        .id(id)
+        .w(px(46.))
+        .h_full()
+        .flex()
+        .items_center()
+        .justify_center()
+        .font_family("Segoe MDL2 Assets")
+        .text_size(px(10.))
+        .text_color(t.text_secondary)
+        .hover(move |s| s.bg(hover_bg).text_color(gpui::white()))
+        .window_control_area(area)
+        .child(glyph)
+}
+```
+
+- [ ] **Step 4: Write `app/sidebar.rs`**
+
+```rust
+//! 260 px host list.
+use flc_ui::theme::ActiveTheme;
+use gpui::prelude::*;
+use gpui::{Context, FontWeight, div, px};
+
+use super::Workspace;
+use super::titlebar::tone_color;
+use crate::connect::status_line;
+
+impl Workspace {
+    pub(super) fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let t = cx.theme().clone();
+        let rows: Vec<_> = self
+            .hosts
+            .iter()
+            .enumerate()
+            .map(|(i, h)| {
+                let selected = self.selected == Some(i);
+                let (tone, _) = status_line(&h.phase);
+                let hover_bg = t.raised_hover;
+                div()
+                    .id(("host", i))
+                    .h(px(30.))
+                    .px(px(8.))
+                    .rounded(t.radius_sm)
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .cursor_pointer()
+                    .when(selected, |d| d.bg(t.row_selected).border_1().border_color(t.row_selected_border))
+                    .when(!selected, |d| d.hover(move |s| s.bg(hover_bg)))
+                    .child(div().size(px(7.)).rounded_full().flex_none().bg(tone_color(tone, &t)))
+                    .child(div().flex_1().overflow_hidden().text_ellipsis().child(h.profile.name.clone()))
+                    .on_click(cx.listener(move |ws, _, _window, cx| ws.select(i, cx)))
+            })
+            .collect();
+        let hover_bg = t.raised_hover;
+        div()
+            .w(px(260.))
+            .h_full()
+            .flex_none()
+            .flex()
+            .flex_col()
+            .gap(px(2.))
+            .p(px(8.))
+            .bg(t.chrome_bg)
+            .border_r_1()
+            .border_color(t.border)
+            .child(
+                div()
+                    .px(px(8.))
+                    .pt(px(6.))
+                    .pb(px(4.))
+                    .text_size(t.text_size_sm)
+                    .text_color(t.text_tertiary)
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child("HOSTS"),
+            )
+            .children(rows)
+            .child(
+                div()
+                    .id("add-host")
+                    .mt(px(4.))
+                    .h(px(30.))
+                    .px(px(8.))
+                    .rounded(t.radius_sm)
+                    .flex()
+                    .items_center()
+                    .text_color(t.text_secondary)
+                    .cursor_pointer()
+                    .hover(move |s| s.bg(hover_bg))
+                    .child("+ Add host")
+                    .on_click(cx.listener(|ws, _, window, cx| ws.open_add_host(window, cx))),
+            )
+    }
+}
+```
+
+- [ ] **Step 5: Write `app/host_view.rs`: the center pane and shared buttons**
+
+```rust
+//! Center pane: empty state, host details, or the add-host form.
+use flc_conn::supervisor::ConnPhase;
+use flc_ui::theme::{ActiveTheme, Theme};
+use gpui::prelude::*;
+use gpui::{AnyElement, Context, FontWeight, SharedString, Stateful, Div, div, px};
+
+use super::titlebar::tone_color;
+use super::{Center, Workspace};
+use crate::connect::status_line;
+
+pub(crate) fn primary_button(id: &'static str, label: &'static str, t: &Theme) -> Stateful<Div> {
+    let hover = t.accent.opacity(0.85);
+    div()
+        .id(id)
+        .h(px(30.))
+        .px(px(14.))
+        .rounded(t.radius_md)
+        .flex()
+        .items_center()
+        .justify_center()
+        .bg(t.accent)
+        .text_color(gpui::white())
+        .font_weight(FontWeight::MEDIUM)
+        .cursor_pointer()
+        .hover(move |s| s.bg(hover))
+        .child(label)
+}
+
+pub(crate) fn secondary_button(id: &'static str, label: &'static str, t: &Theme) -> Stateful<Div> {
+    let hover = t.raised_hover;
+    div()
+        .id(id)
+        .h(px(30.))
+        .px(px(14.))
+        .rounded(t.radius_md)
+        .flex()
+        .items_center()
+        .justify_center()
+        .bg(t.control_bg)
+        .text_color(t.text_primary)
+        .cursor_pointer()
+        .hover(move |s| s.bg(hover))
+        .child(label)
+}
+
+fn kv(label: &'static str, value: impl Into<SharedString>, t: &Theme) -> impl IntoElement {
+    div()
+        .flex()
+        .gap(px(12.))
+        .child(div().w(px(90.)).text_color(t.text_tertiary).child(label))
+        .child(div().flex_1().child(value.into()))
+}
+
+impl Workspace {
+    pub(super) fn render_center(&self, cx: &mut Context<Self>) -> AnyElement {
+        let t = cx.theme().clone();
+        let body: AnyElement = match &self.center {
+            Center::AddHost(form) => form.clone().into_any_element(),
+            Center::Host => match self.selected {
+                Some(i) if i < self.hosts.len() => self.render_host(i, cx).into_any_element(),
+                _ => self.render_empty(cx).into_any_element(),
+            },
+            Center::Empty => self.render_empty(cx).into_any_element(),
+        };
+        div()
+            .flex_1()
+            .h_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(t.surface_bg)
+            .child(body)
+            .into_any_element()
+    }
+
+    fn render_empty(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let t = cx.theme().clone();
+        div()
+            .flex()
+            .flex_col()
+            .items_center()
+            .gap(px(10.))
+            .child(div().text_size(px(20.)).font_weight(FontWeight::SEMIBOLD).child("Connect a workspace"))
+            .child(
+                div()
+                    .max_w(px(420.))
+                    .text_center()
+                    .text_color(t.text_secondary)
+                    .child("Flotilla runs on your server. Add an SSH host and Flotilla installs its daemon there for you."),
+            )
+            .child(
+                primary_button("empty-add-host", "Add host", &t)
+                    .mt(px(6.))
+                    .on_click(cx.listener(|ws, _, window, cx| ws.open_add_host(window, cx))),
+            )
+    }
+
+    fn render_host(&self, index: usize, cx: &mut Context<Self>) -> impl IntoElement {
+        let t = cx.theme().clone();
+        let h = &self.hosts[index];
+        let (tone, status) = status_line(&h.phase);
+        let (transport, latency, daemon) = match &h.phase {
+            ConnPhase::Connected { kind, rtt_ms, daemon_version } => {
+                (kind.to_string(), format!("{rtt_ms} ms"), format!("flotillad {daemon_version}"))
+            }
+            _ => ("—".to_string(), "—".to_string(), "—".to_string()),
+        };
+        let problem = match &h.phase {
+            ConnPhase::Failed { error } | ConnPhase::Reconnecting { error, .. } => Some(error.clone()),
+            _ => None,
+        };
+        let ssh = &h.profile.ssh;
+        div()
+            .w(px(520.))
+            .p(px(20.))
+            .rounded(t.radius_lg)
+            .bg(t.surface_raised)
+            .border_1()
+            .border_color(t.border)
+            .flex()
+            .flex_col()
+            .gap(px(12.))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(div().text_size(px(18.)).font_weight(FontWeight::SEMIBOLD).child(h.profile.name.clone()))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.))
+                            .text_color(t.text_secondary)
+                            .child(div().size(px(7.)).rounded_full().bg(tone_color(tone, &t)))
+                            .child(status),
+                    ),
+            )
+            .child(kv("Address", format!("{}@{}:{}", ssh.user, ssh.host, ssh.port), &t))
+            .child(kv("Transport", transport, &t))
+            .child(kv("Latency", latency, &t))
+            .child(kv("Daemon", daemon, &t))
+            .when_some(problem, |d, error| d.child(div().text_color(t.danger).child(error)))
+            .child(
+                div()
+                    .flex()
+                    .gap(px(8.))
+                    .pt(px(4.))
+                    .child(
+                        secondary_button("reconnect", "Reconnect", &t)
+                            .on_click(cx.listener(move |ws, _, _, cx| ws.connect(index, cx))),
+                    )
+                    .child(
+                        secondary_button("remove", "Remove", &t)
+                            .text_color(t.danger)
+                            .on_click(cx.listener(move |ws, _, _, cx| ws.remove_host(index, cx))),
+                    ),
+            )
+    }
+}
+```
+
+- [ ] **Step 6: Write `app/add_host.rs`: the form and install flow**
+
+```rust
+//! Add-host card: form → SSH connect → confirm host key → install with progress.
+use std::sync::Arc;
+use std::time::Duration;
+
+use fl_transport::ssh::{HostKeyPolicy, SshSession};
+use flc_conn::bootstrap::{BootstrapOptions, BootstrapStep, bootstrap};
+use flc_conn::profile::HostProfile;
+use flc_ui::input::TextInput;
+use flc_ui::theme::{ActiveTheme, Theme};
+use gpui::prelude::*;
+use gpui::{AnyElement, App, AsyncApp, Context, Entity, EventEmitter, Focusable, FontWeight, SharedString, WeakEntity, Window, div, px};
+
+use super::Tokio;
+use super::host_view::{primary_button, secondary_button};
+use crate::connect::{Draft, default_key_path, device_name, parse_draft, profile_from_enrollment, step_index, step_label};
+
+pub enum AddHostEvent {
+    Completed { profile: HostProfile, token: String },
+    Cancelled,
+}
+
+enum Stage {
+    Editing { error: Option<SharedString> },
+    Connecting,
+    ConfirmHostKey { draft: Draft, session: Arc<SshSession> },
+    Installing { step: BootstrapStep },
+}
+
+pub struct AddHostForm {
+    name: Entity<TextInput>,
+    host: Entity<TextInput>,
+    port: Entity<TextInput>,
+    user: Entity<TextInput>,
+    key_path: Entity<TextInput>,
+    use_agent: bool,
+    stage: Stage,
+}
+
+impl EventEmitter<AddHostEvent> for AddHostForm {}
+
+impl AddHostForm {
+    pub fn new(cx: &mut Context<Self>) -> Self {
+        let with_text = |cx: &mut Context<Self>, placeholder: &'static str, text: String| {
+            cx.new(|cx| {
+                let mut input = TextInput::new(cx, placeholder);
+                if !text.is_empty() {
+                    input.set_text(text, cx);
+                }
+                input
+            })
+        };
+        Self {
+            name: with_text(cx, "my-vps", String::new()),
+            host: with_text(cx, "203.0.113.10 or vps.example.com", String::new()),
+            port: with_text(cx, "22", "22".into()),
+            user: with_text(cx, "root", "root".into()),
+            key_path: with_text(cx, "C:\\Users\\you\\.ssh\\id_ed25519", default_key_path(dirs::home_dir())),
+            use_agent: false,
+            stage: Stage::Editing { error: None },
+        }
+    }
+
+    pub fn focus_first(&self, window: &mut Window, cx: &App) {
+        window.focus(&self.host.focus_handle(cx));
+    }
+
+    fn text(&self, input: &Entity<TextInput>, cx: &Context<Self>) -> String {
+        input.read(cx).text().to_string()
+    }
+
+    fn submit(&mut self, cx: &mut Context<Self>) {
+        let draft = match parse_draft(
+            &self.text(&self.name, cx),
+            &self.text(&self.host, cx),
+            &self.text(&self.port, cx),
+            &self.text(&self.user, cx),
+            &self.text(&self.key_path, cx),
+            self.use_agent,
+            dirs::home_dir(),
+        ) {
+            Ok(d) => d,
+            Err(message) => {
+                self.stage = Stage::Editing { error: Some(message.into()) };
+                cx.notify();
+                return;
+            }
+        };
+        self.stage = Stage::Connecting;
+        cx.notify();
+        let rt = cx.global::<Tokio>().0.clone();
+        let (target, auth) = (draft.target.clone(), draft.auth.clone());
+        let task = rt.spawn(async move {
+            SshSession::connect(&target, &auth, &HostKeyPolicy::TrustOnFirstUse, Duration::from_secs(15)).await
+        });
+        cx.spawn(async move |this: WeakEntity<AddHostForm>, cx: &mut AsyncApp| {
+            let result = task.await;
+            let _ = this.update(cx, |form, cx| {
+                form.stage = match result {
+                    Ok(Ok(session)) => Stage::ConfirmHostKey { draft, session: Arc::new(session) },
+                    Ok(Err(e)) => Stage::Editing { error: Some(e.to_string().into()) },
+                    Err(e) => Stage::Editing { error: Some(format!("internal error: {e}").into()) },
+                };
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn trust_and_install(&mut self, cx: &mut Context<Self>) {
+        let Stage::ConfirmHostKey { draft, session } = std::mem::replace(&mut self.stage, Stage::Installing { step: BootstrapStep::Probing })
+        else {
+            return;
+        };
+        cx.notify();
+        let fingerprint = session.host_key_fingerprint().to_string();
+        let rt = cx.global::<Tokio>().0.clone();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<BootstrapStep>();
+        let task = rt.spawn(async move {
+            let progress = move |step: BootstrapStep| {
+                let _ = tx.send(step);
+            };
+            let options = BootstrapOptions::new(device_name());
+            let result = bootstrap(&session, &crate::embedded::artifacts(), &options, &progress).await;
+            session.disconnect().await;
+            result
+        });
+        cx.spawn(async move |this: WeakEntity<AddHostForm>, cx: &mut AsyncApp| {
+            while let Some(step) = rx.recv().await {
+                let updated = this.update(cx, |form, cx| {
+                    form.stage = Stage::Installing { step };
+                    cx.notify();
+                });
+                if updated.is_err() {
+                    return;
+                }
+            }
+            let result = task.await;
+            let _ = this.update(cx, |form, cx| {
+                match result {
+                    Ok(Ok(outcome)) => match outcome.enrollment {
+                        Some(enrollment) => {
+                            let profile = profile_from_enrollment(uuid::Uuid::new_v4().to_string(), &draft, &fingerprint, &enrollment);
+                            cx.emit(AddHostEvent::Completed { profile, token: enrollment.token.clone() });
+                        }
+                        None => form.stage = Stage::Editing { error: Some("The daemon did not return credentials.".into()) },
+                    },
+                    Ok(Err(e)) => form.stage = Stage::Editing { error: Some(e.to_string().into()) },
+                    Err(e) => form.stage = Stage::Editing { error: Some(format!("internal error: {e}").into()) },
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn cancel(&mut self, cx: &mut Context<Self>) {
+        cx.emit(AddHostEvent::Cancelled);
+    }
+
+    fn field(label: &'static str, input: &Entity<TextInput>, t: &Theme) -> impl IntoElement {
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(4.))
+            .child(div().text_size(t.text_size_sm).text_color(t.text_secondary).child(label))
+            .child(input.clone())
+    }
+
+    fn render_fields(&self, error: Option<SharedString>, t: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let agent = self.use_agent;
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(12.))
+            .child(Self::field("Name", &self.name, t))
+            .child(Self::field("Address", &self.host, t))
+            .child(
+                div()
+                    .flex()
+                    .gap(px(10.))
+                    .child(div().w(px(90.)).child(Self::field("Port", &self.port, t)))
+                    .child(div().flex_1().child(Self::field("User", &self.user, t))),
+            )
+            .when(!agent, |d| d.child(Self::field("Private key file", &self.key_path, t)))
+            .child(
+                div()
+                    .id("use-agent")
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .cursor_pointer()
+                    .child(
+                        div()
+                            .size(px(14.))
+                            .rounded(px(3.))
+                            .border_1()
+                            .border_color(if agent { t.accent } else { t.text_tertiary })
+                            .when(agent, |d| d.bg(t.accent)),
+                    )
+                    .child(div().text_color(t.text_secondary).child("Use SSH agent (OpenSSH agent or Pageant)"))
+                    .on_click(cx.listener(|form, _, _, cx| {
+                        form.use_agent = !form.use_agent;
+                        cx.notify();
+                    })),
+            )
+            .when_some(error, |d, e| d.child(div().text_color(t.danger).child(e)))
+            .child(
+                div()
+                    .flex()
+                    .justify_end()
+                    .gap(px(8.))
+                    .pt(px(4.))
+                    .child(secondary_button("cancel", "Cancel", t).on_click(cx.listener(|form, _, _, cx| form.cancel(cx))))
+                    .child(primary_button("connect", "Connect", t).on_click(cx.listener(|form, _, _, cx| form.submit(cx)))),
+            )
+            .into_any_element()
+    }
+
+    fn render_confirm(&self, draft: &Draft, fingerprint: &str, t: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(12.))
+            .child(div().text_color(t.text_secondary).child(format!(
+                "First connection to {}. Check that this fingerprint matches your server's SSH host key:",
+                draft.target.host
+            )))
+            .child(
+                div()
+                    .p(px(10.))
+                    .rounded(t.radius_sm)
+                    .bg(t.surface_bg)
+                    .font_family(t.font_mono.clone())
+                    .text_size(t.mono_size)
+                    .child(fingerprint.to_string()),
+            )
+            .child(div().text_size(t.text_size_sm).text_color(t.text_tertiary).child(
+                "On the server: ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub",
+            ))
+            .child(
+                div()
+                    .flex()
+                    .justify_end()
+                    .gap(px(8.))
+                    .child(secondary_button("cancel", "Cancel", t).on_click(cx.listener(|form, _, _, cx| form.cancel(cx))))
+                    .child(
+                        primary_button("trust", "Trust and install", t)
+                            .on_click(cx.listener(|form, _, _, cx| form.trust_and_install(cx))),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn render_progress(&self, current: &BootstrapStep, t: &Theme) -> AnyElement {
+        let now = step_index(current);
+        let steps = [
+            BootstrapStep::Probing,
+            match current {
+                BootstrapStep::Uploading { bytes } => BootstrapStep::Uploading { bytes: *bytes },
+                _ => BootstrapStep::Uploading { bytes: 0 },
+            },
+            BootstrapStep::Starting,
+            BootstrapStep::Enrolling,
+        ];
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(8.))
+            .children(steps.iter().map(|step| {
+                let i = step_index(step);
+                let (mark, color) = if i < now {
+                    ("✓", t.success)
+                } else if i == now {
+                    ("●", t.accent)
+                } else {
+                    ("○", t.text_tertiary)
+                };
+                let label = match step {
+                    BootstrapStep::Uploading { bytes: 0 } => "Uploading the daemon".to_string(),
+                    other => step_label(other),
+                };
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(10.))
+                    .child(div().w(px(14.)).text_color(color).child(mark))
+                    .child(div().text_color(if i <= now { t.text_primary } else { t.text_tertiary }).child(label))
+            }))
+            .into_any_element()
+    }
+}
+
+impl Render for AddHostForm {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let t = cx.theme().clone();
+        let body = match &self.stage {
+            Stage::Editing { error } => self.render_fields(error.clone(), &t, cx),
+            Stage::Connecting => div().text_color(t.text_secondary).child("Connecting to the server…").into_any_element(),
+            Stage::ConfirmHostKey { draft, session } => {
+                let (draft, fingerprint) = (draft.clone(), session.host_key_fingerprint().to_string());
+                self.render_confirm(&draft, &fingerprint, &t, cx)
+            }
+            Stage::Installing { step } => self.render_progress(step, &t),
+        };
+        div()
+            .w(px(460.))
+            .p(px(24.))
+            .rounded(t.radius_lg)
+            .bg(t.surface_raised)
+            .border_1()
+            .border_color(t.border)
+            .flex()
+            .flex_col()
+            .gap(px(16.))
+            .child(div().text_size(px(18.)).font_weight(FontWeight::SEMIBOLD).child("Add a host"))
+            .child(body)
+    }
+}
+```
+
+`trust_and_install` moves `draft` and `fingerprint` into the second `cx.spawn` closure. Clone them before the first `rt.spawn` if the borrow checker requires it: `session` moves into the Tokio task, while `draft` and `fingerprint` stay in the UI closure.
+
+- [ ] **Step 7: Update `main.rs`**
+
+```rust
+//! Flotilla: native Windows client for a Flotilla workspace on your VPS.
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
+mod app;
+mod connect;
+mod embedded;
+mod hosts;
+mod runtime;
+mod secrets;
+mod selftest;
+
+use std::path::PathBuf;
+
+fn main() {
+    if let Some(path) = std::env::args().find_map(|a| a.strip_prefix("--self-test=").map(PathBuf::from)) {
+        std::process::exit(selftest::run(&path));
+    }
+    init_logging();
+    let rt = runtime::start();
+    app::run(rt.handle().clone());
+}
+
+/// Log to `%LOCALAPPDATA%\Flotilla\logs\flotilla.log` (filter with FLOTILLA_LOG).
+fn init_logging() {
+    let Some(dir) = dirs::data_local_dir().map(|d| d.join("Flotilla").join("logs")) else { return };
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let Ok(file) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("flotilla.log")) else {
+        return;
+    };
+    let filter = tracing_subscriber::EnvFilter::try_from_env("FLOTILLA_LOG")
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_ansi(false)
+        .with_writer(std::sync::Mutex::new(file))
+        .try_init();
+}
+```
+
+The `#![allow(dead_code)]` from Task 13 is gone. If the compiler now reports an unused item, delete it, unless a test uses it; in that case mark the item `#[cfg(test)]`.
+
+- [ ] **Step 8: Type-check, lint, test**
+
+```bash
+cargo check -p flotilla 2>&1 | grep -E '^(error|warning)' -A6 | head -80
+```
+
+Fix every error against the real gpui 0.2.2 API, keeping layout, tokens and behaviour. Then:
+
+```bash
+cargo clippy -p flotilla --all-targets -- -D warnings
+cargo test -p flotilla
+```
+
+Expected: clippy is clean; the `connect`, `hosts`, `secrets`, `embedded` and `selftest` tests all pass. You can't run the GUI on this headless VPS; the Windows CI build and the owner's acceptance test (Task 16) cover that.
+
+- [ ] **Step 9: Commit**
+
+```bash
+cargo fmt -p flotilla
+git add crates/client/flotilla/src
+git commit -m "feat(flotilla): window shell, status title bar, host sidebar, add-host install flow
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+```
+
+---
+
+### Task 16: M0 acceptance (owner, on a real Windows PC and the VPS)
+
+**Files:** none. Record results in the PR description.
+
+- [ ] **Step 1:** Merge the M0 PR. CI publishes the `nightly` release. Download `Flotilla-Setup-x64.exe` from it and install (per-user, no admin).
+- [ ] **Step 2:** On the VPS, make sure UDP 7443 is allowed by the firewall and the cloud provider's security group (`ufw allow 7443/udp` if ufw is active).
+- [ ] **Step 3:** Launch Flotilla, choose **Add host**, and enter the VPS address, the user and the key file (or tick the SSH agent). Connect, compare the fingerprint, then choose **Trust and install**.
+- [ ] **Step 4:** Expected: the steps tick through and the title bar shows `● Connected · QUIC · NN ms`. On the VPS, `systemctl --user status flotillad` is active.
+- [ ] **Step 5:** Failover: block outbound UDP 7443 in Windows Defender Firewall. Within about 8 s the pill shows `Connected · SSH · NN ms`. Remove the rule; within about 30 s it shows `QUIC` again.
+- [ ] **Step 6:** Restart the VPS daemon (`systemctl --user restart flotillad`). The pill shows `Reconnecting…` briefly, then `Connected` again.
+- [ ] **Step 7:** Close and relaunch Flotilla. The host is remembered and reconnects without prompts.
