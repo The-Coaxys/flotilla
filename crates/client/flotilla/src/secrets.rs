@@ -1,12 +1,18 @@
 //! Device tokens. Windows: Credential Manager (service "Flotilla",
 //! account "device-token:<host id>"). Elsewhere (dev builds, tests): one
 //! private file per host.
+#[cfg(any(not(windows), test))]
 use std::path::PathBuf;
 
-use anyhow::{Result, ensure};
+use anyhow::Result;
+#[cfg(any(not(windows), test))]
+use anyhow::ensure;
 
+// Used only by the Windows CredentialStore.
+#[cfg(windows)]
 pub const SERVICE: &str = "Flotilla";
 
+#[cfg(any(windows, test))]
 pub fn account(host_id: &str) -> String {
     format!("device-token:{host_id}")
 }
@@ -44,10 +50,12 @@ impl SecretStore for CredentialStore {
 }
 
 /// One `<host id>.token` file per host, mode 0600 on Unix.
+#[cfg(any(not(windows), test))]
 pub struct FileStore {
     dir: PathBuf,
 }
 
+#[cfg(any(not(windows), test))]
 impl FileStore {
     pub fn new(dir: PathBuf) -> Self {
         Self { dir }
@@ -65,6 +73,7 @@ impl FileStore {
     }
 }
 
+#[cfg(any(not(windows), test))]
 impl SecretStore for FileStore {
     fn get(&self, host_id: &str) -> Result<Option<String>> {
         match std::fs::read_to_string(self.path(host_id)?) {

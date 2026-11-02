@@ -1,6 +1,6 @@
 //! Saved hosts in `<config dir>/Flotilla/hosts.json` (`%APPDATA%` on Windows).
 //! A corrupt file is reported, never silently overwritten.
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use flc_conn::profile::HostProfile;
@@ -26,7 +26,8 @@ impl HostStore {
         Self { path }
     }
 
-    pub fn path(&self) -> &Path {
+    #[cfg(test)]
+    pub fn path(&self) -> &std::path::Path {
         &self.path
     }
 

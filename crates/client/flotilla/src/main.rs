@@ -1,8 +1,8 @@
 //! Flotilla: native Windows client for a Flotilla workspace on your VPS.
 #![cfg_attr(windows, windows_subsystem = "windows")]
-// Task 14 wires the remaining items into the UI and removes this allow.
-#![allow(dead_code)]
 
+mod app;
+mod connect;
 mod embedded;
 mod hosts;
 mod runtime;
@@ -17,5 +17,31 @@ fn main() {
     {
         std::process::exit(selftest::run(&path));
     }
-    eprintln!("flotilla: the UI shell arrives in Task 14");
+    init_logging();
+    let rt = runtime::start();
+    app::run(rt.handle().clone());
+}
+
+/// Log to `%LOCALAPPDATA%\Flotilla\logs\flotilla.log` (filter with FLOTILLA_LOG).
+fn init_logging() {
+    let Some(dir) = dirs::data_local_dir().map(|d| d.join("Flotilla").join("logs")) else {
+        return;
+    };
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let Ok(file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("flotilla.log"))
+    else {
+        return;
+    };
+    let filter = tracing_subscriber::EnvFilter::try_from_env("FLOTILLA_LOG")
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_ansi(false)
+        .with_writer(std::sync::Mutex::new(file))
+        .try_init();
 }
