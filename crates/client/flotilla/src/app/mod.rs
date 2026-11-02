@@ -84,7 +84,9 @@ pub struct Workspace {
     pub(crate) center: Center,
     banner: Option<SharedString>,
     focus: FocusHandle,
-    subscriptions: Vec<Subscription>,
+    // Keep onboarding alive even when the center pane displays another host.
+    add_host: Option<Entity<add_host::AddHostForm>>,
+    add_host_subscription: Option<Subscription>,
 }
 
 impl Workspace {
@@ -113,7 +115,8 @@ impl Workspace {
             center: Center::Empty,
             banner,
             focus: cx.focus_handle(),
-            subscriptions: Vec::new(),
+            add_host: None,
+            add_host_subscription: None,
         };
         if !ws.hosts.is_empty() {
             ws.selected = Some(0);
@@ -201,17 +204,26 @@ impl Workspace {
     }
 
     pub(crate) fn open_add_host(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let form = cx.new(add_host::AddHostForm::new);
-        let sub = cx.subscribe(&form, |ws, _form, event: &add_host::AddHostEvent, cx| {
-            ws.on_add_host(event, cx)
-        });
-        self.subscriptions.push(sub);
+        let form = if let Some(form) = &self.add_host {
+            form.clone()
+        } else {
+            let form = cx.new(add_host::AddHostForm::new);
+            self.add_host_subscription = Some(
+                cx.subscribe(&form, |ws, _form, event: &add_host::AddHostEvent, cx| {
+                    ws.on_add_host(event, cx)
+                }),
+            );
+            self.add_host = Some(form.clone());
+            form
+        };
         form.read(cx).focus_first(window, cx);
         self.center = Center::AddHost(form);
         cx.notify();
     }
 
     fn on_add_host(&mut self, event: &add_host::AddHostEvent, cx: &mut Context<Self>) {
+        self.add_host = None;
+        self.add_host_subscription = None;
         match event {
             add_host::AddHostEvent::Cancelled => {
                 self.center = if self.selected.is_some() {

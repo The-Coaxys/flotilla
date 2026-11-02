@@ -21,6 +21,7 @@ impl Workspace {
                 div()
                     .id(("host", i))
                     .h(px(30.))
+                    .flex_none()
                     .px(px(8.))
                     .rounded(t.radius_sm)
                     .flex()
@@ -65,6 +66,7 @@ impl Workspace {
             .child(
                 div()
                     .px(px(8.))
+                    .flex_none()
                     .pt(px(6.))
                     .pb(px(4.))
                     .text_size(t.text_size_sm)
@@ -72,12 +74,23 @@ impl Workspace {
                     .font_weight(FontWeight::SEMIBOLD)
                     .child("HOSTS"),
             )
-            .children(rows)
+            .child(
+                div()
+                    .id("host-list")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.))
+                    .children(rows),
+            )
             .child(
                 div()
                     .id("add-host")
                     .mt(px(4.))
                     .h(px(30.))
+                    .flex_none()
                     .px(px(8.))
                     .rounded(t.radius_sm)
                     .flex()

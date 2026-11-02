@@ -10,11 +10,11 @@ use fl_proto::{DaemonInfo, EnrollResponse, VersionInfo};
 use fl_transport::ssh::{SshError, SshSession};
 use sha2::{Digest, Sha256};
 
-/// Remote path of the installed daemon; `$HOME` is expanded by the remote `sh`.
-pub const REMOTE_BIN: &str = "$HOME/.flotilla/bin/flotillad";
+/// Remote daemon path; the remote `sh` expands the home override or default.
+pub const REMOTE_BIN: &str = "${FLOTILLA_HOME:-$HOME/.flotilla}/bin/flotillad";
 
 /// One line each: OS, arch, sha256sum availability, installed version JSON (or `none`).
-pub const PROBE_SCRIPT: &str = r#"uname -s; uname -m; if command -v sha256sum >/dev/null 2>&1; then echo sha256sum=yes; else echo sha256sum=no; fi; "$HOME/.flotilla/bin/flotillad" version --json 2>/dev/null || echo none"#;
+pub const PROBE_SCRIPT: &str = r#"uname -s; uname -m; if command -v sha256sum >/dev/null 2>&1; then echo sha256sum=yes; else echo sha256sum=no; fi; "${FLOTILLA_HOME:-$HOME/.flotilla}/bin/flotillad" version --json 2>/dev/null || echo none"#;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RemoteArch {
@@ -285,18 +285,21 @@ pub async fn bootstrap(
 
 async fn upload(ssh: &SshSession, bytes: &[u8]) -> Result<(), BootstrapError> {
     let expected = hex::encode(Sha256::digest(bytes));
-    let script = r#"set -e; d="$HOME/.flotilla/bin"; mkdir -p "$d"; chmod 700 "$HOME/.flotilla"; cat > "$d/flotillad.new"; chmod 755 "$d/flotillad.new"; sha256sum "$d/flotillad.new""#;
+    let script = r#"set -e; h="${FLOTILLA_HOME:-$HOME/.flotilla}"; d="$h/bin"; mkdir -p "$d"; chmod 700 "$h"; cat > "$d/flotillad.new"; chmod 755 "$d/flotillad.new"; sha256sum < "$d/flotillad.new""#;
     let out = ssh.exec_checked(&sh(script), Some(bytes)).await?;
     let text = String::from_utf8_lossy(&out);
     let actual = text.split_whitespace().next().unwrap_or("").to_string();
     if actual != expected {
         let _ = ssh
-            .exec(&sh(r#"rm -f "$HOME/.flotilla/bin/flotillad.new""#), None)
+            .exec(
+                &sh(r#"rm -f "${FLOTILLA_HOME:-$HOME/.flotilla}/bin/flotillad.new""#),
+                None,
+            )
             .await;
         return Err(BootstrapError::HashMismatch { expected, actual });
     }
     ssh.exec_checked(
-        &sh(r#"mv -f "$HOME/.flotilla/bin/flotillad.new" "$HOME/.flotilla/bin/flotillad""#),
+        &sh(r#"h="${FLOTILLA_HOME:-$HOME/.flotilla}"; mv -f "$h/bin/flotillad.new" "$h/bin/flotillad""#),
         None,
     )
     .await?;

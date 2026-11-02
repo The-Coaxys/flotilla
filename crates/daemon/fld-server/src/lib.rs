@@ -39,7 +39,7 @@ pub struct DaemonConfig {
     pub home: FlotillaHome,
     /// `None` disables QUIC.
     pub quic_bind: Option<SocketAddr>,
-    /// How long a new connection may take to send `Hello`.
+    /// Complete authentication budget, including QUIC control-stream acceptance.
     pub hello_timeout: Duration,
 }
 
@@ -48,7 +48,7 @@ impl DaemonConfig {
         Self {
             home,
             quic_bind: Some(SocketAddr::from(([0, 0, 0, 0], 7443))),
-            hello_timeout: Duration::from_secs(10),
+            hello_timeout: Duration::from_secs(3),
         }
     }
 }

@@ -315,3 +315,47 @@ async fn shutdown_returns_to_idle() {
     sup.shutdown().await;
     assert_eq!(*rx.borrow(), ConnPhase::Idle);
 }
+
+async fn shutdown_closes_pending_ssh(with_quic: bool) {
+    use tokio::io::AsyncReadExt;
+    use tokio::net::TcpListener;
+
+    let h = Harness::new().await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut spec = h.spec(with_quic);
+    spec.ssh.port = listener.local_addr().unwrap().port();
+    spec.timings.connect_timeout = Duration::from_secs(30);
+    let sup = Supervisor::spawn(spec);
+    let mut rx = sup.phase();
+    // Keep the TCP connection alive without completing the SSH handshake.
+    let (mut stream, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    if with_quic {
+        wait_phase(
+            &mut rx,
+            Duration::from_secs(5),
+            "QUIC while SSH is warming",
+            connected(TransportKind::Quic),
+        )
+        .await;
+    }
+    sup.shutdown().await;
+    let mut received = Vec::new();
+    tokio::time::timeout(Duration::from_secs(1), stream.read_to_end(&mut received))
+        .await
+        .expect("shutdown left the SSH connection attempt running")
+        .unwrap();
+    assert_eq!(*rx.borrow(), ConnPhase::Idle);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shutdown_cancels_connecting_ssh() {
+    shutdown_closes_pending_ssh(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shutdown_cancels_standby_ssh_warmup() {
+    shutdown_closes_pending_ssh(true).await;
+}

@@ -8189,3 +8189,12 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 - [ ] **Step 5:** Failover: block outbound UDP 7443 in Windows Defender Firewall. Within about 8 s the pill shows `Connected · SSH · NN ms`. Remove the rule; within about 30 s it shows `QUIC` again.
 - [ ] **Step 6:** Restart the VPS daemon (`systemctl --user restart flotillad`). The pill shows `Reconnecting…` briefly, then `Connected` again.
 - [ ] **Step 7:** Close and relaunch Flotilla. The host is remembered and reconnects without prompts.
+
+## M0 delivery verification
+
+- Delivery review fixed six reachable defects: onboarding entity lifetime, sidebar overflow, first-address-only QUIC dialing, detached connection attempts after shutdown, custom `FLOTILLA_HOME` handling, and unbounded pre-authentication QUIC stream acceptance.
+- QUIC authentication has one three-second post-TLS budget, including control-stream acceptance and token verification. Authenticated sessions are not constrained by that budget.
+- Address attempts race within the configured connection deadline. The existing workspace `futures` dependency is now used directly by `flc-conn`; no new crate versions were introduced.
+- Regression proof: both pending-SSH shutdown cases failed before the fix; the integrated client/daemon suites then passed 94 tests. Workspace clippy passed with warnings denied.
+- Runtime proof used an isolated real OpenSSH server, disabled stream-local forwarding, and a real daemon process: fresh install/enrollment into a custom remote home, repeat bootstrap without reinstall, QUIC, a UDP blackhole, SSH exec fallback, QUIC recovery, and clean shutdown all succeeded. Default heartbeat/dead-link timings produced SSH failover in 6.01 seconds; a one-second smoke-only reprobe interval produced QUIC recovery in 1.00 seconds.
+- Windows CI now runs `scripts/smoke_windows_ui.ps1` against the release executable in addition to `--self-test`. The `windows-smoke` artifact contains rendered screenshots and reports. The owner checklist above remains necessary for a real Windows-to-VPS connection, sleep/resume, firewall behavior and per-user installer acceptance.

@@ -19,14 +19,17 @@ use sha2::{Digest, Sha256};
 const BIN: &str = env!("CARGO_BIN_EXE_flotillad");
 
 /// Stops whatever daemon the test started in `home`, even if the test panics.
-struct StopOnDrop(PathBuf);
+struct StopOnDrop {
+    home: PathBuf,
+    flotilla_home: PathBuf,
+}
 
 impl Drop for StopOnDrop {
     fn drop(&mut self) {
         let _ = std::process::Command::new(BIN)
             .arg("stop")
-            .env("HOME", &self.0)
-            .env("FLOTILLA_HOME", self.0.join(".flotilla"))
+            .env("HOME", &self.home)
+            .env("FLOTILLA_HOME", &self.flotilla_home)
             .output();
     }
 }
@@ -37,14 +40,23 @@ struct Fx {
     _stop: StopOnDrop,
     _dir: tempfile::TempDir,
     home: PathBuf,
+    flotilla_home: PathBuf,
     _server: TestSshServer,
     ssh: SshSession,
 }
 
 async fn fixture() -> Fx {
+    fixture_at(None).await
+}
+
+async fn fixture_at(relative_home: Option<&str>) -> Fx {
     let dir = tempfile::tempdir().unwrap();
     let home = dir.path().to_path_buf();
-    let stop = StopOnDrop(home.clone());
+    let flotilla_home = home.join(relative_home.unwrap_or(".flotilla"));
+    let stop = StopOnDrop {
+        home: home.clone(),
+        flotilla_home: flotilla_home.clone(),
+    };
     let server = TestSshServer::start_with(
         &home,
         TestSshOptions {
@@ -52,7 +64,9 @@ async fn fixture() -> Fx {
                 ("FLOTILLA_QUIC_BIND".into(), "127.0.0.1:0".into()),
                 (
                     "FLOTILLA_HOME".into(),
-                    home.join(".flotilla").display().to_string(),
+                    relative_home
+                        .map(|_| flotilla_home.display().to_string())
+                        .unwrap_or_default(),
                 ),
             ],
             ..Default::default()
@@ -85,6 +99,7 @@ async fn fixture() -> Fx {
         _stop: stop,
         _dir: dir,
         home,
+        flotilla_home,
         _server: server,
         ssh,
     }
@@ -187,6 +202,57 @@ async fn bootstrap_installs_starts_enrolls_and_both_transports_work() {
         qr.recv::<ServerMsg>().await.unwrap(),
         ServerMsg::Welcome(_)
     ));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bootstrap_uses_custom_home_with_spaces_and_shell_characters() {
+    let fx = fixture_at(Some(r#"custom home '"\$; &"#)).await;
+    assert!(!fx.flotilla_home.exists());
+    let artifacts = real_artifacts();
+    let outcome = bootstrap(&fx.ssh, &artifacts, &test_options(), &|_| {})
+        .await
+        .unwrap();
+
+    assert!(outcome.installed);
+    let installed = std::fs::read(fx.flotilla_home.join("bin/flotillad")).unwrap();
+    assert_eq!(
+        Sha256::digest(&installed),
+        Sha256::digest(&artifacts.x86_64[..])
+    );
+    assert!(!fx.flotilla_home.join("bin/flotillad.new").exists());
+    let socket = fx.flotilla_home.join("run/daemon.sock");
+    assert_eq!(Path::new(&outcome.daemon.socket_path), socket);
+    let enrollment = outcome.enrollment.expect("enrolled in custom home");
+    assert_eq!(Path::new(&enrollment.socket_path), socket);
+    assert!(
+        fld_server::devices::DeviceRegistry::new(fx.flotilla_home.join("state/devices.json"))
+            .verify(&enrollment.device_id, &enrollment.token)
+            .unwrap()
+    );
+
+    let stream = fx
+        .ssh
+        .open_unix_socket(&enrollment.socket_path)
+        .await
+        .unwrap();
+    let (r, w) = tokio::io::split(stream);
+    let (mut reader, mut writer) = framed(r, w);
+    writer.send(&hello(None, None)).await.unwrap();
+    assert!(matches!(
+        reader.recv::<ServerMsg>().await.unwrap(),
+        ServerMsg::Welcome(_)
+    ));
+
+    // Probe and status must find the same installation without uploading again.
+    let mut opts = test_options();
+    opts.enroll = false;
+    let again = bootstrap(&fx.ssh, &artifacts, &opts, &|_| {})
+        .await
+        .unwrap();
+    assert!(!again.installed);
+    assert_eq!(again.daemon.pid, outcome.daemon.pid);
+    assert_eq!(Path::new(&again.daemon.socket_path), socket);
+    assert!(!fx.home.join(".flotilla").exists());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

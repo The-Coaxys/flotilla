@@ -2,21 +2,32 @@
 use std::path::Path;
 use std::time::Duration;
 
-use fl_proto::{ClientMsg, Hello, PROTO, ProtoVersion, RejectReason, Request, Response, ServerMsg};
+use fl_proto::{
+    ClientMsg, FrameCodec, Hello, PROTO, ProtoVersion, RejectReason, Request, Response, ServerMsg,
+    WireMessage,
+};
 use fl_transport::conn::{ConnError, FrameReader, FrameWriter, framed};
 use fl_transport::quic;
 use fld_server::devices::DeviceRegistry;
 use fld_server::{DaemonConfig, DaemonHandle, FlotillaHome, ServerError};
 use tokio::net::UnixStream;
+use tokio_util::codec::Encoder;
 
 fn home_in(dir: &Path) -> FlotillaHome {
     FlotillaHome::new(dir.join(".flotilla"))
 }
 
 async fn start_daemon(dir: &Path) -> Result<DaemonHandle, ServerError> {
+    start_daemon_with_hello_timeout(dir, Duration::from_millis(300)).await
+}
+
+async fn start_daemon_with_hello_timeout(
+    dir: &Path,
+    hello_timeout: Duration,
+) -> Result<DaemonHandle, ServerError> {
     let mut config = DaemonConfig::new(home_in(dir));
     config.quic_bind = Some("127.0.0.1:0".parse().unwrap());
-    config.hello_timeout = Duration::from_millis(300);
+    config.hello_timeout = hello_timeout;
     fld_server::start(config).await
 }
 
@@ -128,9 +139,97 @@ async fn quic_with_enrolled_token_is_welcomed() {
         .await
         .unwrap();
     assert!(matches!(recv(&mut q.reader).await, ServerMsg::Welcome(_)));
+    // The authentication deadline must not become a lifetime limit.
+    tokio::time::sleep(Duration::from_millis(600)).await;
     q.writer.send(&ClientMsg::Ping { nonce: 1 }).await.unwrap();
     assert_eq!(recv(&mut q.reader).await, ServerMsg::Pong { nonce: 1 });
     d.shutdown().await;
+}
+
+#[tokio::test]
+async fn quic_without_control_stream_is_closed_at_hello_timeout() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = start_daemon(dir.path()).await.unwrap();
+    let (_endpoint, conn) =
+        quic::connect(d.quic_addr.unwrap(), d.cert_sha256, Duration::from_secs(5))
+            .await
+            .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), conn.closed())
+        .await
+        .expect("TLS-only peers must be closed at the 300 ms authentication deadline");
+    d.shutdown().await;
+}
+
+#[tokio::test]
+async fn quic_control_stream_and_hello_share_one_deadline() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = start_daemon_with_hello_timeout(dir.path(), Duration::from_millis(600))
+        .await
+        .unwrap();
+    let (id, token) = DeviceRegistry::new(home_in(dir.path()).devices_path())
+        .enroll("pc")
+        .unwrap();
+    let mut encoded = Default::default();
+    FrameCodec
+        .encode(
+            hello_with(PROTO, Some(&id), Some(&token))
+                .to_frame()
+                .unwrap(),
+            &mut encoded,
+        )
+        .unwrap();
+    let (_endpoint, conn) =
+        quic::connect(d.quic_addr.unwrap(), d.cert_sha256, Duration::from_secs(5))
+            .await
+            .unwrap();
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let (mut send, stream_recv) = quic::open_ctl(&conn).await.unwrap();
+    // QUIC does not announce an opened stream until its first data is sent.
+    // Leave Hello incomplete so receiving it consumes the remaining budget.
+    send.write_all(&encoded[..1]).await.unwrap();
+    let (mut reader, _writer) = framed(stream_recv, tokio::io::sink());
+    let delayed_hello = async {
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let _ = send.write_all(&encoded[1..]).await;
+    };
+    let (_, reply) = tokio::join!(delayed_hello, recv(&mut reader));
+    assert_eq!(reply, ServerMsg::Rejected(RejectReason::HelloTimeout));
+    tokio::time::timeout(Duration::from_millis(300), conn.closed())
+        .await
+        .expect("timed-out peers must not linger for the normal session close grace");
+    d.shutdown().await;
+}
+
+#[tokio::test]
+async fn shutdown_closes_quic_without_control_stream() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = start_daemon_with_hello_timeout(dir.path(), Duration::from_secs(30))
+        .await
+        .unwrap();
+    let (_endpoint, conn) =
+        quic::connect(d.quic_addr.unwrap(), d.cert_sha256, Duration::from_secs(5))
+            .await
+            .unwrap();
+    d.shutdown().await;
+    tokio::time::timeout(Duration::from_secs(1), conn.closed())
+        .await
+        .expect("shutdown must close peers still waiting for a control stream");
+}
+
+#[tokio::test]
+async fn dropping_daemon_closes_quic_without_control_stream() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = start_daemon_with_hello_timeout(dir.path(), Duration::from_secs(30))
+        .await
+        .unwrap();
+    let (_endpoint, conn) =
+        quic::connect(d.quic_addr.unwrap(), d.cert_sha256, Duration::from_secs(5))
+            .await
+            .unwrap();
+    drop(d);
+    tokio::time::timeout(Duration::from_secs(1), conn.closed())
+        .await
+        .expect("cancelling the daemon must close peers waiting for a control stream");
 }
 
 #[tokio::test]

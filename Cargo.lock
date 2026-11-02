@@ -2316,6 +2316,7 @@ dependencies = [
  "fl-testkit",
  "fl-transport",
  "fld-server",
+ "futures",
  "getrandom 0.3.4",
  "hex",
  "quinn",

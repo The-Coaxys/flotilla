@@ -108,7 +108,9 @@ jobs:
         shell: pwsh
         run: |
           $p = Start-Process -FilePath target\release\flotilla.exe -ArgumentList '--self-test=selftest.json' -Wait -PassThru
-          if (Test-Path selftest.json) { Get-Content selftest.json }
+          if (-not (Test-Path selftest.json)) { throw "self-test did not write its report" }
+          Get-Content selftest.json
+          if (-not ((Get-Content selftest.json -Raw | ConvertFrom-Json).ok)) { throw "self-test report failed" }
           if ($p.ExitCode -ne 0) { throw "self-test failed with exit code $($p.ExitCode)" }
       - name: Build installer (Inno Setup)
         shell: pwsh
@@ -122,6 +124,30 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "ISCC failed with $LASTEXITCODE" }
           Copy-Item target\release\flotilla.exe dist\flotilla.exe
           Get-ChildItem dist
+      - name: Smoke per-user install, native window and uninstall
+        shell: pwsh
+        run: |
+          $installer = Start-Process dist\Flotilla-Setup-x64.exe -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART' -Wait -PassThru
+          if ($installer.ExitCode -ne 0) { throw "installer failed with $($installer.ExitCode)" }
+          $installed = Join-Path $env:LOCALAPPDATA 'Programs\Flotilla'
+          try {
+            if (-not (Test-Path "$installed\flotilla.exe")) { throw "per-user executable is missing" }
+            pwsh -NoProfile -STA -File scripts/smoke_windows_ui.ps1 -Exe "$installed\flotilla.exe"
+            if ($LASTEXITCODE -ne 0) { throw "installed application UI smoke failed" }
+          } finally {
+            $uninstaller = Start-Process "$installed\unins000.exe" -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART' -Wait -PassThru
+            if ($uninstaller.ExitCode -ne 0) { throw "uninstall failed with $($uninstaller.ExitCode)" }
+          }
+      - name: Upload Windows smoke evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: windows-smoke
+          path: |
+            dist/ui-smoke/
+            selftest.json
+            ~/AppData/Local/Flotilla/logs/
+          if-no-files-found: warn
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: flotilla-windows-x64

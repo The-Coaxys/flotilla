@@ -28,10 +28,23 @@ pub struct InfoSource {
 
 pub struct SessionCtx {
     pub registry: Arc<DeviceRegistry>,
+    /// Authentication budget; QUIC starts it after TLS, before the control stream.
     pub hello_timeout: Duration,
     pub info: InfoSource,
     /// Cancelled when the daemon shuts down; every session then ends.
     pub shutdown: CancellationToken,
+}
+
+/// Allow a best-effort timeout rejection without letting an unresponsive peer
+/// keep the unauthenticated connection open indefinitely.
+pub(crate) const HELLO_TIMEOUT_GRACE: Duration = Duration::from_millis(100);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionEnd {
+    /// The session ended without an authentication timeout.
+    Finished,
+    /// Authentication expired; transport closure must not use the normal grace.
+    HelloTimeout,
 }
 
 pub async fn serve_connection(
@@ -39,22 +52,25 @@ pub async fn serve_connection(
     mut reader: FrameReader,
     mut writer: FrameWriter,
     peer: PeerKind,
-) -> Result<(), ConnError> {
-    let first = tokio::select! {
-        _ = ctx.shutdown.cancelled() => return Ok(()),
-        r = tokio::time::timeout(ctx.hello_timeout, reader.recv::<ClientMsg>()) => r,
+    hello_deadline: tokio::time::Instant,
+) -> Result<SessionEnd, ConnError> {
+    let rejection = tokio::select! {
+        biased;
+        _ = ctx.shutdown.cancelled() => return Ok(SessionEnd::Finished),
+        _ = tokio::time::sleep_until(hello_deadline) => {
+            if let Ok(Err(error)) = tokio::time::timeout_at(
+                hello_deadline + HELLO_TIMEOUT_GRACE,
+                reject(&mut writer, RejectReason::HelloTimeout),
+            ).await {
+                tracing::debug!("hello timeout rejection failed: {error}");
+            }
+            return Ok(SessionEnd::HelloTimeout);
+        }
+        result = authenticate(&ctx, &mut reader, peer) => result?,
     };
-    let hello = match first {
-        Err(_elapsed) => return reject(&mut writer, RejectReason::HelloTimeout).await,
-        Ok(Err(e)) => return Err(e),
-        Ok(Ok(ClientMsg::Hello(h))) => h,
-        Ok(Ok(_)) => return reject(&mut writer, RejectReason::ExpectedHello).await,
-    };
-    if !PROTO.is_compatible_with(hello.proto) {
-        return reject(&mut writer, RejectReason::ProtoMismatch { server: PROTO }).await;
-    }
-    if peer == PeerKind::Quic && !token_ok(&ctx, &hello).await {
-        return reject(&mut writer, RejectReason::BadToken).await;
+    if let Some(reason) = rejection {
+        reject(&mut writer, reason).await?;
+        return Ok(SessionEnd::Finished);
     }
     let mut server_session_id = [0u8; 16];
     let _ = getrandom::fill(&mut server_session_id);
@@ -69,7 +85,7 @@ pub async fn serve_connection(
         .await?;
     loop {
         let msg = tokio::select! {
-            _ = ctx.shutdown.cancelled() => return Ok(()),
+            _ = ctx.shutdown.cancelled() => return Ok(SessionEnd::Finished),
             m = reader.recv::<ClientMsg>() => m,
         };
         match msg {
@@ -79,10 +95,28 @@ pub async fn serve_connection(
                 writer.send(&ServerMsg::RpcResult { id, result }).await?;
             }
             Ok(ClientMsg::Hello(_)) => {} // a repeated Hello is harmless; ignore it
-            Err(ConnError::Closed) => return Ok(()),
+            Err(ConnError::Closed) => return Ok(SessionEnd::Finished),
             Err(e) => return Err(e),
         }
     }
+}
+
+async fn authenticate(
+    ctx: &SessionCtx,
+    reader: &mut FrameReader,
+    peer: PeerKind,
+) -> Result<Option<RejectReason>, ConnError> {
+    let hello = match reader.recv::<ClientMsg>().await? {
+        ClientMsg::Hello(hello) => hello,
+        _ => return Ok(Some(RejectReason::ExpectedHello)),
+    };
+    if !PROTO.is_compatible_with(hello.proto) {
+        return Ok(Some(RejectReason::ProtoMismatch { server: PROTO }));
+    }
+    if peer == PeerKind::Quic && !token_ok(ctx, &hello).await {
+        return Ok(Some(RejectReason::BadToken));
+    }
+    Ok(None)
 }
 
 async fn reject(writer: &mut FrameWriter, reason: RejectReason) -> Result<(), ConnError> {

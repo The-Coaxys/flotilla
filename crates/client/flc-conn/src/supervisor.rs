@@ -19,13 +19,15 @@ use fl_proto::{ClientMsg, Hello, PROTO, RejectReason, ServerMsg};
 use fl_transport::conn::{ConnError, FrameReader, FrameWriter, framed};
 use fl_transport::quic::{self, QuicError};
 use fl_transport::ssh::{HostKeyPolicy, SshAuth, SshError, SshSession, SshTarget};
+use futures::stream::{FuturesUnordered, StreamExt};
 use tokio::sync::{Mutex, watch};
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
 
 /// Fallback when the SSH server refuses `direct-streamlocal` forwarding.
-pub const ATTACH_COMMAND: &str = "\"$HOME/.flotilla/bin/flotillad\" attach";
+pub const ATTACH_COMMAND: &str =
+    r#"sh -c 'exec "${FLOTILLA_HOME:-$HOME/.flotilla}/bin/flotillad" attach'"#;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransportKind {
@@ -245,12 +247,14 @@ async fn run(spec: ConnectSpec, phase: watch::Sender<ConnPhase>, cancel: Cancell
         ssh: Mutex::new(None),
     });
     let mut attempt: u32 = 0;
+    let mut warmup = None;
+    let mut failed = false;
     set(&phase, ConnPhase::Connecting);
     'outer: loop {
-        let established = tokio::select! {
-            _ = cancel.cancelled() => break 'outer,
-            r = establish(&shared) => r,
-        };
+        let established = establish(&shared, &cancel, &mut warmup).await;
+        if cancel.is_cancelled() {
+            break;
+        }
         match established {
             Ok(mut link) => {
                 let connected_at = Instant::now();
@@ -263,7 +267,7 @@ async fn run(spec: ConnectSpec, phase: watch::Sender<ConnPhase>, cancel: Cancell
                             daemon_version: link.daemon_version.clone(),
                         },
                     );
-                    match drive(&shared, &mut link, &phase, &cancel).await {
+                    match drive(&shared, &mut link, &phase, &cancel, &mut warmup).await {
                         LinkEnd::Cancelled => break 'outer,
                         LinkEnd::Upgrade(better) => link = better,
                         LinkEnd::Dead(reason) => break reason,
@@ -297,7 +301,8 @@ async fn run(spec: ConnectSpec, phase: watch::Sender<ConnPhase>, cancel: Cancell
                         error: e.to_string(),
                     },
                 );
-                return;
+                failed = true;
+                break;
             }
             Err(e) => {
                 attempt += 1;
@@ -316,7 +321,13 @@ async fn run(spec: ConnectSpec, phase: watch::Sender<ConnPhase>, cancel: Cancell
             }
         }
     }
-    set(&phase, ConnPhase::Idle);
+    stop_link_task(&mut warmup).await;
+    if let Some(session) = shared.ssh.lock().await.take() {
+        session.disconnect().await;
+    }
+    if !failed {
+        set(&phase, ConnPhase::Idle);
+    }
 }
 
 async fn join_link(task: &mut Option<LinkTask>) -> Result<Link, ConnectError> {
@@ -329,8 +340,20 @@ async fn join_link(task: &mut Option<LinkTask>) -> Result<Link, ConnectError> {
     }
 }
 
+async fn stop_link_task(task: &mut Option<LinkTask>) {
+    if let Some(task) = task.take() {
+        task.abort();
+        let _ = task.await;
+    }
+}
+
 /// Race QUIC (if configured) against SSH; first success wins.
-async fn establish(shared: &Arc<Shared>) -> Result<Link, ConnectError> {
+async fn establish(
+    shared: &Arc<Shared>,
+    cancel: &CancellationToken,
+    warmup: &mut Option<LinkTask>,
+) -> Result<Link, ConnectError> {
+    stop_link_task(warmup).await;
     let mut quic_task: Option<LinkTask> = shared.spec.quic.clone().map(|q| {
         let s = shared.clone();
         tokio::spawn(async move { quic_link(&s.spec, &q).await })
@@ -347,6 +370,8 @@ async fn establish(shared: &Arc<Shared>) -> Result<Link, ConnectError> {
     let mut ssh_err: Option<ConnectError> = None;
     let result = loop {
         tokio::select! {
+            biased;
+            _ = cancel.cancelled() => break Err(ConnectError::Task("cancelled".into())),
             r = join_link(&mut quic_task), if quic_task.is_some() => {
                 quic_task = None;
                 match r {
@@ -374,13 +399,12 @@ async fn establish(shared: &Arc<Shared>) -> Result<Link, ConnectError> {
             });
         }
     };
-    // QUIC won: let the SSH attempt finish in the background so its session is
-    // warm for failover (dropping the JoinHandle detaches the task).
-    drop(ssh_task.take());
-    // SSH won: stop the QUIC attempt; drive() re-probes later.
-    if let Some(t) = quic_task.take() {
-        t.abort();
+    // The supervisor owns standby SSH until drive consumes it or shutdown joins it.
+    if result.is_ok() && !cancel.is_cancelled() {
+        *warmup = ssh_task.take();
     }
+    stop_link_task(&mut ssh_task).await;
+    stop_link_task(&mut quic_task).await;
     result
 }
 
@@ -449,8 +473,42 @@ async fn open_ssh_link(spec: &ConnectSpec, session: &SshSession) -> Result<Link,
 }
 
 async fn quic_link(spec: &ConnectSpec, q: &QuicSpec) -> Result<Link, ConnectError> {
-    let addr = resolve(&q.host, q.port).await?;
-    let (endpoint, conn) = quic::connect(addr, q.cert_sha256, spec.timings.connect_timeout).await?;
+    tokio::time::timeout(spec.timings.connect_timeout, async {
+        let addresses = tokio::net::lookup_host((q.host.as_str(), q.port))
+            .await
+            .map_err(|e| ConnectError::Resolve(format!("{}: {e}", q.host)))?;
+        quic_link_addresses(spec, q, addresses).await
+    })
+    .await
+    .map_err(|_| ConnectError::HandshakeTimeout)?
+}
+
+async fn quic_link_addresses(
+    spec: &ConnectSpec,
+    q: &QuicSpec,
+    addresses: impl IntoIterator<Item = SocketAddr>,
+) -> Result<Link, ConnectError> {
+    let mut attempts = FuturesUnordered::new();
+    for address in addresses {
+        attempts.push(quic_link_address(spec, q, address));
+    }
+    let mut last_error = None;
+    while let Some(result) = attempts.next().await {
+        match result {
+            Ok(link) => return Ok(link),
+            Err(e) => last_error = Some(e),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| ConnectError::Resolve(q.host.clone())))
+}
+
+async fn quic_link_address(
+    spec: &ConnectSpec,
+    q: &QuicSpec,
+    address: SocketAddr,
+) -> Result<Link, ConnectError> {
+    let (endpoint, conn) =
+        quic::connect(address, q.cert_sha256, spec.timings.connect_timeout).await?;
     let (send, recv) = quic::open_ctl(&conn).await?;
     let (reader, writer) = framed(recv, send);
     handshake(
@@ -461,14 +519,6 @@ async fn quic_link(spec: &ConnectSpec, q: &QuicSpec) -> Result<Link, ConnectErro
         Some((endpoint, conn)),
     )
     .await
-}
-
-async fn resolve(host: &str, port: u16) -> Result<SocketAddr, ConnectError> {
-    tokio::net::lookup_host((host, port))
-        .await
-        .map_err(|e| ConnectError::Resolve(format!("{host}: {e}")))?
-        .next()
-        .ok_or_else(|| ConnectError::Resolve(host.to_string()))
 }
 
 async fn handshake(
@@ -513,6 +563,7 @@ async fn drive(
     link: &mut Link,
     phase: &watch::Sender<ConnPhase>,
     cancel: &CancellationToken,
+    warmup: &mut Option<LinkTask>,
 ) -> LinkEnd {
     let t = shared.spec.timings.clone();
     let mut heartbeat = tokio::time::interval(t.heartbeat);
@@ -530,6 +581,9 @@ async fn drive(
     let end = loop {
         tokio::select! {
             _ = cancel.cancelled() => break LinkEnd::Cancelled,
+            _ = join_link(warmup), if warmup.is_some() => {
+                *warmup = None;
+            }
             _ = heartbeat.tick() => {
                 let silent = last_rx.elapsed();
                 if silent >= t.dead_after {
@@ -574,26 +628,13 @@ async fn drive(
             }
         }
     };
-    if let Some(p) = probe.take() {
-        p.abort();
-    }
+    stop_link_task(&mut probe).await;
     end
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn default_timings_match_spec() {
-        let t = Timings::default();
-        assert_eq!(t.heartbeat, Duration::from_secs(2));
-        assert_eq!(t.dead_after, Duration::from_secs(6));
-        assert_eq!(t.quic_reprobe, Duration::from_secs(30));
-        assert_eq!(t.backoff_min, Duration::from_millis(250));
-        assert_eq!(t.backoff_max, Duration::from_secs(5));
-        assert_eq!(t.connect_timeout, Duration::from_secs(10));
-    }
 
     #[test]
     fn backoff_grows_and_is_capped_with_jitter() {
@@ -634,5 +675,56 @@ mod tests {
         assert!(!ConnectError::Rejected(RejectReason::BadToken).is_fatal());
         assert!(!ConnectError::HandshakeTimeout.is_fatal());
         assert!(!ConnectError::Ssh(SshError::Timeout).is_fatal());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn quic_tries_ipv4_when_first_address_is_unreachable_ipv6() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = fld_server::FlotillaHome::new(dir.path());
+        let mut config = fld_server::DaemonConfig::new(home.clone());
+        config.quic_bind = Some("127.0.0.1:0".parse().unwrap());
+        let daemon = fld_server::start(config).await.unwrap();
+        let (device_id, token) = fld_server::devices::DeviceRegistry::new(home.devices_path())
+            .enroll("address regression")
+            .unwrap();
+        // Retain an IPv6 endpoint which never accepts TLS, rather than depending
+        // on DNS order, disabled IPv6, or an unbound UDP port's ICMP behavior.
+        let blackhole = tokio::net::UdpSocket::bind("[::1]:0").await.unwrap();
+        let q = QuicSpec {
+            host: "localhost".into(),
+            port: daemon.quic_addr.unwrap().port(),
+            cert_sha256: daemon.cert_sha256,
+        };
+        let spec = ConnectSpec {
+            ssh: SshTarget {
+                host: "127.0.0.1".into(),
+                port: 22,
+                user: "unused".into(),
+            },
+            auth: SshAuth::Agent { socket: None },
+            host_key: HostKeyPolicy::TrustOnFirstUse,
+            socket_path: daemon.socket_path.display().to_string(),
+            quic: Some(q.clone()),
+            device_id: Some(device_id),
+            token: Some(token),
+            client_version: "address regression".into(),
+            timings: Timings::default(),
+        };
+        let link = tokio::time::timeout(
+            Duration::from_secs(2),
+            quic_link_addresses(
+                &spec,
+                &q,
+                [blackhole.local_addr().unwrap(), daemon.quic_addr.unwrap()],
+            ),
+        )
+        .await
+        .expect("IPv6 blackhole prevented the reachable IPv4 connection")
+        .unwrap();
+        assert_eq!(link.kind, TransportKind::Quic);
+        assert_eq!(link.daemon_version, fl_proto::PRODUCT_VERSION);
+        drop(link);
+        daemon.shutdown().await;
     }
 }

@@ -648,7 +648,7 @@ All bindings can be changed in `keymap.json` and in the Settings → Keyboard ed
 - **UI:**
   - GPUI `TestAppContext` tests for view logic.
   - Visual snapshot tests on Linux CI compared with reference renders.
-  - A Windows smoke test: launch with `--self-test`, which renders offscreen, opens a loopback daemon session and exits 0.
+  - Windows release checks are separate: `--self-test=<report.json>` verifies bundled daemons, Credential Manager and runtime startup; `scripts/smoke_windows_ui.ps1` launches the actual GPUI window, captures workspace/onboarding screenshots and verifies that reopening onboarding preserves the draft. Transport loopback/failover coverage runs in the daemon/client integration suites.
   - A manual checklist per milestone.
 - **Performance (tracked in CI):** terminal throughput (MB/s parse + sync), snapshot sizes, cold start, idle memory, frame time with 20 active terminals.
 
@@ -658,7 +658,7 @@ All bindings can be changed in `keymap.json` and in the Settings → Keyboard ed
 
 | # | Milestone | Exit criteria |
 |---|---|---|
-| M0 | **Foundations:** repo, CI (daemon, client, release), `fl-proto`, `fl-transport` (SSH + QUIC + failover), daemon skeleton, prochost, client window shell with design tokens, connect/install/enroll flow | Owner installs Flotilla.exe, adds the VPS, and sees "Connected · QUIC · 42 ms" in Flotilla chrome; daemon installed by the client |
+| M0 | **Foundations:** repo, CI (daemon, client, release), `fl-proto`, `fl-transport` (SSH + QUIC + failover), daemon skeleton, client window shell with design tokens, connect/install/enroll flow; prochost moves to M1 per the M0 plan | Owner installs Flotilla.exe, adds the VPS, and sees "Connected · QUIC · 42 ms" in Flotilla chrome; daemon installed by the client |
 | M1 | **Terminals:** prochost PTYs, hybrid terminal sync, terminal view, tabs, panes, views, layout persistence, predictive echo | A full remote terminal app with splits that survives sleep, Wi-Fi changes, and daemon restarts |
 | M2 | **Workspaces and git:** workspace/project/worktree sidebar, worktree create/delete, `.worktreeinclude`, scripts (setup/run/teardown), file tree, file viewer/editor, Changes + diff view, git watcher | Agents usable in terminal tabs, one worktree per task, with live +/− counts |
 | M3 | **Forge and Git actions:** GitHub integration, adaptive Git button + dropdown, routes, prompt templates, dispatch modes, Checks tab, review threads, sections | Full commit → PR → checks → merge → delete loop from the UI |
