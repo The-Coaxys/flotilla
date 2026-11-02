@@ -79,10 +79,16 @@ try {
     [System.Windows.Forms.SendKeys]::SendWait('127.0.0.1')
     [System.Windows.Forms.SendKeys]::SendWait('^+n')
     Start-Sleep -Milliseconds 300
+    [void](Capture-Window $window '03-draft-reopened')
     [System.Windows.Forms.Clipboard]::SetText('clipboard-sentinel')
-    [System.Windows.Forms.SendKeys]::SendWait('^a^c')
-    if ([System.Windows.Forms.Clipboard]::GetText() -ne '127.0.0.1') {
-        throw 'Reopening Add host lost the existing draft'
+    [System.Windows.Forms.SendKeys]::SendWait('^a')
+    [System.Windows.Forms.SendKeys]::SendWait('^c')
+    $copyDeadline = [DateTime]::UtcNow.AddSeconds(5)
+    while ([System.Windows.Forms.Clipboard]::GetText() -ne '127.0.0.1') {
+        if ([DateTime]::UtcNow -ge $copyDeadline) {
+            throw 'Reopening Add host lost the existing draft'
+        }
+        Start-Sleep -Milliseconds 100
     }
     @{
         window_title = $process.MainWindowTitle
