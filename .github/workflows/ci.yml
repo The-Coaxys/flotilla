@@ -1,0 +1,166 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+  FLOTILLA_BUILD_ID: ${{ github.sha }}
+
+jobs:
+  daemon:
+    name: daemon — test + static builds
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain (rust-toolchain.toml)
+        run: |
+          rustup toolchain install
+          rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: daemon
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Clippy (non-UI crates)
+        run: cargo clippy --locked --workspace --exclude flc-ui --exclude flotilla --all-targets -- -D warnings
+      - name: Test (non-UI crates)
+        run: cargo test --locked --workspace --exclude flc-ui --exclude flotilla
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.14.1
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
+      - name: Build static daemons (musl)
+        run: |
+          set -euo pipefail
+          for t in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
+            cargo zigbuild --locked --release -p flotillad --target "$t"
+          done
+          mkdir -p dist/daemon
+          cp target/x86_64-unknown-linux-musl/release/flotillad dist/daemon/flotillad-x86_64-unknown-linux-musl
+          cp target/aarch64-unknown-linux-musl/release/flotillad dist/daemon/flotillad-aarch64-unknown-linux-musl
+          file dist/daemon/*
+          ls -l dist/daemon
+          ./dist/daemon/flotillad-x86_64-unknown-linux-musl version --json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: daemon
+          path: dist/daemon/
+          if-no-files-found: error
+
+  ui-check:
+    name: client — Linux type-check (headless gpui)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ui-check
+      - name: Clippy (UI crates)
+        run: cargo clippy --locked -p flc-ui -p flotilla --all-targets -- -D warnings
+      - name: Test (UI crates)
+        run: cargo test --locked -p flc-ui -p flotilla
+
+  windows:
+    name: client — Windows build, self-test, installer
+    needs: daemon
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows
+      - uses: actions/download-artifact@v4
+        with:
+          name: daemon
+          path: dist/daemon
+      - name: Portable tests on Windows
+        run: |
+          cargo test --locked -p fl-proto -p fl-transport --lib
+          cargo test --locked -p flotilla --bins
+      - name: Build flotilla.exe (daemons embedded)
+        shell: pwsh
+        env:
+          FLOTILLA_EMBED_DAEMON_DIR: ${{ github.workspace }}\dist\daemon
+        run: cargo build --locked --release -p flotilla
+      - name: Self-test release binary
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath target\release\flotilla.exe -ArgumentList '--self-test=selftest.json' -Wait -PassThru
+          if (Test-Path selftest.json) { Get-Content selftest.json }
+          if ($p.ExitCode -ne 0) { throw "self-test failed with exit code $($p.ExitCode)" }
+      - name: Build installer (Inno Setup)
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup --no-progress -y | Out-Null }
+          $meta = cargo metadata --locked --format-version 1 --no-deps | ConvertFrom-Json
+          $ver = ($meta.packages | Where-Object { $_.name -eq 'flotilla' }).version
+          New-Item -ItemType Directory -Force dist | Out-Null
+          & $iscc "/DAppVersion=$ver" "/DSourceExe=$PWD\target\release\flotilla.exe" "/O$PWD\dist" packaging\windows\flotilla.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed with $LASTEXITCODE" }
+          Copy-Item target\release\flotilla.exe dist\flotilla.exe
+          Get-ChildItem dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: flotilla-windows-x64
+          path: |
+            dist/Flotilla-Setup-x64.exe
+            dist/flotilla.exe
+          if-no-files-found: error
+
+  release:
+    name: publish release
+    needs: [daemon, ui-check, windows]
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Collect assets
+        run: |
+          set -euo pipefail
+          mkdir -p upload
+          cp artifacts/flotilla-windows-x64/Flotilla-Setup-x64.exe upload/
+          cp artifacts/flotilla-windows-x64/flotilla.exe upload/flotilla-x64.exe
+          cp artifacts/daemon/flotillad-* upload/
+          (cd upload && sha256sum * > SHA256SUMS.txt)
+          ls -l upload
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            gh release create "$GITHUB_REF_NAME" upload/* --title "Flotilla $GITHUB_REF_NAME" --generate-notes
+          else
+            gh release delete nightly --yes --cleanup-tag || true
+            gh release create nightly upload/* --prerelease --target "$GITHUB_SHA" \
+              --title "Flotilla nightly (${GITHUB_SHA::7})" \
+              --notes "Automated build of ${GITHUB_SHA}. Install with Flotilla-Setup-x64.exe."
+          fi
