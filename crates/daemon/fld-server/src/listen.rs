@@ -72,55 +72,98 @@ pub async fn quic_accept_loop(endpoint: quinn::Endpoint, ctx: Arc<SessionCtx>) {
                     Err(_) => return,
                 },
             };
-            // TLS is complete. Opening the control stream and authenticating
-            // its Hello must consume the same budget.
-            let hello_deadline = tokio::time::Instant::now() + ctx.hello_timeout;
-            let (send, recv) = tokio::select! {
-                biased;
-                _ = ctx.shutdown.cancelled() => {
-                    conn.close(0u32.into(), b"daemon shutting down");
-                    return;
-                }
-                _ = tokio::time::sleep_until(hello_deadline) => {
-                    conn.close(0u32.into(), b"hello timeout");
-                    return;
-                }
-                result = accept_ctl(&conn) => match result {
-                    Ok(streams) => streams,
-                    Err(_) => {
-                        conn.close(0u32.into(), b"control stream unavailable");
-                        return;
-                    }
-                },
-            };
-            let (reader, writer) = framed(recv, send);
-            let result = tokio::select! {
-                biased;
-                _ = ctx.shutdown.cancelled() => {
-                    conn.close(0u32.into(), b"daemon shutting down");
-                    return;
-                }
-                result = serve_connection(
-                    ctx.clone(), reader, writer, PeerKind::Quic, hello_deadline,
-                ) => result,
-            };
-            let close_deadline = match result {
-                Ok(SessionEnd::HelloTimeout) => hello_deadline + HELLO_TIMEOUT_GRACE,
-                Ok(SessionEnd::Finished) => tokio::time::Instant::now() + Duration::from_secs(5),
-                Err(e) => {
-                    tracing::debug!("quic session ended: {e}");
-                    tokio::time::Instant::now() + Duration::from_secs(5)
-                }
-            };
-            // Let the client read our last frame and close first, but do not
-            // extend the authentication budget beyond a brief rejection grace.
-            tokio::select! {
-                biased;
-                _ = ctx.shutdown.cancelled() => {}
-                _ = tokio::time::sleep_until(close_deadline) => {}
-                _ = conn.closed() => {}
-            }
-            conn.close(0u32.into(), b"bye");
+            serve_quic_connection(ctx, conn).await;
         });
     }
+}
+
+/// Every bidirectional stream is a logical stream: a control session or a
+/// ticket-bound channel. The connection lives while any stream is active.
+async fn serve_quic_connection(ctx: Arc<SessionCtx>, conn: quinn::Connection) {
+    // TLS is complete. Opening the first stream and authenticating its first
+    // message must consume the same budget.
+    let hello_deadline = tokio::time::Instant::now() + ctx.hello_timeout;
+    let first = tokio::select! {
+        biased;
+        _ = ctx.shutdown.cancelled() => {
+            conn.close(0u32.into(), b"daemon shutting down");
+            return;
+        }
+        _ = tokio::time::sleep_until(hello_deadline) => {
+            conn.close(0u32.into(), b"hello timeout");
+            return;
+        }
+        result = accept_ctl(&conn) => match result {
+            Ok(streams) => streams,
+            Err(_) => {
+                conn.close(0u32.into(), b"control stream unavailable");
+                return;
+            }
+        },
+    };
+    let mut streams = tokio::task::JoinSet::new();
+    let spawn_stream = |streams: &mut tokio::task::JoinSet<_>,
+                        (send, recv): (quinn::SendStream, quinn::RecvStream),
+                        deadline: tokio::time::Instant| {
+        let ctx = ctx.clone();
+        streams.spawn(async move {
+            let (reader, writer) = framed(recv, send);
+            (
+                serve_connection(ctx, reader, writer, PeerKind::Quic, deadline).await,
+                deadline,
+            )
+        });
+    };
+    spawn_stream(&mut streams, first, hello_deadline);
+    let mut authenticated = false;
+    let mut idle_deadline = None;
+    loop {
+        let idle = async {
+            match idle_deadline {
+                Some(deadline) => tokio::time::sleep_until(deadline).await,
+                None => std::future::pending().await,
+            }
+        };
+        tokio::select! {
+            biased;
+            _ = ctx.shutdown.cancelled() => {
+                conn.close(0u32.into(), b"daemon shutting down");
+                return;
+            }
+            settled = streams.join_next(), if !streams.is_empty() => {
+                match settled {
+                    Some(Ok((Ok(SessionEnd::HelloTimeout), deadline))) if !authenticated => {
+                        if streams.is_empty() {
+                            // Do not extend the authentication budget beyond
+                            // a brief rejection grace.
+                            tokio::select! {
+                                _ = tokio::time::sleep_until(deadline + HELLO_TIMEOUT_GRACE) => {}
+                                _ = conn.closed() => {}
+                            }
+                            conn.close(0u32.into(), b"hello timeout");
+                            return;
+                        }
+                    }
+                    Some(Ok((Ok(SessionEnd::Finished), _))) => authenticated = true,
+                    Some(Ok((Err(e), _))) => tracing::debug!("quic stream ended: {e}"),
+                    _ => {}
+                }
+                if streams.is_empty() {
+                    // Let the client read our last frame and close first.
+                    idle_deadline = Some(tokio::time::Instant::now() + Duration::from_secs(5));
+                }
+            }
+            _ = idle => break,
+            _ = conn.closed() => break,
+            accepted = accept_ctl(&conn) => match accepted {
+                Ok(stream) => {
+                    idle_deadline = None;
+                    spawn_stream(&mut streams, stream, tokio::time::Instant::now() + ctx.hello_timeout);
+                }
+                Err(_) => break,
+            },
+        }
+    }
+    streams.abort_all();
+    conn.close(0u32.into(), b"bye");
 }

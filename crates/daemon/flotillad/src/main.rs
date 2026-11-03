@@ -52,6 +52,8 @@ enum Command {
     },
     /// Bridge stdin/stdout to the daemon socket (SSH fallback transport).
     Attach,
+    /// Own persistent PTYs independently from the workspace daemon.
+    Prochost,
     /// Install and (re)start the per-user service.
     InstallService {
         /// Only write the unit file.
@@ -94,6 +96,13 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         Command::Status { json } => status(json).await,
         Command::Enroll { device_name } => enroll(&device_name),
         Command::Attach => attach().await,
+        Command::Prochost => {
+            init_logging();
+            let home = FlotillaHome::from_env()?;
+            home.ensure_dirs()?;
+            fld_prochost::serve(home.root().to_path_buf()).await?;
+            Ok(ExitCode::SUCCESS)
+        }
         Command::InstallService {
             no_start,
             no_systemd,
@@ -107,7 +116,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
     }
 }
 
-async fn serve(quic: SocketAddr, no_quic: bool) -> Result<ExitCode> {
+fn init_logging() {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_env("FLOTILLA_LOG")
@@ -115,9 +124,17 @@ async fn serve(quic: SocketAddr, no_quic: bool) -> Result<ExitCode> {
         )
         .with_writer(std::io::stderr)
         .init();
+}
+
+async fn serve(quic: SocketAddr, no_quic: bool) -> Result<ExitCode> {
+    init_logging();
     let home = FlotillaHome::from_env()?;
     let mut config = DaemonConfig::new(home);
     config.quic_bind = (!no_quic).then_some(quic);
+    // PTYs live in `<this executable> prochost`, a detached host that outlives
+    // daemon restarts and upgrades.
+    config.prochost_executable =
+        Some(std::env::current_exe().context("locating this executable for the process host")?);
     let daemon = fld_server::start(config).await?;
     tracing::info!(
         socket = %daemon.socket_path.display(),

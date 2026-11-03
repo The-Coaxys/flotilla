@@ -887,3 +887,91 @@ fn state_paths_reject_symlink_components_database_and_sidecars() {
     assert!(matches!(Database::open(&actual), Err(StoreError::Io(_))));
     assert_eq!(fs::read(&target).unwrap(), b"preserved");
 }
+
+#[test]
+fn relaunch_replaces_incarnation_clears_state_and_rejects_stale_keys() {
+    let temporary = TempDir::new().unwrap();
+    let mut database = Database::open(temporary.path()).unwrap();
+    let (_, op, entry) = create_terminal(&mut database);
+    let old = key_of(&entry);
+    database.update_process(&process(&entry)).unwrap();
+    database
+        .set_launch_error(old, Some("previous failure"))
+        .unwrap();
+    database
+        .save_checkpoint_ref(old, &checkpoint(10, 80, 7))
+        .unwrap();
+    let relaunched = database.relaunch_terminal(old).unwrap();
+    assert_eq!(relaunched.spec.terminal, entry.spec.terminal);
+    assert_ne!(relaunched.spec.incarnation, entry.spec.incarnation);
+    assert_eq!(relaunched.spec.argv, entry.spec.argv);
+    assert_eq!(relaunched.spec.cwd, entry.spec.cwd);
+    assert_eq!(relaunched.spec.env, entry.spec.env);
+    assert_eq!(relaunched.spec.size, entry.spec.size);
+    assert_eq!(relaunched.spec.quota_bytes, entry.spec.quota_bytes);
+    assert_eq!(relaunched.worktree, entry.worktree);
+    assert!(relaunched.desired);
+    assert!(relaunched.process.is_none());
+    assert!(relaunched.checkpoint.is_none());
+    assert!(relaunched.launch_error.is_none());
+    assert!(database.checkpoint_hashes().unwrap().is_empty());
+    // Durable across a real reopen, and the old key is permanently stale.
+    drop(database);
+    let mut database = Database::open(temporary.path()).unwrap();
+    let new = key_of(&relaunched);
+    assert_eq!(
+        postcard::to_stdvec(&database.terminal(new).unwrap()).unwrap(),
+        postcard::to_stdvec(&relaunched).unwrap()
+    );
+    assert!(matches!(
+        database.terminal(old),
+        Err(StoreError::WrongIncarnation)
+    ));
+    assert!(matches!(
+        database.relaunch_terminal(old),
+        Err(StoreError::WrongIncarnation)
+    ));
+    assert!(matches!(
+        database.update_process(&process(&entry)),
+        Err(StoreError::WrongIncarnation)
+    ));
+    assert!(matches!(
+        database.relaunch_terminal(TerminalKey {
+            terminal: TerminalId::new(),
+            incarnation: new.incarnation,
+        }),
+        Err(StoreError::NotFound(_))
+    ));
+    // A closed intent is a cleanup obligation, never a relaunch candidate.
+    close_tab(&mut database, tab_id(&op));
+    let before = snapshot(&database);
+    assert!(matches!(
+        database.relaunch_terminal(new),
+        Err(StoreError::Invalid(message)) if message.contains("closed")
+    ));
+    assert_eq!(snapshot(&database), before);
+}
+
+#[test]
+fn failed_relaunch_rolls_back_the_incarnation_row() {
+    let temporary = TempDir::new().unwrap();
+    let mut database = Database::open(temporary.path()).unwrap();
+    let (_, _, entry) = create_terminal(&mut database);
+    database
+        .save_checkpoint_ref(key_of(&entry), &checkpoint(4, 16, 3))
+        .unwrap();
+    let before = snapshot(&database);
+    database.connection.execute_batch("CREATE TRIGGER fail_relaunch AFTER UPDATE ON terminals BEGIN SELECT RAISE(ABORT, 'injected relaunch failure'); END;").unwrap();
+    assert!(matches!(
+        database.relaunch_terminal(key_of(&entry)),
+        Err(StoreError::Sqlite(_))
+    ));
+    assert_eq!(snapshot(&database), before);
+    database
+        .connection
+        .execute_batch("DROP TRIGGER fail_relaunch")
+        .unwrap();
+    let unchanged = database.terminal(key_of(&entry)).unwrap();
+    assert_eq!(unchanged.checkpoint, Some(checkpoint(4, 16, 3)));
+    assert!(database.relaunch_terminal(key_of(&entry)).is_ok());
+}

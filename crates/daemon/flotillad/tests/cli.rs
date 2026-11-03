@@ -187,8 +187,18 @@ async fn attach_bridges_stdio_to_the_daemon() {
         .unwrap();
     assert!(status.success());
 
-    daemon.start_kill().unwrap();
-    let _ = daemon.wait().await;
+    // SIGTERM, not SIGKILL: a killed daemon intentionally leaves its process
+    // host running so shells survive; a graceful stop shuts an idle host down.
+    let pid = daemon.id().unwrap() as libc::pid_t;
+    // SAFETY: signalling the child process this test spawned.
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+    let status = tokio::time::timeout(Duration::from_secs(10), daemon.wait())
+        .await
+        .expect("daemon stops on SIGTERM")
+        .unwrap();
+    assert!(status.success());
+    let host_socket = home.join(".flotilla/run/prochost.sock");
+    wait_for(|| !host_socket.exists(), "idle process host shutdown").await;
 }
 
 #[tokio::test]

@@ -305,6 +305,48 @@ impl Database {
         Ok(())
     }
 
+    /// Replace a lost child incarnation of a still-desired terminal. The old
+    /// incarnation's offsets, checkpoint and input identities can never be
+    /// accepted again; its checkpoint blob is reclaimed by later GC.
+    pub fn relaunch_terminal(&mut self, key: TerminalKey) -> Result<TerminalEntry> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (_, terminals) = load_state(&transaction)?;
+        let mut entry = terminals
+            .into_iter()
+            .find(|entry| entry.spec.terminal == key.terminal)
+            .ok_or(StoreError::NotFound(key.terminal))?;
+        require_incarnation(&entry, key)?;
+        if !entry.desired {
+            return Err(StoreError::Invalid(
+                "terminal was closed; it cannot be relaunched".into(),
+            ));
+        }
+        entry.spec.incarnation = IncarnationId::new();
+        entry.process = None;
+        entry.checkpoint = None;
+        entry.launch_error = None;
+        validate_entry(&entry).map_err(StoreError::Invalid)?;
+        let bytes = encode_entry(&entry)?;
+        let changed = transaction.execute(
+            "UPDATE terminals SET incarnation=?3,entry=?4 WHERE terminal=?1 AND incarnation=?2 AND desired=1",
+            params![
+                key.terminal.as_bytes().as_slice(),
+                key.incarnation.as_bytes().as_slice(),
+                entry.spec.incarnation.as_bytes().as_slice(),
+                bytes
+            ],
+        )?;
+        if changed != 1 {
+            return Err(corrupt(
+                "terminal relaunch did not replace exactly one incarnation",
+            ));
+        }
+        transaction.commit()?;
+        Ok(entry)
+    }
+
     pub fn checkpoint_hashes(&self) -> Result<Vec<BlobHash>> {
         let mut hashes: Vec<_> = self
             .list_terminals()?

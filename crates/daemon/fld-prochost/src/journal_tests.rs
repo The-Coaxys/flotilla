@@ -242,7 +242,6 @@ fn hot_ring_evicts_bytes_but_disk_keeps_contiguous_required_suffix() {
     assert_eq!(cursor, log.tail());
 }
 
-
 #[test]
 fn interrupted_final_appends_are_removed_without_losing_committed_records() {
     for cut in [

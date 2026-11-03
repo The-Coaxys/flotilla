@@ -2455,8 +2455,13 @@ name = "fld-server"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "fl-model",
+ "fl-prochost-proto",
  "fl-proto",
+ "fl-term",
  "fl-transport",
+ "fld-prochost",
+ "fld-store",
  "getrandom 0.3.4",
  "hex",
  "quinn",

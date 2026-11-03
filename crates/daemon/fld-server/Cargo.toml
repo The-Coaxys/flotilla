@@ -1,6 +1,6 @@
 [package]
 name = "fld-server"
-description = "Flotilla daemon core: state home, device registry, sessions, listeners"
+description = "Flotilla daemon core: state home, device registry, sessions, listeners, terminals"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,8 +8,14 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+anyhow.workspace = true
+fl-model.workspace = true
+fl-prochost-proto.workspace = true
 fl-proto.workspace = true
+fl-term.workspace = true
 fl-transport.workspace = true
+fld-prochost.workspace = true
+fld-store.workspace = true
 getrandom.workspace = true
 hex.workspace = true
 quinn.workspace = true
@@ -23,5 +29,4 @@ tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
-anyhow.workspace = true
 tempfile.workspace = true

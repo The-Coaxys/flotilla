@@ -1,10 +1,13 @@
-//! Flotilla daemon core: state home, device registry, control sessions, and
-//! listeners (Unix socket for SSH-forwarded peers, QUIC for direct peers).
+//! Flotilla daemon core: state home, device registry, control sessions,
+//! listeners (Unix socket for SSH-forwarded peers, QUIC for direct peers) and
+//! the persistent terminal service.
+pub mod channels;
 pub mod devices;
 pub mod identity;
 pub mod listen;
 pub mod paths;
 pub mod session;
+mod terminal;
 
 use std::io::Write;
 use std::net::SocketAddr;
@@ -18,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+pub use fld_store::LaunchDefaults;
 pub use paths::FlotillaHome;
 
 #[derive(Debug, thiserror::Error)]
@@ -41,6 +45,26 @@ pub struct DaemonConfig {
     pub quic_bind: Option<SocketAddr>,
     /// Complete authentication budget, including QUIC control-stream acceptance.
     pub hello_timeout: Duration,
+    /// Installed multi-call executable started as `<exe> prochost` when no
+    /// process host answers; the daemon then also stops it when idle at
+    /// shutdown. `None` (the default) only connects to an externally managed host.
+    pub prochost_executable: Option<PathBuf>,
+    /// Launch policy for new terminals (empty argv: the user's login shell).
+    pub launch: LaunchDefaults,
+}
+
+/// Production launch policy: login shell in `$HOME`, 256 MiB journal quota.
+pub fn default_launch() -> LaunchDefaults {
+    LaunchDefaults {
+        cwd: String::new(),
+        argv: Vec::new(),
+        env: [
+            ("TERM".to_string(), "xterm-256color".to_string()),
+            ("COLORTERM".to_string(), "truecolor".to_string()),
+        ]
+        .into(),
+        quota_bytes: fl_prochost_proto::DEFAULT_QUOTA_BYTES,
+    }
 }
 
 impl DaemonConfig {
@@ -49,6 +73,8 @@ impl DaemonConfig {
             home,
             quic_bind: Some(SocketAddr::from(([0, 0, 0, 0], 7443))),
             hello_timeout: Duration::from_secs(3),
+            prochost_executable: None,
+            launch: default_launch(),
         }
     }
 }
@@ -71,6 +97,7 @@ pub struct DaemonHandle {
     cancel: CancellationToken,
     tasks: Vec<JoinHandle<()>>,
     quic: Option<quinn::Endpoint>,
+    terminals: Arc<terminal::TerminalService>,
 }
 
 /// Start listening. Fails with `AlreadyRunning` if another daemon owns the socket.
@@ -92,6 +119,12 @@ pub async fn start(config: DaemonConfig) -> Result<DaemonHandle, ServerError> {
         None => None,
     };
     let quic_addr = quic.as_ref().and_then(|ep| ep.local_addr().ok());
+    let terminals = terminal::TerminalService::start(
+        &home,
+        config.prochost_executable.clone(),
+        config.launch.clone(),
+    )
+    .await?;
     let cancel = CancellationToken::new();
     let ctx = Arc::new(session::SessionCtx {
         registry: Arc::new(devices::DeviceRegistry::new(home.devices_path())),
@@ -103,6 +136,8 @@ pub async fn start(config: DaemonConfig) -> Result<DaemonHandle, ServerError> {
             socket_path: socket_path.display().to_string(),
         },
         shutdown: cancel.clone(),
+        channels: Arc::default(),
+        terminals: terminals.clone(),
     });
     let mut tasks = vec![tokio::spawn(listen::unix_accept_loop(unix, ctx.clone()))];
     if let Some(ep) = &quic {
@@ -127,6 +162,7 @@ pub async fn start(config: DaemonConfig) -> Result<DaemonHandle, ServerError> {
         cancel,
         tasks,
         quic,
+        terminals,
     })
 }
 
@@ -144,6 +180,7 @@ impl DaemonHandle {
         for t in std::mem::take(&mut self.tasks) {
             let _ = t.await;
         }
+        self.terminals.shutdown().await;
         let _ = std::fs::remove_file(&self.socket_path);
         let _ = std::fs::remove_file(self.home.runtime_info_path());
     }
@@ -152,6 +189,7 @@ impl DaemonHandle {
 impl Drop for DaemonHandle {
     fn drop(&mut self) {
         self.cancel.cancel();
+        self.terminals.abort();
     }
 }
 
