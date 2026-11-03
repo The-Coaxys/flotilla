@@ -18,7 +18,7 @@ pub use alacritty_terminal::term::cell::{Cell, Flags};
 pub use alacritty_terminal::term::{PromptState, TermMode};
 pub use effects::{ClipboardTarget, Effect, EffectKind};
 pub use fl_model::Size;
-pub use vte::ansi::{Color, CursorShape};
+pub use vte::ansi::{Color, CursorShape, NamedColor};
 
 pub const ENGINE_ID: &str = "flotilla-term/1;alacritty/0.26.0;vte/0.15.0";
 const MAGIC: &[u8; 8] = b"FLTERM01";
