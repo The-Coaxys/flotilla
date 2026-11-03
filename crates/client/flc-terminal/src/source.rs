@@ -79,6 +79,17 @@ pub trait TerminalSource: Send + Sync + 'static {
 
     /// The child process exited; the last frame stays readable.
     fn exited(&self) -> Option<Exited>;
+
+    /// Canonical PTY echo state, when the session tracks it. `None` disables
+    /// predictive echo: guessing on a password prompt would print secrets.
+    fn echo(&self) -> Option<bool> {
+        None
+    }
+
+    /// Current control-link round-trip time, for `EchoPolicy::Auto`.
+    fn rtt(&self) -> Option<std::time::Duration> {
+        None
+    }
 }
 
 /// Resolves once the source has published past generation `seen`; the

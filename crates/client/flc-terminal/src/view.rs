@@ -32,6 +32,7 @@ use crate::grid::{CellHit, CellMetrics, ResizeDebounce, ResizeStep, cell_at, gri
 use crate::keys::{self, Route, Stroke, StrokeModifiers};
 use crate::links::{Link, link_at};
 use crate::mouse::{MouseReporter, WheelAccumulator, WheelAction, wheel_action};
+use crate::predict::{EchoPolicy, PredictionContext, Predictor};
 use crate::runs::{
     BgQuad, CursorGlyph, RowLayout, RunKind, Underline, default_colors, layout_row,
     merge_backgrounds,
@@ -54,6 +55,8 @@ const RESIZE_DEBOUNCE: Duration = Duration::from_millis(60);
 /// set per surface).
 #[derive(Debug, Clone, PartialEq)]
 pub struct TerminalViewOptions {
+    /// Predictive-echo policy; `Auto` needs a slow link and a shell prompt.
+    pub echo_policy: EchoPolicy,
     /// `None`: the theme's terminal font (Cascadia Mono).
     pub font_family: Option<SharedString>,
     /// `None`: the theme's monospace size.
@@ -66,6 +69,7 @@ pub struct TerminalViewOptions {
 impl Default for TerminalViewOptions {
     fn default() -> Self {
         Self {
+            echo_policy: EchoPolicy::default(),
             font_family: None,
             font_size: None,
             line_height: 1.0,
@@ -229,6 +233,7 @@ pub struct TerminalView {
     search: Option<SearchState>,
     mouse: MouseReporter,
     wheel: WheelAccumulator,
+    predict: Predictor,
     resize: ResizeDebounce,
     resize_check: Option<Task<()>>,
     /// IME composition (preedit); never sent until committed.
@@ -374,6 +379,7 @@ impl TerminalView {
             search: None,
             mouse: MouseReporter::default(),
             wheel: WheelAccumulator::default(),
+            predict: Predictor::default(),
             resize: ResizeDebounce::new(RESIZE_DEBOUNCE),
             resize_check: None,
             marked: String::new(),
@@ -597,8 +603,29 @@ impl TerminalView {
                 }
             }
         }
+        let context = self.prediction_context();
+        if context.allows(&self.frame) {
+            self.predict.reconcile(&self.frame);
+        } else {
+            self.predict.clear();
+        }
         cx.notify();
         generation
+    }
+
+    fn prediction_context(&self) -> PredictionContext {
+        PredictionContext {
+            policy: self.options.echo_policy,
+            rtt: self.source.rtt(),
+            echo: self.source.echo() == Some(true),
+            stale: self.stale,
+            exited: self.exited.is_some(),
+        }
+    }
+
+    /// The unconfirmed overlay, if any.
+    pub(crate) fn prediction(&self) -> Option<&crate::predict::Prediction> {
+        self.predict.pending()
     }
 
     fn report_focus(&self, focused: bool) {
@@ -726,6 +753,8 @@ impl TerminalView {
         {
             self.source.resize(requested);
         }
+        let context = self.prediction_context();
+        self.predict.typed(&self.frame, context, &bytes);
         self.source.send_input(bytes);
         self.selection = None;
         self.hold_blink();
@@ -1535,6 +1564,36 @@ impl Element for TerminalElement {
                 for run in &cached.shaped {
                     let x = geometry.origin.x + px(run.column as f32 * metrics.cell_width);
                     let _ = run.line.paint(point(x, y), line_height, window, cx);
+                }
+            }
+            // Unconfirmed predictive echo: dim, at the cursor, gone the moment
+            // the daemon's real output arrives or disagrees.
+            let overlay = {
+                let view = self.view.read(cx);
+                view.prediction().cloned().zip(view.fonts.clone())
+            };
+            if let Some((prediction, fonts)) = overlay {
+                let row = prediction.row;
+                if row >= 0 && (row as u32) < geometry.visible_rows as u32 {
+                    let text: SharedString = prediction.text.clone().into();
+                    let color = hsla(cache.colors[NamedColor::Foreground as usize]).opacity(0.6);
+                    let run = TextRun {
+                        len: text.len(),
+                        font: fonts.variant(false, false),
+                        color,
+                        background_color: None,
+                        underline: None,
+                        strikethrough: None,
+                    };
+                    let line = window.text_system().shape_line(
+                        text,
+                        fonts.key.size,
+                        &[run],
+                        Some(px(metrics.cell_width)),
+                    );
+                    let x = geometry.origin.x + px(prediction.column as f32 * metrics.cell_width);
+                    let y = geometry.origin.y + px(row as f32 * metrics.line_height);
+                    let _ = line.paint(point(x, y), line_height, window, cx);
                 }
             }
             if let Some((area, paint, color)) = cursor {

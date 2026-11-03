@@ -14,11 +14,13 @@ pub mod grid;
 pub mod keys;
 pub mod links;
 pub mod mouse;
+pub mod predict;
 pub mod runs;
 pub mod search;
 pub mod selection;
 mod source;
 mod view;
 
+pub use predict::{EchoPolicy, Prediction, PredictionContext, PredictionOutcome, Predictor};
 pub use source::{Exited, TerminalSource};
 pub use view::{SearchStatus, TerminalEvent, TerminalView, TerminalViewOptions};
