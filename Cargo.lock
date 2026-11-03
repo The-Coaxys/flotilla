@@ -2401,9 +2401,12 @@ name = "flc-conn"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "fl-model",
  "fl-proto",
+ "fl-term",
  "fl-testkit",
  "fl-transport",
+ "fld-prochost",
  "fld-server",
  "futures",
  "getrandom 0.3.4",
@@ -2417,6 +2420,40 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+]
+
+[[package]]
+name = "flc-sync"
+version = "0.2.0"
+dependencies = [
+ "fl-model",
+ "fl-prochost-proto",
+ "fl-proto",
+ "fl-term",
+ "fl-testkit",
+ "fl-transport",
+ "flc-conn",
+ "fld-prochost",
+ "fld-server",
+ "postcard",
+ "serde",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
+name = "flc-terminal"
+version = "0.2.0"
+dependencies = [
+ "fl-model",
+ "fl-term",
+ "flc-ui",
+ "gpui",
+ "unicode-width",
 ]
 
 [[package]]

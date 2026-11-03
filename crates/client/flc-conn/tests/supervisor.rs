@@ -1,130 +1,13 @@
 #![cfg(unix)]
 //! Supervisor tests against an in-process daemon, the test SSH server, and a
 //! UDP relay that can black-hole QUIC.
-use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use fl_testkit::ssh_server::TestSshServer;
-use fl_testkit::udp_relay::UdpRelay;
-use fl_transport::ssh::{HostKeyPolicy, SshAuth, SshTarget};
-use flc_conn::supervisor::{ConnPhase, ConnectSpec, QuicSpec, Supervisor, Timings, TransportKind};
-use fld_server::devices::DeviceRegistry;
-use fld_server::{DaemonConfig, DaemonHandle, FlotillaHome};
-use tokio::sync::watch;
+use fl_transport::ssh::HostKeyPolicy;
+use flc_conn::supervisor::{ConnPhase, Supervisor, TransportKind};
 
-fn fast() -> Timings {
-    Timings {
-        heartbeat: Duration::from_millis(100),
-        dead_after: Duration::from_millis(500),
-        quic_reprobe: Duration::from_millis(300),
-        backoff_min: Duration::from_millis(50),
-        backoff_max: Duration::from_millis(300),
-        connect_timeout: Duration::from_secs(2),
-    }
-}
-
-fn home(dir: &Path) -> FlotillaHome {
-    FlotillaHome::new(dir.join(".flotilla"))
-}
-
-async fn start_daemon(dir: &Path) -> DaemonHandle {
-    let mut config = DaemonConfig::new(home(dir));
-    config.quic_bind = Some("127.0.0.1:0".parse().unwrap());
-    config.hello_timeout = Duration::from_secs(2);
-    fld_server::start(config).await.unwrap()
-}
-
-struct Harness {
-    dir: tempfile::TempDir,
-    daemon: Option<DaemonHandle>,
-    ssh: TestSshServer,
-    key: PathBuf,
-    device: (String, String),
-    relay: UdpRelay,
-}
-
-impl Harness {
-    async fn new() -> Self {
-        let dir = tempfile::tempdir().unwrap();
-        let daemon = start_daemon(dir.path()).await;
-        let device = DeviceRegistry::new(home(dir.path()).devices_path())
-            .enroll("test")
-            .unwrap();
-        let ssh = TestSshServer::start(dir.path()).await.unwrap();
-        let key = dir.path().join("id_ed25519");
-        let ok = std::process::Command::new("ssh-keygen")
-            .args(["-q", "-t", "ed25519", "-N", "", "-f"])
-            .arg(&key)
-            .status()
-            .unwrap()
-            .success();
-        assert!(ok);
-        let relay = UdpRelay::start(daemon.quic_addr.unwrap()).await.unwrap();
-        Self {
-            dir,
-            daemon: Some(daemon),
-            ssh,
-            key,
-            device,
-            relay,
-        }
-    }
-
-    fn spec(&self, with_quic: bool) -> ConnectSpec {
-        let d = self.daemon.as_ref().expect("daemon running");
-        ConnectSpec {
-            ssh: SshTarget {
-                host: "127.0.0.1".into(),
-                port: self.ssh.addr.port(),
-                user: "tester".into(),
-            },
-            auth: SshAuth::KeyFile {
-                path: self.key.clone(),
-            },
-            host_key: HostKeyPolicy::Expect(self.ssh.host_key_fingerprint.clone()),
-            socket_path: d.socket_path.display().to_string(),
-            quic: with_quic.then(|| QuicSpec {
-                host: "127.0.0.1".into(),
-                port: self.relay.addr.port(),
-                cert_sha256: d.cert_sha256,
-            }),
-            device_id: Some(self.device.0.clone()),
-            token: Some(self.device.1.clone()),
-            client_version: "supervisor-test".into(),
-            timings: fast(),
-        }
-    }
-}
-
-async fn wait_phase(
-    rx: &mut watch::Receiver<ConnPhase>,
-    within: Duration,
-    what: &str,
-    pred: impl Fn(&ConnPhase) -> bool,
-) -> ConnPhase {
-    let fut = async {
-        loop {
-            let current = rx.borrow_and_update().clone();
-            if pred(&current) {
-                return current;
-            }
-            if rx.changed().await.is_err() {
-                panic!("supervisor stopped while waiting for {what}");
-            }
-        }
-    };
-    match tokio::time::timeout(within, fut).await {
-        Ok(p) => p,
-        Err(_) => panic!(
-            "timed out after {within:?} waiting for {what}; last phase: {:?}",
-            *rx.borrow()
-        ),
-    }
-}
-
-fn connected(kind: TransportKind) -> impl Fn(&ConnPhase) -> bool {
-    move |p| matches!(p, ConnPhase::Connected { kind: k, .. } if *k == kind)
-}
+mod support;
+use support::{Harness, connected, start_daemon, wait_phase};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn connects_over_quic_when_available() {
