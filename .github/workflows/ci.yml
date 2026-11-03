@@ -103,6 +103,8 @@ jobs:
           cargo test --locked --target x86_64-pc-windows-msvc -p fl-proto -p fl-transport --lib
           cargo test --locked --target x86_64-pc-windows-msvc -p flotilla --bins
           cargo test --locked --target x86_64-pc-windows-msvc -p flc-terminal --lib
+          cargo test --locked --target x86_64-pc-windows-msvc -p flc-shell --lib
+          cargo test --locked --target x86_64-pc-windows-msvc -p flc-sync --lib
       - name: Build flotilla.exe (daemons embedded)
         shell: pwsh
         env:
