@@ -34,7 +34,9 @@ jobs:
         with:
           key: daemon
       - name: Format
-        run: cargo fmt --all --check
+        # Without --all: checks every workspace member but not the vendored
+        # Alacritty/VTE path dependencies, which keep upstream's nightly style.
+        run: cargo fmt --check
       - name: Clippy (non-UI crates)
         run: cargo clippy --locked --workspace --exclude flc-ui --exclude flotilla --all-targets -- -D warnings
       - name: Test (non-UI crates)
