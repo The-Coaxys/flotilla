@@ -990,11 +990,23 @@ impl TerminalView {
         if let Some(fonts) = self.fonts.as_ref().filter(|f| f.key == key) {
             return fonts.clone();
         }
+        // A family that is not installed would silently resolve to a
+        // proportional system face (glyphs drift inside their cells, as on
+        // Windows 10 or Linux without Cascadia): use the bundled monospace
+        // face instead.
+        let installed = window.text_system().all_font_names();
+        let family = if installed
+            .iter()
+            .any(|name| name.as_str() == key.family.as_ref())
+        {
+            key.family.clone()
+        } else {
+            theme.font_mono.clone()
+        };
         let regular = Font {
-            family: key.family.clone(),
+            family,
             // One glyph per cell: no contextual alternates or ligatures.
             features: FontFeatures(Arc::new(vec![("calt".into(), 0), ("liga".into(), 0)])),
-            // The bundled monospace face covers machines without Cascadia.
             fallbacks: Some(FontFallbacks::from_fonts(vec![theme.font_mono.to_string()])),
             weight: FontWeight::NORMAL,
             style: FontStyle::Normal,

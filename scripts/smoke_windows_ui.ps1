@@ -16,6 +16,15 @@ public static class FlotillaSmokeWindow {
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr window);
     [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
     [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr window, int command);
+    [StructLayout(LayoutKind.Sequential)]
+    public struct Point { public int X, Y; }
+    [DllImport("user32.dll")] public static extern bool GetClientRect(IntPtr window, out Rect rect);
+    [DllImport("user32.dll")] public static extern bool ClientToScreen(IntPtr window, ref Point point);
+    [DllImport("user32.dll")] public static extern uint GetDpiForWindow(IntPtr window);
+    [DllImport("user32.dll")] public static extern bool IsZoomed(IntPtr window);
+    [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr window);
+    [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
+    [DllImport("user32.dll")] public static extern void mouse_event(uint flags, uint dx, uint dy, uint data, UIntPtr extra);
 }
 '@
 
@@ -51,6 +60,37 @@ function Capture-Window([IntPtr]$Window, [string]$Name) {
     } finally {
         $graphics.Dispose()
         $bitmap.Dispose()
+    }
+}
+
+# Screen point of a title-bar location, `FromRight` logical pixels left of the
+# client area's right edge (caption buttons are 46 px wide, the bar 36 px tall).
+function Get-TitlePoint([IntPtr]$Window, [double]$FromRight, [double]$FromLeft = -1) {
+    $client = New-Object FlotillaSmokeWindow+Rect
+    if (-not [FlotillaSmokeWindow]::GetClientRect($Window, [ref]$client)) { throw 'Cannot read the client area' }
+    $origin = New-Object FlotillaSmokeWindow+Point
+    if (-not [FlotillaSmokeWindow]::ClientToScreen($Window, [ref]$origin)) { throw 'Cannot map the client area' }
+    $scale = [FlotillaSmokeWindow]::GetDpiForWindow($Window) / 96.0
+    $x = if ($FromLeft -ge 0) { $origin.X + [int]($FromLeft * $scale) } else { $origin.X + $client.Right - [int]($FromRight * $scale) }
+    $point = New-Object FlotillaSmokeWindow+Point
+    $point.X = $x
+    $point.Y = $origin.Y + [int](18 * $scale)
+    return $point
+}
+
+function Click-At($Point) {
+    [void][FlotillaSmokeWindow]::SetCursorPos($Point.X, $Point.Y)
+    Start-Sleep -Milliseconds 150
+    [FlotillaSmokeWindow]::mouse_event(0x0002, 0, 0, 0, [UIntPtr]::Zero)
+    Start-Sleep -Milliseconds 80
+    [FlotillaSmokeWindow]::mouse_event(0x0004, 0, 0, 0, [UIntPtr]::Zero)
+}
+
+function Wait-For([scriptblock]$Condition, [string]$What) {
+    $until = [DateTime]::UtcNow.AddSeconds(5)
+    while (-not (& $Condition)) {
+        if ([DateTime]::UtcNow -ge $until) { throw "Caption smoke: $What" }
+        Start-Sleep -Milliseconds 100
     }
 }
 
@@ -90,11 +130,49 @@ try {
         }
         Start-Sleep -Milliseconds 100
     }
+    $title = $process.MainWindowTitle
+    # The client-drawn caption buttons must drive the real window: restore,
+    # maximize, drag, minimize and finally close the app.
+    [void][FlotillaSmokeWindow]::SetForegroundWindow($window)
+    Wait-For { [FlotillaSmokeWindow]::IsZoomed($window) } 'the window did not start maximized'
+    Click-At (Get-TitlePoint $window 69)
+    Wait-For { -not [FlotillaSmokeWindow]::IsZoomed($window) } 'Maximize/Restore did not restore'
+    Start-Sleep -Milliseconds 500
+    $before = New-Object FlotillaSmokeWindow+Rect
+    [void][FlotillaSmokeWindow]::GetWindowRect($window, [ref]$before)
+    $grab = Get-TitlePoint $window 0 200
+    [void][FlotillaSmokeWindow]::SetCursorPos($grab.X, $grab.Y)
+    Start-Sleep -Milliseconds 150
+    [FlotillaSmokeWindow]::mouse_event(0x0002, 0, 0, 0, [UIntPtr]::Zero)
+    for ($step = 1; $step -le 10; $step++) {
+        Start-Sleep -Milliseconds 40
+        [void][FlotillaSmokeWindow]::SetCursorPos($grab.X + 12 * $step, $grab.Y + 6 * $step)
+    }
+    Start-Sleep -Milliseconds 150
+    [FlotillaSmokeWindow]::mouse_event(0x0004, 0, 0, 0, [UIntPtr]::Zero)
+    Start-Sleep -Milliseconds 300
+    $after = New-Object FlotillaSmokeWindow+Rect
+    [void][FlotillaSmokeWindow]::GetWindowRect($window, [ref]$after)
+    if (($after.Left - $before.Left) -lt 60 -or ($after.Top - $before.Top) -lt 30) {
+        throw "Caption smoke: dragging the title bar did not move the window ($($before.Left),$($before.Top) -> $($after.Left),$($after.Top))"
+    }
+    Click-At (Get-TitlePoint $window 69)
+    Wait-For { [FlotillaSmokeWindow]::IsZoomed($window) } 'Maximize did not maximize'
+    Click-At (Get-TitlePoint $window 115)
+    Wait-For { [FlotillaSmokeWindow]::IsIconic($window) } 'Minimize did not minimize'
+    [void][FlotillaSmokeWindow]::ShowWindow($window, 9)
+    [void][FlotillaSmokeWindow]::SetForegroundWindow($window)
+    Wait-For { -not [FlotillaSmokeWindow]::IsIconic($window) } 'the window did not come back'
+    Start-Sleep -Milliseconds 500
+    Click-At (Get-TitlePoint $window 23)
+    if (-not $process.WaitForExit(15000)) { throw 'Caption smoke: Close did not exit the app' }
+
     @{
-        window_title = $process.MainWindowTitle
+        window_title = $title
         workspace_sha256 = $initial
         add_host_sha256 = $addHost
         draft_preserved = $true
+        caption_buttons = 'restore, drag, maximize, minimize, close'
         ok = $true
     } | ConvertTo-Json | Set-Content (Join-Path $output 'report.json')
     Get-Content (Join-Path $output 'report.json')

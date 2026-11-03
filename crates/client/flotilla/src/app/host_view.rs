@@ -89,7 +89,9 @@ impl Workspace {
         };
         div()
             .flex_1()
+            .min_w(px(0.))
             .h_full()
+            .overflow_hidden()
             .flex()
             .items_center()
             .justify_center()

@@ -426,10 +426,14 @@ async fn watch_phase(
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
+        // Focus is tracked below the title bar on purpose: GPUI's focus
+        // transfer marks every mouse-down inside a focusable element as
+        // handled, and on Windows a handled non-client button-down never
+        // reaches the caption-button and drag logic, leaving minimize,
+        // maximize, close and window dragging dead.
         div()
             .id("workspace")
             .key_context("Workspace")
-            .track_focus(&self.focus)
             .on_action(cx.listener(|ws, _: &AddHost, window, cx| ws.open_add_host(window, cx)))
             .size_full()
             .flex()
@@ -439,28 +443,37 @@ impl Render for Workspace {
             .font_family(theme.font_ui.clone())
             .text_size(theme.text_size)
             .child(self.render_titlebar(window, cx))
-            .when_some(self.banner.clone(), |d, message| {
-                d.child(
-                    div()
-                        .id("banner")
-                        .px(px(14.))
-                        .py(px(8.))
-                        .bg(theme.danger.opacity(0.15))
-                        .text_color(theme.text_primary)
-                        .child(message)
-                        .on_click(cx.listener(|ws, _, _, cx| {
-                            ws.banner = None;
-                            cx.notify();
-                        })),
-                )
-            })
             .child(
                 div()
+                    .id("workspace-body")
+                    .track_focus(&self.focus)
                     .flex_1()
                     .min_h_0()
                     .flex()
-                    .child(self.render_sidebar(cx))
-                    .child(self.render_center(window, cx)),
+                    .flex_col()
+                    .when_some(self.banner.clone(), |d, message| {
+                        d.child(
+                            div()
+                                .id("banner")
+                                .px(px(14.))
+                                .py(px(8.))
+                                .bg(theme.danger.opacity(0.15))
+                                .text_color(theme.text_primary)
+                                .child(message)
+                                .on_click(cx.listener(|ws, _, _, cx| {
+                                    ws.banner = None;
+                                    cx.notify();
+                                })),
+                        )
+                    })
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_h_0()
+                            .flex()
+                            .child(self.render_sidebar(cx))
+                            .child(self.render_center(window, cx)),
+                    ),
             )
     }
 }

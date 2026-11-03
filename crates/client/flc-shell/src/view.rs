@@ -14,6 +14,7 @@ use flc_sync::{ClipboardTarget, MirrorEvent, MirrorStatus, Sync, SyncEvent, Term
 use flc_terminal::{EchoPolicy, TerminalView, TerminalViewOptions};
 use flc_ui::input::{TextInput, TextInputEvent};
 use flc_ui::theme::{ActiveTheme, Theme};
+use gpui::Focusable as _;
 use gpui::prelude::*;
 use gpui::{
     AsyncApp, Context, Div, Entity, FocusHandle, InteractiveElement, IntoElement, KeyDownEvent,
@@ -22,7 +23,7 @@ use gpui::{
 };
 use tokio::sync::broadcast;
 
-use crate::model::ShellModel;
+use crate::model::{Focus, ShellModel};
 use crate::source::MirrorSource;
 
 #[derive(Debug, Clone, Default)]
@@ -50,11 +51,17 @@ pub struct ShellView {
     /// Terminals that rang while their tab was in the background.
     bells: HashSet<TerminalId>,
     terminals: HashMap<(ViewId, TabId, PaneId), Entity<TerminalView>>,
+    /// The pane keyboard focus was last moved to; a different focused pane
+    /// in the layout moves the keyboard to its terminal.
+    keyboard_pane: Option<(ViewId, TabId, PaneId)>,
     focus: FocusHandle,
     rename: Option<(TabId, Entity<TextInput>)>,
     banner: Option<SharedString>,
     /// Link latency published by the supervisor; `None` while disconnected.
     rtt: Option<Duration>,
+    /// Whether the first authoritative layout has been seen. A workspace
+    /// that is empty at that moment gets its first terminal automatically.
+    first_layout_seen: bool,
     _workspace: Task<()>,
     _events: Task<()>,
     _subscriptions: Vec<Subscription>,
@@ -196,14 +203,17 @@ impl ShellView {
             listeners: HashMap::new(),
             bells: HashSet::new(),
             terminals: HashMap::new(),
+            keyboard_pane: None,
             focus: cx.focus_handle(),
             rename: None,
             banner: None,
             rtt: None,
+            first_layout_seen: false,
             _workspace: Task::ready(()),
             _events: Task::ready(()),
             _subscriptions: Vec::new(),
         };
+        view.open_first_terminal(cx);
         view.attach_panes(window, cx);
 
         let mut changes = sync.workspace_changes();
@@ -214,6 +224,7 @@ impl ShellView {
                 }
                 let alive = this.update(cx, |view, cx| {
                     view.model.adopt(&view.sync.workspace());
+                    view.open_first_terminal(cx);
                     cx.notify();
                 });
                 if alive.is_err() {
@@ -266,6 +277,59 @@ impl ShellView {
         });
         window.focus(&view.focus);
         view
+    }
+
+    /// Keyboard input follows the layout's focused pane: a new tab, a split,
+    /// tab cycling or a pane move puts the cursor in that pane's terminal.
+    /// Focus held outside the shell (a dialog, the rename editor) is left
+    /// alone.
+    fn follow_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(Focus {
+            view,
+            tab: Some(tab),
+            pane: Some(pane),
+        }) = self.model.focus()
+        else {
+            return;
+        };
+        let key = (view, tab, pane);
+        let Some(terminal) = self.terminals.get(&key) else {
+            return;
+        };
+        if self.rename.is_some() {
+            return;
+        }
+        let handle = terminal.read(cx).focus_handle(cx);
+        // The keyboard belongs to the shell when the shell itself, nothing,
+        // or any of its terminals holds focus — including a terminal in a tab
+        // that is no longer shown, which would otherwise swallow every key.
+        // Focus in a dialog or editor elsewhere is left alone.
+        let shell_owned = self.focus.is_focused(window)
+            || window.focused(cx).is_none()
+            || self
+                .terminals
+                .values()
+                .any(|view| view.read(cx).focus_handle(cx).is_focused(window));
+        if shell_owned && (self.keyboard_pane != Some(key) || !handle.is_focused(window)) {
+            self.keyboard_pane = Some(key);
+            window.focus(&handle);
+        }
+    }
+
+    /// Opening a fresh workspace lands in a shell, not an empty view. Only
+    /// the first authoritative layout counts: closing every tab later leaves
+    /// the empty view (and its New terminal button) alone.
+    fn open_first_terminal(&mut self, cx: &mut Context<Self>) {
+        if self.first_layout_seen || self.model.stale() || self.model.pending() > 0 {
+            return;
+        }
+        let Some(layout) = self.model.layout() else {
+            return;
+        };
+        self.first_layout_seen = true;
+        if layout.views.iter().all(|view| view.tabs.is_empty()) {
+            self.create_terminal(cx);
+        }
     }
 
     /// Publish the current link latency to every pane, including panes the
@@ -682,9 +746,9 @@ impl ShellView {
         t: &Theme,
         cx: &mut Context<Self>,
     ) -> Div {
-        let view_id = view.id;
         let mut strip = div()
             .flex()
+            .overflow_hidden()
             .items_center()
             .h(px(32.))
             .px(px(6.))
@@ -720,6 +784,10 @@ impl ShellView {
             let mut item = div()
                 .id(SharedString::from(format!("tab-{tab_id}")))
                 .flex()
+                .flex_shrink()
+                .min_w(px(56.))
+                .max_w(px(220.))
+                .overflow_hidden()
                 .items_center()
                 .gap(px(6.))
                 .px(px(10.))
@@ -749,7 +817,12 @@ impl ShellView {
                 } else {
                     div()
                 })
-                .child(SharedString::from(label))
+                .child(
+                    div()
+                        .min_w(px(0.))
+                        .truncate()
+                        .child(SharedString::from(label)),
+                )
                 .when(rang, |d| d.child(div().text_color(t.warning).child("•")));
             if let Some((id, editor)) = &self.rename
                 && *id == tab_id
@@ -762,6 +835,7 @@ impl ShellView {
             .child(
                 div()
                     .id("new-tab")
+                    .flex_none()
                     .ml(px(4.))
                     .px(px(8.))
                     .h(px(24.))
@@ -775,6 +849,7 @@ impl ShellView {
             .child(
                 div()
                     .id("split-view")
+                    .flex_none()
                     .px(px(8.))
                     .h(px(24.))
                     .rounded(t.radius_sm)
@@ -800,16 +875,6 @@ impl ShellView {
             .when(self.model.stale(), |d| {
                 d.child(div().mr(px(8.)).text_color(t.warning).child("Offline copy"))
             })
-            .child(div().w(px(0.)))
-            .child(div().flex_1().min_w(px(0.)))
-            .child(
-                div()
-                    .mr(px(8.))
-                    .text_color(t.text_tertiary)
-                    .child(SharedString::from(
-                        view_id.to_string().chars().take(4).collect::<String>(),
-                    )),
-            )
     }
 
     fn render_pane_tree(
@@ -853,9 +918,9 @@ impl ShellView {
                         })
                     });
                 let direction = if matches!(axis, Axis::Horizontal) {
-                    div().flex_row()
+                    div().flex().flex_row()
                 } else {
-                    div().flex_col()
+                    div().flex().flex_col()
                 };
                 direction
                     .size_full()
@@ -935,10 +1000,14 @@ impl ShellView {
             .when(focused, |d| {
                 d.border_1().border_color(t.accent.opacity(0.4))
             })
-            .on_click(cx.listener(move |this, _, window, cx| {
+            // Capture phase: the terminal inside stops its own mouse-down, so
+            // a bubbling handler would never learn the pane was chosen.
+            .capture_any_mouse_down(cx.listener(move |this, _, window, cx| {
                 if let Some(op) = this.model.select_pane(pane_id) {
                     this.submit(op, cx);
                 }
+                // The pane's terminal (if any) takes the keyboard on render.
+                this.keyboard_pane = None;
                 this.focus.focus(window);
             }))
             .child(body)
@@ -1021,9 +1090,9 @@ impl ShellView {
                     .bg(t.border);
                 let split = *split;
                 let direction = if matches!(axis, Axis::Horizontal) {
-                    div().flex_row()
+                    div().flex().flex_row()
                 } else {
-                    div().flex_col()
+                    div().flex().flex_col()
                 };
                 direction
                     .size_full()
@@ -1085,6 +1154,7 @@ where
 impl Render for ShellView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.attach_panes(window, cx);
+        self.follow_focus(window, cx);
         // Showing a tab acknowledges its bell.
         let bells = std::mem::take(&mut self.bells);
         self.bells = bells
