@@ -29,16 +29,21 @@ is statically linked against the C runtime, so no redistributable is required.
 
 Server (Linux x86_64 or aarch64, glibc-free musl build):
 
+The client installs the daemon over SSH when you add a host. To install it by
+hand, place it where the service and the SSH transport expect it:
+
 ```sh
-install -m755 flotillad-x86_64 /usr/local/bin/flotillad
-flotillad install-service                # per-user service, enabled at boot
-flotillad enroll --device-name laptop   # prints device credentials as JSON
+install -Dm755 flotillad-x86_64-unknown-linux-musl ~/.flotilla/bin/flotillad
+~/.flotilla/bin/flotillad install-service                # per-user service, enabled at boot
+~/.flotilla/bin/flotillad enroll --device-name laptop   # prints device credentials as JSON
 ```
 
-`flotillad install-service` writes a user unit running `flotillad serve`, which
-listens on a Unix socket for the SSH transport and on UDP 7443 for QUIC. The
-client tries QUIC first and falls back to SSH when the daemon, the network or
-the firewall only permits one of them.
+`flotillad install-service` runs only the installed binary
+(`$FLOTILLA_HOME/bin/flotillad`, default `~/.flotilla/bin/flotillad`) and
+writes a user unit running `flotillad serve`, which listens on a Unix socket
+for the SSH transport and on UDP 7443 for QUIC. The client races QUIC and SSH
+and keeps whichever connects first; on an SSH link it re-probes QUIC every
+30 seconds and moves over when UDP gets through.
 
 ## What M1 delivers
 
@@ -66,8 +71,10 @@ the firewall only permits one of them.
   splits) is daemon state: every client sees the same workspace and layout
   changes apply atomically with revision checks. Divider ratios, pinning and
   ordering survive restarts.
-- **Predictive echo.** Typed text is painted dimmed until the daemon's echo
-  arrives; predictions are refused for full-screen programs, password prompts
+- **Predictive echo.** With the default `Auto` policy, on links of at least
+  150 ms and at a shell prompt marked by OSC 133, typed text is painted dimmed
+  until the daemon's echo arrives (`On` predicts on any link, `Off` never);
+  predictions are refused for full-screen programs, password prompts
   (canonical echo off) and stale mirrors, and any contradicting cell rolls the
   whole overlay back.
 
@@ -88,12 +95,14 @@ flowchart LR
   end
 ```
 
-Crates: `fl-proto` (wire protocol 0.2), `fl-model` (typed layout and terminal
-model), `fl-term` (pinned Alacritty/VTE forks with complete checkpoints),
-`fl-transport` (framed streams, pinned-cert QUIC, SSH), `fld-server` (daemon),
-`fld-prochost` (PTY owner + journal), `fld-store` (SQLite + checkpoints),
-`flc-conn`, `flc-sync`, `flc-terminal`, `flc-shell`, `flc-ui`, and the
-`flotilla` application.
+Crates: `fl-proto` (wire protocol 0.2), `fl-prochost-proto` (frozen local
+process-host protocol), `fl-model` (typed layout and terminal model), `fl-term`
+(pinned Alacritty/VTE forks with complete checkpoints), `fl-transport` (framed
+streams, pinned-cert QUIC, SSH), `fl-testkit` (in-process SSH server and UDP
+relay for tests); daemon: `flotillad` (CLI), `fld-server` (sessions, terminal
+service, listeners), `fld-prochost` (PTY owner + journal), `fld-store` (SQLite
++ checkpoints); client: `flc-conn`, `flc-sync`, `flc-terminal`, `flc-shell`,
+`flc-ui`, and the `flotilla` application.
 
 ## Development
 
@@ -105,13 +114,15 @@ cargo fmt --check
 ```
 
 The GPUI crates are excluded from the default members: Linux CI type-checks
-them headless (`--no-default-features`), and the real build, self-test,
+them headless (their manifests select `gpui` without default features off
+Windows), and the real build, self-test,
 installer and UI smoke run on `windows-latest`. The Rust toolchain is pinned in
 `rust-toolchain.toml`; the vendored parser crates are patched in `vendor/` and
 excluded from formatting.
 
 ## Licenses
 
-Flotilla is Apache-2.0. Third-party notices and font licenses are installed
+Flotilla is proprietary (`LicenseRef-Proprietary` in the workspace manifest).
+Third-party notices and font licenses are installed
 next to the application (`licenses/`) and published as
 `flotilla-windows-licenses.zip` with every release.

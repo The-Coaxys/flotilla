@@ -118,7 +118,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn large_message_survives_compression() {
+    async fn large_incompressible_message_survives_backpressure() {
         let ((_ar, mut aw), (mut br, _bw)) = pipe();
         let big = Blob {
             data: noise(200_000),

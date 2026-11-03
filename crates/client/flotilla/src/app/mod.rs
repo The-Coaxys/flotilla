@@ -177,8 +177,8 @@ impl Workspace {
         // The phase already reached Connected, so no watch update will carry
         // the latency: publish it now or Auto prediction stays disabled.
         if let ConnPhase::Connected { rtt_ms, .. } = entry.phase {
-            shell.update(cx, |shell, cx| {
-                shell.set_rtt(Some(std::time::Duration::from_millis(rtt_ms.into())), cx);
+            shell.update(cx, |shell, _| {
+                shell.set_rtt(Some(std::time::Duration::from_millis(rtt_ms.into())));
             });
         }
         entry.shell = Some(shell);
@@ -360,7 +360,7 @@ async fn watch_phase(
                 };
                 h.phase = phase;
                 if let Some(shell) = &h.shell {
-                    shell.update(cx, |shell, cx| shell.set_rtt(rtt, cx));
+                    shell.update(cx, |shell, _| shell.set_rtt(rtt));
                 }
                 cx.notify();
             })

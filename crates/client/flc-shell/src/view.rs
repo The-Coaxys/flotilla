@@ -96,10 +96,12 @@ pub(crate) fn shortcut_for(ctrl: bool, shift: bool, alt: bool, key: &str) -> Opt
         (true, _, false, "tab") => CycleTab { forward: !shift },
         (true, true, false, "left") => ReorderTab { forward: false },
         (true, true, false, "right") => ReorderTab { forward: true },
-        (false, true, true, "=") | (false, true, true, "+") => SplitPane(Axis::Horizontal),
-        (false, true, true, "-") => SplitPane(Axis::Vertical),
-        (true, true, true, "=") | (true, true, true, "+") => SplitView(Axis::Horizontal),
-        (true, true, true, "-") => SplitView(Axis::Vertical),
+        // Windows reports Shift+= / Shift+- as "+" / "_" with shift cleared;
+        // other platforms keep the unshifted key and the shift flag.
+        (false, true, true, "=") | (false, _, true, "+") => SplitPane(Axis::Horizontal),
+        (false, true, true, "-") | (false, _, true, "_") => SplitPane(Axis::Vertical),
+        (true, true, true, "=") | (true, _, true, "+") => SplitView(Axis::Horizontal),
+        (true, true, true, "-") | (true, _, true, "_") => SplitView(Axis::Vertical),
         (false, false, true, "left") => FocusPane {
             axis: Axis::Horizontal,
             forward: false,
@@ -219,7 +221,10 @@ impl ShellView {
     /// Publish the current link latency to every pane, including panes the
     /// daemon has not reported yet. `None` while disconnected disables
     /// automatic predictive echo until a measurement returns.
-    pub fn set_rtt(&mut self, rtt: Option<Duration>, cx: &mut Context<Self>) {
+    ///
+    /// Panes read the latency when input is typed, so nothing re-renders:
+    /// heartbeats update it every few seconds.
+    pub fn set_rtt(&mut self, rtt: Option<Duration>) {
         if self.rtt == rtt {
             return;
         }
@@ -227,7 +232,6 @@ impl ShellView {
         for source in self.sources.values() {
             source.set_rtt(rtt);
         }
-        cx.notify();
     }
 
     /// Window focus follows the shell; pane focus follows the layout.
@@ -1068,6 +1072,32 @@ mod shortcut_tests {
                 forward: false
             })
         );
+    }
+
+    /// GPUI on Windows turns Shift+= / Shift+- into "+" / "_" and clears the
+    /// shift flag; the split chords must still fire.
+    #[test]
+    fn split_chords_accept_the_windows_shifted_spelling() {
+        use Shortcut::*;
+        assert_eq!(
+            chord(false, false, true, "+"),
+            Some(SplitPane(Axis::Horizontal))
+        );
+        assert_eq!(
+            chord(false, false, true, "_"),
+            Some(SplitPane(Axis::Vertical))
+        );
+        assert_eq!(
+            chord(true, false, true, "+"),
+            Some(SplitView(Axis::Horizontal))
+        );
+        assert_eq!(
+            chord(true, false, true, "_"),
+            Some(SplitView(Axis::Vertical))
+        );
+        // Without Alt these are typed characters.
+        assert_eq!(chord(false, false, false, "+"), None);
+        assert_eq!(chord(false, false, false, "_"), None);
     }
 
     /// Ctrl-Tab cycles forward, Ctrl-Shift-Tab must cycle back instead of
