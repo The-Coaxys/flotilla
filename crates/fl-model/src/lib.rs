@@ -1,5 +1,6 @@
 //! Shared domain values. This crate has no terminal engine, transport or UI dependency.
 pub mod layout;
+pub mod workspace;
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -28,6 +29,7 @@ macro_rules! identity {
 
 identity!(
     WorkspaceId,
+    ProjectId,
     WorktreeId,
     TabId,
     ViewId,

@@ -201,3 +201,110 @@ mod tests {
         assert!(value.validate().is_err());
     }
 }
+
+// --- M2 bounds -------------------------------------------------------------
+
+/// One absolute path on the daemon host.
+pub const MAX_PATH_BYTES: usize = 4096;
+/// Largest file read or written in one request (the editor's limit).
+pub const MAX_FILE_BYTES: usize = 8 * 1024 * 1024;
+pub const MAX_DIR_ENTRIES: usize = 10_000;
+pub const MAX_CHANGED_FILES: usize = 20_000;
+pub const MAX_WORKSPACES: usize = 64;
+pub const MAX_PROJECTS: usize = 512;
+pub const MAX_WORKTREES: usize = 4096;
+pub const MAX_SCRIPTS: usize = 64;
+
+pub fn path(value: &str) -> Result<(), ValidationError> {
+    text("path", value, MAX_PATH_BYTES)?;
+    if !value.starts_with('/') {
+        return Err(ValidationError::Invalid("path is not absolute"));
+    }
+    if value.bytes().any(|byte| byte == 0) {
+        return Err(ValidationError::Invalid("path contains NUL"));
+    }
+    Ok(())
+}
+
+pub fn script_kind(kind: &fl_model::workspace::ScriptKind) -> Result<(), ValidationError> {
+    match kind {
+        fl_model::workspace::ScriptKind::Run(Some(name)) => {
+            text("run target", name, MAX_TEXT_BYTES)
+        }
+        _ => Ok(()),
+    }
+}
+
+pub fn project(value: &fl_model::workspace::Project) -> Result<(), ValidationError> {
+    text("project name", &value.name, MAX_TEXT_BYTES)?;
+    path(&value.path)?;
+    path(&value.worktree_root)?;
+    if let Some(branch) = &value.default_branch {
+        text("branch", branch, MAX_TEXT_BYTES)?;
+    }
+    Ok(())
+}
+
+pub fn worktree(value: &fl_model::workspace::Worktree) -> Result<(), ValidationError> {
+    path(&value.path)?;
+    text("label", &value.label, MAX_TEXT_BYTES)?;
+    for branch in [&value.branch, &value.target].into_iter().flatten() {
+        text("branch", branch, MAX_TEXT_BYTES)?;
+    }
+    Ok(())
+}
+
+pub fn workspace_tree(value: &fl_model::workspace::WorkspaceTree) -> Result<(), ValidationError> {
+    bound("workspaces", value.workspaces.len(), MAX_WORKSPACES)?;
+    bound("projects", value.projects.len(), MAX_PROJECTS)?;
+    bound("worktrees", value.worktrees.len(), MAX_WORKTREES)?;
+    for workspace in &value.workspaces {
+        text("workspace name", &workspace.name, MAX_TEXT_BYTES)?;
+    }
+    value.projects.iter().try_for_each(project)?;
+    value.worktrees.iter().try_for_each(worktree)
+}
+
+pub fn dir_listing(value: &fl_model::workspace::DirListing) -> Result<(), ValidationError> {
+    path(&value.path)?;
+    bound("directory entries", value.entries.len(), MAX_DIR_ENTRIES)?;
+    for entry in &value.entries {
+        text("entry name", &entry.name, MAX_PATH_BYTES)?;
+    }
+    Ok(())
+}
+
+pub fn file_content(value: &fl_model::workspace::FileContent) -> Result<(), ValidationError> {
+    text("file path", &value.path, MAX_PATH_BYTES)?;
+    bound("file bytes", value.bytes.len(), MAX_FILE_BYTES)
+}
+
+pub fn worktree_status(value: &fl_model::workspace::WorktreeStatus) -> Result<(), ValidationError> {
+    bound("changed files", value.files.len(), MAX_CHANGED_FILES)?;
+    for file in &value.files {
+        text("changed path", &file.path, MAX_PATH_BYTES)?;
+        if let Some(old) = &file.old_path {
+            text("changed path", old, MAX_PATH_BYTES)?;
+        }
+    }
+    for value in [
+        &value.summary.branch,
+        &value.summary.head,
+        &value.summary.upstream,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        text("git ref", value, MAX_TEXT_BYTES)?;
+    }
+    Ok(())
+}
+
+pub fn daemon_event(value: &fl_model::workspace::DaemonEvent) -> Result<(), ValidationError> {
+    use fl_model::workspace::DaemonEvent;
+    match value {
+        DaemonEvent::WorktreeStatus(status) => worktree_status(status),
+        DaemonEvent::ScriptChanged(state) => script_kind(&state.kind),
+        DaemonEvent::WorkspaceTreeChanged { .. } | DaemonEvent::LayoutChanged { .. } => Ok(()),
+    }
+}

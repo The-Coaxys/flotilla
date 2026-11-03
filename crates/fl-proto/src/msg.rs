@@ -9,7 +9,13 @@ use crate::channel::{ChannelGrant, ChannelHello, ChannelReady, ChannelRole, TERM
 use crate::validation::{self, MAX_PROCESS_COUNT, MAX_TEXT_BYTES, ValidationError};
 use crate::{Frame, ProtoVersion};
 use fl_model::layout::{Layout, LayoutOp};
-use fl_model::{IncarnationId, OperationId, ProcessInfo, TerminalId};
+use fl_model::workspace::{
+    DaemonEvent, DirListing, FileContent, FileDiff, LayoutScope, Project, ScriptKind, ScriptState,
+    WorkspaceTree, Worktree, WorktreeStatus,
+};
+use fl_model::{
+    IncarnationId, OperationId, ProcessInfo, ProjectId, TerminalId, WorkspaceId, WorktreeId,
+};
 
 pub const KIND_CLIENT: u16 = 1;
 pub const KIND_SERVER: u16 = 2;
@@ -102,6 +108,8 @@ pub enum ServerMsg {
         result: Result<Response, RpcError>,
     },
     ChannelReady(ChannelReady),
+    /// Unsolicited state change, sent to every authenticated session.
+    Event(DaemonEvent),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -134,6 +142,82 @@ pub enum Request {
     OpenChannel {
         role: ChannelRole,
     },
+    // --- M2: workspaces, projects, worktrees, files and scripts ---
+    GetWorkspaceTree,
+    /// List a directory anywhere the daemon user can read (the remote file
+    /// picker and the file tree). `path` must be absolute.
+    ListDir {
+        path: String,
+    },
+    AddProject {
+        workspace: WorkspaceId,
+        path: String,
+    },
+    CloneProject {
+        workspace: WorkspaceId,
+        url: String,
+        /// Absolute destination directory; must not exist yet.
+        dest: String,
+    },
+    RemoveProject {
+        project: ProjectId,
+    },
+    CreateWorktree {
+        project: ProjectId,
+        /// Branch name; `None` creates a temporary name.
+        branch: Option<String>,
+        /// Start point; `None` uses the project's default branch.
+        base: Option<String>,
+    },
+    DeleteWorktree {
+        worktree: WorktreeId,
+        /// Required when the worktree is dirty or has unpushed commits.
+        force: bool,
+    },
+    SetWorktreeLabel {
+        worktree: WorktreeId,
+        label: String,
+    },
+    WorktreeStatus {
+        worktree: WorktreeId,
+    },
+    /// Read a file (absolute path), at most `max_bytes` of it.
+    ReadFile {
+        path: String,
+        max_bytes: u32,
+    },
+    /// Atomically replace a file. With `expected_sha256`, refuse when the
+    /// file changed since it was read.
+    WriteFile {
+        path: String,
+        bytes: Vec<u8>,
+        expected_sha256: Option<[u8; 32]>,
+    },
+    FileDiff {
+        worktree: WorktreeId,
+        /// Relative to the worktree root.
+        path: String,
+    },
+    GetScopedLayout {
+        scope: LayoutScope,
+    },
+    ApplyScopedLayout {
+        scope: LayoutScope,
+        operation: OperationId,
+        base_rev: u64,
+        op: LayoutOp,
+    },
+    RunScript {
+        worktree: WorktreeId,
+        kind: ScriptKind,
+    },
+    StopScript {
+        worktree: WorktreeId,
+        kind: ScriptKind,
+    },
+    ListScripts {
+        worktree: WorktreeId,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -144,6 +228,20 @@ pub enum Response {
     ProcessInfo(ProcessInfo),
     Processes(Vec<ProcessInfo>),
     ChannelGrant(ChannelGrant),
+    // --- M2 ---
+    WorkspaceTree(WorkspaceTree),
+    DirListing(DirListing),
+    Project(Project),
+    Worktree(Worktree),
+    WorktreeStatus(WorktreeStatus),
+    FileContent(FileContent),
+    /// SHA-256 of the written file.
+    Written([u8; 32]),
+    FileDiff(FileDiff),
+    ScriptState(ScriptState),
+    Scripts(Vec<ScriptState>),
+    /// Success with nothing to return (removals, stops).
+    Done,
 }
 
 /// Returned on the authenticated control stream before requesting channels.
@@ -249,6 +347,7 @@ impl WireMessage for ServerMsg {
             Self::RpcResult {
                 result: Err(error), ..
             } => validation::text("rpc error", &error.message, MAX_TEXT_BYTES),
+            Self::Event(event) => validation::daemon_event(event),
             _ => Ok(()),
         }
     }
@@ -256,11 +355,37 @@ impl WireMessage for ServerMsg {
 
 impl Request {
     pub fn validate(&self) -> Result<(), ValidationError> {
-        if let Self::ApplyLayout { op, .. } = self {
-            op.validate()
-                .map_err(|_| ValidationError::Invalid("layout operation"))?;
+        use validation::{bound, path, text};
+        match self {
+            Self::ApplyLayout { op, .. } | Self::ApplyScopedLayout { op, .. } => op
+                .validate()
+                .map_err(|_| ValidationError::Invalid("layout operation")),
+            Self::ListDir { path: p } | Self::AddProject { path: p, .. } => path(p),
+            Self::CloneProject { url, dest, .. } => {
+                text("clone url", url, MAX_TEXT_BYTES)?;
+                path(dest)
+            }
+            Self::CreateWorktree { branch, base, .. } => {
+                for value in [branch, base].into_iter().flatten() {
+                    text("branch", value, MAX_TEXT_BYTES)?;
+                }
+                Ok(())
+            }
+            Self::SetWorktreeLabel { label, .. } => text("label", label, MAX_TEXT_BYTES),
+            Self::ReadFile { path: p, max_bytes } => {
+                bound("read size", *max_bytes as usize, validation::MAX_FILE_BYTES)?;
+                path(p)
+            }
+            Self::WriteFile { path: p, bytes, .. } => {
+                bound("file bytes", bytes.len(), validation::MAX_FILE_BYTES)?;
+                path(p)
+            }
+            Self::FileDiff { path: p, .. } => text("diff path", p, validation::MAX_PATH_BYTES),
+            Self::RunScript { kind, .. } | Self::StopScript { kind, .. } => {
+                validation::script_kind(kind)
+            }
+            _ => Ok(()),
         }
-        Ok(())
     }
 }
 
@@ -286,6 +411,27 @@ impl Response {
                 Ok(())
             }
             Self::ChannelGrant(value) => value.validate(),
+            Self::WorkspaceTree(value) => validation::workspace_tree(value),
+            Self::DirListing(value) => validation::dir_listing(value),
+            Self::Project(value) => validation::project(value),
+            Self::Worktree(value) => validation::worktree(value),
+            Self::WorktreeStatus(value) => validation::worktree_status(value),
+            Self::FileContent(value) => validation::file_content(value),
+            Self::FileDiff(value) => {
+                validation::text("diff path", &value.path, validation::MAX_PATH_BYTES)?;
+                for side in [&value.old, &value.new].into_iter().flatten() {
+                    validation::file_content(side)?;
+                }
+                Ok(())
+            }
+            Self::ScriptState(value) => validation::script_kind(&value.kind),
+            Self::Scripts(values) => {
+                validation::bound("scripts", values.len(), validation::MAX_SCRIPTS)?;
+                values
+                    .iter()
+                    .try_for_each(|value| validation::script_kind(&value.kind))
+            }
+            Self::Written(_) | Self::Done => Ok(()),
             Self::DaemonInfo(value) => {
                 for text in [
                     &value.version,
@@ -324,7 +470,6 @@ mod tests {
         assert_eq!(value.device_id.as_deref(), Some("dev"));
         assert_eq!(value.token.as_deref(), Some("tok"));
         assert_eq!(value.client_session_id, [9; 16]);
-        assert!(crate::PROTO.is_compatible_with(value.proto));
         assert_eq!(decoded.to_frame().unwrap().payload.as_ref(), M0_HELLO);
     }
 

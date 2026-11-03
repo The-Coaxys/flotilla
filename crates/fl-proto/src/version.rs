@@ -10,7 +10,7 @@ pub struct ProtoVersion {
 }
 
 /// The protocol version this build speaks.
-pub const PROTO: ProtoVersion = ProtoVersion { major: 0, minor: 2 };
+pub const PROTO: ProtoVersion = ProtoVersion { major: 0, minor: 3 };
 
 /// Product version from Cargo, e.g. `0.2.0`.
 pub const PRODUCT_VERSION: &str = env!("CARGO_PKG_VERSION");
