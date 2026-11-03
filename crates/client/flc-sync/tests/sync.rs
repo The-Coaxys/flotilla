@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use fl_model::layout::LayoutOp;
 use fl_model::{PaneId, Size, TabId, TerminalId, ViewId};
+use fl_proto::{ClipboardTarget, TerminalNotice};
 use flc_conn::supervisor::{Supervisor, TransportKind};
 use flc_sync::{
     Config, DiscardReason, MirrorEvent, MirrorHandle, MirrorStatus, Sync, WorkspaceState,
@@ -444,4 +445,80 @@ async fn cached_layout_and_mirror_render_before_the_server_answers() {
     );
     assert!(visible_text(&mirror).contains("MARKERcached"));
     offline.shutdown().await;
+}
+
+/// Title and working directory follow the canonical engine state (and so
+/// survive a daemon restart), while bell and OSC 52 notices are delivered
+/// once from live output and never replayed by the resumed subscription.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn titles_follow_state_and_live_notices_arrive_once() {
+    let mut h = Harness::new().await;
+    let sup = Supervisor::spawn(h.spec(true));
+    let mut links = sup.links();
+    let _ = wait_link(&mut links, WAIT, "QUIC link", |link| {
+        link.kind() == TransportKind::Quic
+    })
+    .await;
+    let sync = Sync::new(links.clone(), None, Config::default());
+    let (handle, _terminal) = spawn_terminal(&sync, sync.workspace_changes(), ViewId::new()).await;
+    let mut events = handle.events();
+
+    // OSC 2 title, OSC 7 cwd, BEL, OSC 52 store of "hi". The sleep keeps
+    // the shell from returning to a prompt that may retitle the window.
+    handle.send_input(
+        b"printf '\\033]2;proj-%s\\a\\033]7;file://box/srv/x\\a\\a\\033]52;c;aGk=\\a' t; sleep 30\n"
+            .to_vec(),
+    );
+    let mut title = None;
+    let mut notices = Vec::new();
+    tokio::time::timeout(WAIT, async {
+        while title.is_none() || notices.len() < 2 {
+            match events.recv().await {
+                Ok(MirrorEvent::TitleChanged { title: t, cwd })
+                    if t.as_deref() == Some("proj-t") =>
+                {
+                    title = Some((t, cwd))
+                }
+                Ok(MirrorEvent::Notice { sequence, notice }) => notices.push((sequence, notice)),
+                Ok(_) => {}
+                Err(error) => panic!("mirror events ended: {error}"),
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("title {title:?}, notices {notices:?}"));
+    assert_eq!(
+        title,
+        Some((Some("proj-t".into()), Some("file://box/srv/x".into())))
+    );
+    assert_eq!(notices[0].1, TerminalNotice::Bell);
+    assert_eq!(
+        notices[1].1,
+        TerminalNotice::ClipboardStore {
+            target: ClipboardTarget::Clipboard,
+            text: "hi".into(),
+        }
+    );
+
+    // Restart the daemon: the title comes back with the restored state and
+    // the resumed subscription replays no notice.
+    h.stop_daemon().await;
+    let deadline = Instant::now() + WAIT;
+    while handle.state().status == MirrorStatus::Live {
+        assert!(Instant::now() < deadline, "mirror stayed live");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    h.daemon = Some(support::start_daemon(h.dir.path(), h.quic_port).await);
+    wait_live(&handle, WAIT).await;
+    // The child is still sleeping: the restored state carries its title.
+    assert_eq!(handle.state().title.as_deref(), Some("proj-t"));
+    assert_eq!(handle.state().cwd.as_deref(), Some("file://box/srv/x"));
+    while let Ok(event) = events.try_recv() {
+        assert!(
+            !matches!(event, MirrorEvent::Notice { .. }),
+            "replayed {event:?}"
+        );
+    }
+    sync.shutdown().await;
+    sup.shutdown().await;
 }

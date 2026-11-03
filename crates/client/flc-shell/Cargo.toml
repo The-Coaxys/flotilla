@@ -13,6 +13,7 @@ fl-term.workspace = true
 flc-sync.workspace = true
 flc-terminal.workspace = true
 flc-ui.workspace = true
+tokio.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 gpui = "0.2.2"

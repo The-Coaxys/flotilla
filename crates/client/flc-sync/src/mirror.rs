@@ -17,7 +17,9 @@ use fl_model::{
     ExitStatus, IncarnationId, InputId, InputOwner, LogCursor, ProcessInfo, ProcessState, Size,
     SubscriptionId, TerminalId, TerminalRecord, TerminalRecordKind, TransferId, ViewId,
 };
-use fl_proto::{RecordBatch, SnapshotOffer, TerminalClientMsg, TerminalError, TerminalServerMsg};
+use fl_proto::{
+    RecordBatch, SnapshotOffer, TerminalClientMsg, TerminalError, TerminalNotice, TerminalServerMsg,
+};
 use fl_term::{ENGINE_ID, Engine, HistoryLine, RenderFrame, TermMode, TextPoint};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
@@ -78,6 +80,11 @@ pub struct MirrorState {
     pub snapshots_installed: u64,
     /// Reconnects that resumed from this mirror's own cursor.
     pub resumes: u64,
+    /// Window title set by the program (OSC 0/2), part of the canonical
+    /// engine state and therefore restored with every snapshot.
+    pub title: Option<String>,
+    /// Working directory reported by the shell (OSC 7), as a URI.
+    pub cwd: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -97,6 +104,17 @@ pub enum MirrorEvent {
     },
     Ended(EndReason),
     Error(String),
+    /// The program's title or reported working directory changed.
+    TitleChanged {
+        title: Option<String>,
+        cwd: Option<String>,
+    },
+    /// A bell or clipboard store from live output, delivered at most once per
+    /// effect sequence even across reconnects.
+    Notice {
+        sequence: u64,
+        notice: TerminalNotice,
+    },
 }
 
 enum Command {
@@ -314,6 +332,8 @@ pub(crate) fn spawn(
         link_generation: None,
         snapshots_installed: 0,
         resumes: 0,
+        title: None,
+        cwd: None,
     };
     let shared = Arc::new(MirrorShared {
         terminal,
@@ -369,6 +389,7 @@ pub(crate) fn spawn(
         spare: None,
         snapshots: 0,
         resumes: 0,
+        last_notice: None,
         cache_due: None,
         cache_first: None,
         cache_write: None,
@@ -460,6 +481,8 @@ struct Actor {
     spare: Option<RenderFrame>,
     snapshots: u64,
     resumes: u64,
+    /// Highest notice sequence already emitted for this incarnation.
+    last_notice: Option<u64>,
     cache_due: Option<Instant>,
     cache_first: Option<Instant>,
     cache_write: Option<JoinHandle<()>>,
@@ -802,6 +825,18 @@ impl Actor {
                 }
             }
             TerminalServerMsg::Error { id, error, .. } => self.on_error(id, error).await,
+            TerminalServerMsg::Notice {
+                incarnation,
+                sequence,
+                notice,
+                ..
+            } => {
+                if incarnation == self.key.1 && self.last_notice.is_none_or(|last| sequence > last)
+                {
+                    self.last_notice = Some(sequence);
+                    self.emit(MirrorEvent::Notice { sequence, notice });
+                }
+            }
             // Confirmations whose effects arrive as ordered records.
             TerminalServerMsg::Resized { .. }
             | TerminalServerMsg::Parked { .. }
@@ -1297,6 +1332,15 @@ impl Actor {
     }
 
     fn state(&self) -> MirrorState {
+        let (title, cwd) = lock(&self.shared.engine)
+            .as_ref()
+            .map(|engine| {
+                (
+                    engine.title().map(str::to_owned),
+                    engine.cwd().map(str::to_owned),
+                )
+            })
+            .unwrap_or_default();
         MirrorState {
             terminal: self.key.0,
             incarnation: self.key.1,
@@ -1310,6 +1354,8 @@ impl Actor {
             link_generation: self.set.as_ref().map(|set| set.generation),
             snapshots_installed: self.snapshots,
             resumes: self.resumes,
+            title,
+            cwd,
         }
     }
 
@@ -1340,6 +1386,14 @@ impl Actor {
                 // Reuse the previous frame's buffers once no view holds it.
                 self.spare = Arc::try_unwrap(old).ok();
             }
+            let retitled =
+                (&published.state.title, &published.state.cwd) != (&state.title, &state.cwd);
+            if retitled {
+                self.emit(MirrorEvent::TitleChanged {
+                    title: state.title.clone(),
+                    cwd: state.cwd.clone(),
+                });
+            }
             published.state = Arc::new(state);
             std::mem::take(&mut published.wakers)
         };
@@ -1365,6 +1419,7 @@ impl Actor {
             *lock(&self.shared.engine) = Some(cached.engine);
             self.cursor = Some(cached.cursor);
             self.frame_dirty = true;
+            self.state_dirty = true;
         }
     }
 

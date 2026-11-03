@@ -99,6 +99,7 @@ mod tests {
             quic: None,
             device_id: Some("dev".into()),
             socket_path: Some("/root/.flotilla/run/daemon.sock".into()),
+            clipboard_consent: None,
         }
     }
 

@@ -4,13 +4,13 @@
 //! projected layout. Terminal panes render `flc-terminal` views; panes whose
 //! child is not yet reported by the daemon show a placeholder instead of a
 //! blank window.
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
 use fl_model::layout::{Axis, Layout, SplitNode, SplitTree};
 use fl_model::{IncarnationId, PaneId, Size, SplitId, TabId, TerminalId, ViewId};
-use flc_sync::{MirrorStatus, Sync, SyncEvent};
+use flc_sync::{ClipboardTarget, MirrorEvent, MirrorStatus, Sync, SyncEvent, TerminalNotice};
 use flc_terminal::{EchoPolicy, TerminalView, TerminalViewOptions};
 use flc_ui::input::{TextInput, TextInputEvent};
 use flc_ui::theme::{ActiveTheme, Theme};
@@ -20,6 +20,7 @@ use gpui::{
     ParentElement, Render, SharedString, Styled, Subscription, Task, WeakEntity, Window, div, px,
     relative,
 };
+use tokio::sync::broadcast;
 
 use crate::model::ShellModel;
 use crate::source::MirrorSource;
@@ -32,17 +33,22 @@ pub struct ShellViewOptions {
 /// What the shell asks its host to do outside the layout model.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ShellEvent {
-    /// The connection is gone; the shell keeps showing its last frames.
-    Disconnected,
-    /// The daemon speaks a different terminal engine.
-    IncompatibleEngine { daemon: String },
+    /// A program asked (OSC 52) to replace the local clipboard. The host owns
+    /// the per-host consent decision; the shell never writes it itself.
+    ClipboardStore { terminal: TerminalId, text: String },
 }
+
+impl gpui::EventEmitter<ShellEvent> for ShellView {}
 
 pub struct ShellView {
     sync: Arc<Sync>,
     options: ShellViewOptions,
     model: ShellModel,
     sources: HashMap<(TerminalId, IncarnationId), Arc<MirrorSource>>,
+    /// One listener per source for titles and live notices.
+    listeners: HashMap<(TerminalId, IncarnationId), Task<()>>,
+    /// Terminals that rang while their tab was in the background.
+    bells: HashSet<TerminalId>,
     terminals: HashMap<(ViewId, TabId, PaneId), Entity<TerminalView>>,
     focus: FocusHandle,
     rename: Option<(TabId, Entity<TextInput>)>,
@@ -52,6 +58,46 @@ pub struct ShellView {
     _workspace: Task<()>,
     _events: Task<()>,
     _subscriptions: Vec<Subscription>,
+}
+
+/// Label of an unnamed tab: the program's title, else the last component
+/// of the shell's reported directory (OSC 7 `file://host/path`), else a
+/// generic name.
+pub(crate) fn tab_label(title: Option<&str>, cwd: Option<&str>) -> String {
+    if let Some(title) = title.map(str::trim).filter(|title| !title.is_empty()) {
+        return title.to_string();
+    }
+    cwd.and_then(directory_name)
+        .unwrap_or_else(|| "Terminal".to_string())
+}
+
+fn directory_name(uri: &str) -> Option<String> {
+    let path = uri.strip_prefix("file://")?;
+    let path = &path[path.find('/')?..];
+    let name = path.trim_end_matches('/').rsplit('/').next()?;
+    if name.is_empty() {
+        return Some("/".to_string());
+    }
+    let bytes = name.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        let hex = bytes
+            .get(index + 1..index + 3)
+            .and_then(|hex| std::str::from_utf8(hex).ok())
+            .and_then(|hex| u8::from_str_radix(hex, 16).ok());
+        match (bytes[index], hex) {
+            (b'%', Some(byte)) => {
+                decoded.push(byte);
+                index += 3;
+            }
+            (byte, _) => {
+                decoded.push(byte);
+                index += 1;
+            }
+        }
+    }
+    Some(String::from_utf8_lossy(&decoded).into_owned())
 }
 
 /// Workspace shortcuts, independent of GPUI event plumbing so the whole
@@ -147,6 +193,8 @@ impl ShellView {
             options,
             model,
             sources: HashMap::new(),
+            listeners: HashMap::new(),
+            bells: HashSet::new(),
             terminals: HashMap::new(),
             focus: cx.focus_handle(),
             rename: None,
@@ -177,8 +225,10 @@ impl ShellView {
         let mut events = sync.events();
         view._events = cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             loop {
-                let Ok(event) = events.recv().await else {
-                    continue;
+                let event = match events.recv().await {
+                    Ok(event) => event,
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => break,
                 };
                 let alive = this.update(cx, |view, cx| {
                     match &event {
@@ -274,6 +324,7 @@ impl ShellView {
                     let handle = self.sync.attach(terminal, incarnation, key.0);
                     let source = MirrorSource::new(handle);
                     source.set_rtt(self.rtt);
+                    self.listeners.insert(source_key, self.listen(&source, cx));
                     self.sources.insert(source_key, source.clone());
                     source
                 }
@@ -301,6 +352,61 @@ impl ShellView {
                 .flat_map(|tab| &tab.panes)
                 .any(|entry| entry.terminal == *terminal)
         });
+        let sources = &self.sources;
+        self.listeners.retain(|key, _| sources.contains_key(key));
+        self.bells
+            .retain(|terminal| sources.keys().any(|(live, _)| live == terminal));
+    }
+
+    /// Follow one mirror's title changes and live notices until the source
+    /// is dropped from the layout (dropping the task ends the loop).
+    fn listen(&self, source: &MirrorSource, cx: &mut Context<Self>) -> Task<()> {
+        let terminal = source.handle().terminal();
+        let mut events = source.handle().events();
+        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            loop {
+                let event = match events.recv().await {
+                    Ok(event) => event,
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => break,
+                };
+                let alive = this.update(cx, |view, cx| match event {
+                    MirrorEvent::TitleChanged { .. } => cx.notify(),
+                    MirrorEvent::Notice {
+                        notice: TerminalNotice::Bell,
+                        ..
+                    } => {
+                        if !view.in_active_tab(terminal) && view.bells.insert(terminal) {
+                            cx.notify();
+                        }
+                    }
+                    MirrorEvent::Notice {
+                        notice:
+                            TerminalNotice::ClipboardStore {
+                                target: ClipboardTarget::Clipboard,
+                                text,
+                            },
+                        ..
+                    } => cx.emit(ShellEvent::ClipboardStore { terminal, text }),
+                    // Windows has no primary selection to store into.
+                    _ => {}
+                });
+                if alive.is_err() {
+                    break;
+                }
+            }
+        })
+    }
+
+    fn in_active_tab(&self, terminal: TerminalId) -> bool {
+        self.model.layout().is_some_and(|layout| {
+            layout.views.iter().any(|view| {
+                view.tabs.iter().any(|tab| {
+                    Some(tab.id) == view.active
+                        && tab.panes.iter().any(|pane| pane.terminal == terminal)
+                })
+            })
+        })
     }
 
     fn create_terminal(&mut self, cx: &mut Context<Self>) {
@@ -590,16 +696,27 @@ impl ShellView {
             let active = Some(tab.id) == view.active;
             let tab_id = tab.id;
             let pinned = tab.pinned;
-            let label = tab
-                .name
-                .clone()
-                .or_else(|| {
-                    tab.panes
-                        .first()
-                        .and_then(|pane| self.model.incarnation(pane.terminal))
-                        .map(|_| "Terminal".to_string())
-                })
-                .unwrap_or_else(|| "Starting…".to_string());
+            let state = tab.panes.first().and_then(|pane| {
+                let incarnation = self.model.incarnation(pane.terminal)?;
+                Some(
+                    self.sources
+                        .get(&(pane.terminal, incarnation))
+                        .map(|source| source.handle().state()),
+                )
+            });
+            let label = match (&tab.name, &state) {
+                (Some(name), _) => name.clone(),
+                (None, None) => "Starting…".to_string(),
+                (None, Some(state)) => tab_label(
+                    state.as_ref().and_then(|s| s.title.as_deref()),
+                    state.as_ref().and_then(|s| s.cwd.as_deref()),
+                ),
+            };
+            let rang = !active
+                && tab
+                    .panes
+                    .iter()
+                    .any(|pane| self.bells.contains(&pane.terminal));
             let mut item = div()
                 .id(SharedString::from(format!("tab-{tab_id}")))
                 .flex()
@@ -632,7 +749,8 @@ impl ShellView {
                 } else {
                     div()
                 })
-                .child(SharedString::from(label));
+                .child(SharedString::from(label))
+                .when(rang, |d| d.child(div().text_color(t.warning).child("•")));
             if let Some((id, editor)) = &self.rename
                 && *id == tab_id
             {
@@ -967,6 +1085,12 @@ where
 impl Render for ShellView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.attach_panes(window, cx);
+        // Showing a tab acknowledges its bell.
+        let bells = std::mem::take(&mut self.bells);
+        self.bells = bells
+            .into_iter()
+            .filter(|terminal| !self.in_active_tab(*terminal))
+            .collect();
         let t = cx.theme().clone();
         let content: gpui::AnyElement = match self.model.layout() {
             Some(layout) => self.render_view_tree(layout, layout.split.root, &t, cx),
@@ -1124,5 +1248,32 @@ mod shortcut_tests {
         }
         assert_eq!(chord(false, false, false, "tab"), None);
         assert_eq!(chord(false, true, false, "tab"), None);
+    }
+}
+
+#[cfg(test)]
+mod label_tests {
+    use super::tab_label;
+
+    #[test]
+    fn the_program_title_wins_then_the_reported_directory() {
+        assert_eq!(
+            tab_label(Some("vim notes.md"), Some("file://box/srv")),
+            "vim notes.md"
+        );
+        assert_eq!(tab_label(Some("  "), Some("file://box/srv/app/")), "app");
+        assert_eq!(tab_label(None, Some("file://box/srv/my%20app")), "my app");
+        assert_eq!(tab_label(None, Some("file:///home/ü%C3%A9")), "üé");
+        assert_eq!(tab_label(None, Some("file://box/")), "/");
+    }
+
+    /// Malformed reports never panic and fall back to a generic name.
+    #[test]
+    fn malformed_directories_fall_back() {
+        assert_eq!(tab_label(None, None), "Terminal");
+        assert_eq!(tab_label(None, Some("http://box/srv")), "Terminal");
+        assert_eq!(tab_label(None, Some("file://box")), "Terminal");
+        assert_eq!(tab_label(None, Some("file://box/a%2")), "a%2");
+        assert_eq!(tab_label(None, Some("file://box/%FF")), "\u{FFFD}");
     }
 }

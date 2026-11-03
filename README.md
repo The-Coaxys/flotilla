@@ -15,9 +15,9 @@ the client never ends a running agent or its shell.
 
 M1 known limits are recorded at the end of
 [`docs/superpowers/plans/2026-11-02-flotilla-m1-terminals.md`](docs/superpowers/plans/2026-11-02-flotilla-m1-terminals.md):
-no divider drag or tab drag-and-drop, no saved-layout launcher, no OSC52
-clipboard consent flow, no bell/title/cwd notifications on the terminal wire,
-and OS power-resume notifications are not wired (window activation retries
+no divider drag or tab drag-and-drop, no saved-layout launcher, OSC 52
+clipboard reads are never answered (only stores, with consent), and OS
+power-resume notifications are not wired (window activation retries
 immediately instead).
 
 ## Install
@@ -67,6 +67,11 @@ and keeps whichever connects first; on an SSH link it re-probes QUIC every
   glyphs, IME preedit, selection across soft wraps, scrollback search, links,
   mouse reporting, OSC 8, bracketed paste and terminal-first Ctrl+letter
   routing.
+- **Titles, bells and clipboard.** Unnamed tabs follow the program's title
+  (OSC 0/2), else the shell's reported directory (OSC 7). A bell in a
+  background tab marks it until the tab is shown. An OSC 52 clipboard store
+  asks once per host; the answer is remembered with the host. Notices come
+  only from live output, so reattaching never replays a bell or a copy.
 - **Tabs, panes and views.** The layout (view splits → ordered tabs → pane
   splits) is daemon state: every client sees the same workspace and layout
   changes apply atomically with revision checks. Divider ratios, pinning and

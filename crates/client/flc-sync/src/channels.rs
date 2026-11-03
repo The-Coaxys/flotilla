@@ -286,6 +286,11 @@ fn route_key(msg: &TerminalServerMsg) -> RouteKey {
             terminal,
             incarnation,
             ..
+        }
+        | TerminalServerMsg::Notice {
+            terminal,
+            incarnation,
+            ..
         } => (*terminal, *incarnation),
         TerminalServerMsg::RecordBatch(batch) => (batch.terminal, batch.incarnation),
         TerminalServerMsg::SnapshotOffer(offer) => (offer.terminal, offer.incarnation),

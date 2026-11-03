@@ -107,6 +107,7 @@ pub fn profile_from_enrollment(
         }),
         device_id: Some(enrollment.device_id.clone()),
         socket_path: Some(enrollment.socket_path.clone()),
+        clipboard_consent: None,
     }
 }
 

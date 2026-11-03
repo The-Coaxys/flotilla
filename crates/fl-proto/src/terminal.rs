@@ -232,7 +232,40 @@ impl TerminalError {
     }
 }
 
-/// Discriminants 0..=9 in declaration order. Append only.
+/// Which local clipboard an OSC 52 store addresses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ClipboardTarget {
+    Clipboard,
+    /// The X11-style primary selection; Windows has none and ignores it.
+    Selection,
+}
+
+/// Presentation effects the authoritative engine observed in live output.
+/// They are sent once, to the subscribers attached at that moment; a client
+/// that attaches later sees the resulting screen, never a replayed notice.
+/// Discriminants 0..=1 in declaration order. Append only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TerminalNotice {
+    Bell,
+    /// OSC 52 store. The client applies it only with the host's consent.
+    ClipboardStore {
+        target: ClipboardTarget,
+        text: String,
+    },
+}
+
+impl TerminalNotice {
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        match self {
+            Self::Bell => Ok(()),
+            Self::ClipboardStore { text, .. } => {
+                validation::bound("clipboard bytes", text.len(), MAX_CLIPBOARD_BYTES)
+            }
+        }
+    }
+}
+
+/// Discriminants 0..=10 in declaration order. Append only.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TerminalServerMsg {
     Subscribed {
@@ -280,6 +313,14 @@ pub enum TerminalServerMsg {
         incarnation: IncarnationId,
         error: TerminalError,
     },
+    /// `sequence` is the engine's effect sequence: stable within the
+    /// incarnation, so a client drops a notice it has already applied.
+    Notice {
+        terminal: TerminalId,
+        incarnation: IncarnationId,
+        sequence: u64,
+        notice: TerminalNotice,
+    },
 }
 
 impl WireMessage for TerminalClientMsg {
@@ -305,6 +346,7 @@ impl WireMessage for TerminalServerMsg {
             Self::Resized { size, .. } => validation::size(*size),
             Self::ProcessChanged(value) => validation::process(value),
             Self::Error { error, .. } => error.validate(),
+            Self::Notice { notice, .. } => notice.validate(),
             _ => Ok(()),
         }
     }
@@ -535,5 +577,44 @@ mod tests {
         assert!(offer.validate().is_err());
         offer.total_bytes = 0;
         assert!(offer.validate().is_err());
+    }
+
+    fn notice(text: String) -> TerminalServerMsg {
+        TerminalServerMsg::Notice {
+            terminal: TerminalId::from_bytes([1; 16]),
+            incarnation: IncarnationId::from_bytes([2; 16]),
+            sequence: 7,
+            notice: TerminalNotice::ClipboardStore {
+                target: ClipboardTarget::Clipboard,
+                text,
+            },
+        }
+    }
+
+    /// A clipboard store is bounded on both sides, and the new message is
+    /// appended after every existing server discriminant.
+    #[test]
+    fn clipboard_notices_are_bounded_and_appended() {
+        let fits = notice("é".repeat(MAX_CLIPBOARD_BYTES / 2));
+        let frame = fits.to_frame().unwrap();
+        assert_eq!(frame.payload[0], 10, "Notice is discriminant 10");
+        assert_eq!(TerminalServerMsg::from_frame(&frame).unwrap(), fits);
+
+        let too_large = notice("x".repeat(MAX_CLIPBOARD_BYTES + 1));
+        assert!(matches!(
+            too_large.to_frame(),
+            Err(MsgError::Validation(ValidationError::Limit {
+                field: "clipboard bytes",
+                ..
+            }))
+        ));
+        let frame = Frame {
+            kind: KIND_TERMINAL_SERVER,
+            payload: postcard::to_stdvec(&too_large).unwrap().into(),
+        };
+        assert!(matches!(
+            TerminalServerMsg::from_frame(&frame),
+            Err(MsgError::Validation(_))
+        ));
     }
 }

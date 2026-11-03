@@ -11,8 +11,8 @@ use flc_conn::supervisor::{ConnPhase, Supervisor};
 use flc_ui::theme::ActiveTheme;
 use gpui::prelude::*;
 use gpui::{
-    App, Application, AsyncApp, Bounds, Context, Entity, FocusHandle, Global, KeyBinding,
-    SharedString, Subscription, TitlebarOptions, WeakEntity, Window, WindowBounds,
+    App, Application, AsyncApp, Bounds, ClipboardItem, Context, Entity, FocusHandle, Global,
+    KeyBinding, SharedString, Subscription, TitlebarOptions, WeakEntity, Window, WindowBounds,
     WindowDecorations, WindowOptions, actions, div, px, size,
 };
 
@@ -71,6 +71,9 @@ pub(crate) struct HostEntry {
     /// Terminal session for this host; `None` until the first connection.
     pub(crate) sync: Option<Arc<flc_sync::Sync>>,
     pub(crate) shell: Option<Entity<flc_shell::ShellView>>,
+    shell_events: Option<Subscription>,
+    /// Latest OSC 52 store waiting for the user's first answer for this host.
+    pub(crate) clipboard_request: Option<String>,
     /// Bumped on every (re)connect so stale phase watchers are ignored.
     generation: u64,
 }
@@ -120,6 +123,8 @@ impl Workspace {
                     supervisor: None,
                     sync: None,
                     shell: None,
+                    shell_events: None,
+                    clipboard_request: None,
                     generation: 0,
                 })
                 .collect(),
@@ -181,7 +186,52 @@ impl Workspace {
                 shell.set_rtt(Some(std::time::Duration::from_millis(rtt_ms.into())));
             });
         }
+        let host_id = entry.profile.id.clone();
+        entry.shell_events = Some(cx.subscribe(
+            &shell,
+            move |ws, _shell, event: &flc_shell::ShellEvent, cx| {
+                ws.on_shell_event(&host_id, event, cx)
+            },
+        ));
         entry.shell = Some(shell);
+    }
+
+    fn on_shell_event(
+        &mut self,
+        host_id: &str,
+        event: &flc_shell::ShellEvent,
+        cx: &mut Context<Self>,
+    ) {
+        let flc_shell::ShellEvent::ClipboardStore { text, .. } = event;
+        let Some(entry) = self.hosts.iter_mut().find(|h| h.profile.id == host_id) else {
+            return;
+        };
+        match entry.profile.clipboard_consent {
+            Some(true) => cx.write_to_clipboard(ClipboardItem::new_string(text.clone())),
+            Some(false) => {}
+            // Ask once; a newer store replaces the pending one.
+            None => {
+                entry.clipboard_request = Some(text.clone());
+                cx.notify();
+            }
+        }
+    }
+
+    /// Record the user's answer for this host and apply the pending store
+    /// when it was allowed.
+    pub(crate) fn answer_clipboard(&mut self, index: usize, allow: bool, cx: &mut Context<Self>) {
+        let Some(entry) = self.hosts.get_mut(index) else {
+            return;
+        };
+        let pending = entry.clipboard_request.take();
+        entry.profile.clipboard_consent = Some(allow);
+        if allow && let Some(text) = pending {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+        }
+        if let Err(e) = self.store.upsert(entry.profile.clone()) {
+            self.banner = Some(format!("Could not save the clipboard choice: {e:#}").into());
+        }
+        cx.notify();
     }
 
     pub(crate) fn selected_phase(&self) -> Option<&ConnPhase> {
@@ -320,6 +370,8 @@ impl Workspace {
                     supervisor: None,
                     sync: None,
                     shell: None,
+                    shell_events: None,
+                    clipboard_request: None,
                     generation: 0,
                 });
                 let index = self.hosts.len() - 1;

@@ -72,7 +72,15 @@ impl Workspace {
             // stays available while connecting or when the link has failed.
             Center::Host => match self.selected {
                 Some(i) if i < self.hosts.len() => match &self.hosts[i].shell {
-                    Some(shell) => shell.clone().into_any_element(),
+                    Some(shell) => div()
+                        .size_full()
+                        .flex()
+                        .flex_col()
+                        .when_some(self.render_clipboard_request(i, cx), |d, prompt| {
+                            d.child(prompt)
+                        })
+                        .child(div().flex_1().min_h(px(0.)).child(shell.clone()))
+                        .into_any_element(),
                     None => self.render_host(i, cx).into_any_element(),
                 },
                 _ => self.render_empty(cx).into_any_element(),
@@ -88,6 +96,42 @@ impl Workspace {
             .bg(t.surface_bg)
             .child(body)
             .into_any_element()
+    }
+
+    /// The one-time OSC 52 question for this host, shown above its terminals.
+    fn render_clipboard_request(&self, index: usize, cx: &mut Context<Self>) -> Option<Div> {
+        let host = &self.hosts[index];
+        let text = host.clipboard_request.as_ref()?;
+        let t = cx.theme().clone();
+        let chars = text.chars().count();
+        Some(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(10.))
+                .px(px(12.))
+                .py(px(8.))
+                .bg(t.chrome_bg)
+                .border_b_1()
+                .border_color(t.border)
+                .child(
+                    div().flex_1().child(SharedString::from(format!(
+                        "A program on {} wants to copy {chars} character{} to your clipboard. Allow programs on this host to set the clipboard?",
+                        host.profile.name,
+                        if chars == 1 { "" } else { "s" },
+                    ))),
+                )
+                .child(
+                    secondary_button("clipboard-deny", "Don't allow", &t).on_click(cx.listener(
+                        move |ws, _, _, cx| ws.answer_clipboard(index, false, cx),
+                    )),
+                )
+                .child(
+                    primary_button("clipboard-allow", "Allow", &t).on_click(cx.listener(
+                        move |ws, _, _, cx| ws.answer_clipboard(index, true, cx),
+                    )),
+                ),
+        )
     }
 
     fn render_empty(&self, cx: &mut Context<Self>) -> impl IntoElement {

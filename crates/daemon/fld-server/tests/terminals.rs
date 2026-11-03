@@ -12,7 +12,7 @@ use fl_model::{
 use fl_proto::{
     BulkClientMsg, BulkServerMsg, Capabilities, ChannelGrant, ChannelRole, ClientMsg, Hello, PROTO,
     RecordBatch, RejectReason, Request, Response, RpcError, RpcErrorCode, ServerMsg, SnapshotOffer,
-    TerminalClientMsg, TerminalError, TerminalServerMsg,
+    TerminalClientMsg, TerminalError, TerminalNotice, TerminalServerMsg,
 };
 use fl_term::{ENGINE_ID, EffectMode, Engine, TextPoint};
 use fl_transport::conn::{ConnError, FrameReader, FrameWriter, framed};
@@ -1382,5 +1382,115 @@ async fn startup_relaunches_missing_processes_and_finishes_closed_intents() {
     })
     .await
     .expect("closed intent finished at startup");
+    daemon.shutdown().await;
+}
+
+/// Bell and OSC 52 stores reach the subscribers attached when the output is
+/// parsed, exactly once, with the engine's effect sequence; a subscriber that
+/// attaches afterwards sees the screen but never a replayed notice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn live_output_notices_reach_attached_subscribers_once() {
+    let fixture = Fixture::new().await;
+    let daemon = fixture.start().await;
+    let mut control = Control::connect(&daemon.socket_path).await;
+    let layout = control.layout().await;
+    let terminal = TerminalId::new();
+    let (_, op) = new_tab(&layout, terminal);
+    control
+        .apply_at(OperationId::new(), layout.rev, op)
+        .await
+        .unwrap();
+    let incarnation = control.processes().await[0].incarnation;
+    let target = (terminal, incarnation);
+    let (mut live, _) = attach(
+        &mut control,
+        ChannelRole::TerminalHot,
+        terminal,
+        incarnation,
+        None,
+    )
+    .await;
+    let view = ViewId::new();
+
+    // `aGVsbG8gw6k=` is base64 for "hello é".
+    let id = live.channel.id();
+    live.channel
+        .send(TerminalClientMsg::Input {
+            id,
+            terminal,
+            incarnation,
+            input: InputId {
+                client: control.client,
+                sequence: 1,
+            },
+            view,
+            bytes: b"printf '\\a\\033]52;c;aGVsbG8gw6k=\\a'; echo notice-$((40+2))\n".to_vec(),
+            deadline_ns: now_ns() + 4_000_000_000,
+        })
+        .await;
+    let mut notices = Vec::new();
+    tokio::time::timeout(WAIT, async {
+        while notices.len() < 2 || !live.mirror.text().contains("notice-42") {
+            match live.channel.recv().await {
+                TerminalServerMsg::RecordBatch(batch) => live.mirror.apply(&batch),
+                TerminalServerMsg::Notice {
+                    terminal: t,
+                    incarnation: i,
+                    sequence,
+                    notice,
+                } => {
+                    assert_eq!((t, i), target);
+                    notices.push((sequence, notice));
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("notices {notices:?}; screen:\n{}", live.mirror.text()));
+    assert_eq!(notices.len(), 2, "{notices:?}");
+    assert_eq!(notices[0].1, TerminalNotice::Bell);
+    assert_eq!(
+        notices[1].1,
+        TerminalNotice::ClipboardStore {
+            target: fl_proto::ClipboardTarget::Clipboard,
+            text: "hello é".into(),
+        }
+    );
+    assert!(notices[0].0 < notices[1].0, "effect sequences increase");
+
+    // A later subscriber reconstructs the screen and receives no notice for
+    // output it did not see live.
+    let (mut late, _) = attach(
+        &mut control,
+        ChannelRole::TerminalBackground,
+        terminal,
+        incarnation,
+        None,
+    )
+    .await;
+    assert!(late.mirror.text().contains("notice-42"));
+    live.input(
+        control.client,
+        2,
+        view,
+        target,
+        b"echo after-$((1+1))\n",
+        now_ns() + 4_000_000_000,
+    )
+    .await;
+    tokio::time::timeout(WAIT, async {
+        while !late.mirror.text().contains("after-2") {
+            match late.channel.recv().await {
+                TerminalServerMsg::RecordBatch(batch) => late.mirror.apply(&batch),
+                TerminalServerMsg::Notice { notice, .. } => {
+                    panic!("replayed notice {notice:?}")
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("late subscriber follows live output");
     daemon.shutdown().await;
 }

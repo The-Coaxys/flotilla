@@ -16,6 +16,8 @@ pub const MAX_CHECKPOINT_BYTES: u64 = 512 * 1024 * 1024;
 pub const MAX_PROCESS_COUNT: usize = 128;
 pub const MAX_ARG_COUNT: usize = 256;
 pub const MAX_TEXT_BYTES: usize = 4096;
+/// One OSC 52 clipboard store, decoded.
+pub const MAX_CLIPBOARD_BYTES: usize = 1024 * 1024;
 pub const MAX_ARGV_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]

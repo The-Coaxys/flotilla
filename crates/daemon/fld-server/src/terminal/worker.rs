@@ -11,7 +11,11 @@ use fl_model::{
     TerminalRecord, TerminalRecordKind, ViewId,
 };
 use fl_prochost_proto::{ErrorCode, MAX_READ_BYTES, Request, Response, WriteId};
-use fl_proto::{RecordBatch, SnapshotOffer, TERMINAL_PROTOCOL, TerminalError, TerminalServerMsg};
+use fl_proto::validation::MAX_CLIPBOARD_BYTES;
+use fl_proto::{
+    ClipboardTarget, RecordBatch, SnapshotOffer, TERMINAL_PROTOCOL, TerminalError, TerminalNotice,
+    TerminalServerMsg,
+};
 use fl_term::{ENGINE_ID, EffectKind, Engine};
 use fld_store::TerminalKey;
 use sha2::{Digest, Sha256};
@@ -635,12 +639,57 @@ impl Worker {
             TerminalRecordKind::Exit(_) => Vec::new(),
         };
         for effect in effects {
-            if let EffectKind::Reply(bytes) = effect.kind {
-                self.effect_bytes.fetch_add(bytes.len(), Ordering::AcqRel);
-                let _ = self.effects.send((effect.sequence, bytes));
-            }
+            let notice = match effect.kind {
+                EffectKind::Reply(bytes) => {
+                    self.effect_bytes.fetch_add(bytes.len(), Ordering::AcqRel);
+                    let _ = self.effects.send((effect.sequence, bytes));
+                    continue;
+                }
+                EffectKind::Bell => TerminalNotice::Bell,
+                EffectKind::ClipboardStore { target, text } => {
+                    if text.len() > MAX_CLIPBOARD_BYTES {
+                        tracing::warn!(
+                            terminal = %self.key.terminal,
+                            bytes = text.len(),
+                            "dropping an oversized OSC 52 clipboard store"
+                        );
+                        continue;
+                    }
+                    TerminalNotice::ClipboardStore {
+                        target: match target {
+                            fl_term::ClipboardTarget::Clipboard => ClipboardTarget::Clipboard,
+                            fl_term::ClipboardTarget::Selection => ClipboardTarget::Selection,
+                        },
+                        text,
+                    }
+                }
+                _ => continue,
+            };
+            self.notify(effect.sequence, notice);
         }
         Ok(())
+    }
+
+    /// Presentation notices go to every attached subscriber, parked ones
+    /// included (a bell in a hidden tab is the point). A subscriber whose
+    /// queue is full misses the notice rather than stalling the terminal.
+    fn notify(&self, sequence: u64, notice: TerminalNotice) {
+        let cost = SMALL
+            + match &notice {
+                TerminalNotice::ClipboardStore { text, .. } => text.len(),
+                TerminalNotice::Bell => 0,
+            };
+        for subscriber in &self.subscribers {
+            subscriber.sink.try_send(
+                TerminalServerMsg::Notice {
+                    terminal: self.key.terminal,
+                    incarnation: self.key.incarnation,
+                    sequence,
+                    notice: notice.clone(),
+                },
+                cost,
+            );
+        }
     }
 
     fn fail(&mut self, message: String) {

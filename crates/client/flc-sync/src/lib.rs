@@ -18,6 +18,7 @@ use std::time::Duration;
 
 use fl_model::layout::LayoutOp;
 use fl_model::{IncarnationId, OperationId, ProcessInfo, TerminalId, ViewId};
+pub use fl_proto::{ClipboardTarget, TerminalNotice};
 pub use input::{Discard, DiscardReason};
 pub use layout::{LayoutApplyError, LayoutTicket, PendingLayoutOp, WorkspaceState};
 pub use mirror::{EndReason, MirrorEvent, MirrorHandle, MirrorState, MirrorStatus};

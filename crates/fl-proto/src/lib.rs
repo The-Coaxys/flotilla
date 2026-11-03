@@ -23,8 +23,8 @@ pub use msg::{
     Request, Response, RpcError, RpcErrorCode, ServerMsg, Welcome, WireMessage,
 };
 pub use terminal::{
-    InputAck, KIND_TERMINAL_CLIENT, KIND_TERMINAL_SERVER, RecordBatch, SnapshotOffer,
-    TerminalClientMsg, TerminalError, TerminalServerMsg,
+    ClipboardTarget, InputAck, KIND_TERMINAL_CLIENT, KIND_TERMINAL_SERVER, RecordBatch,
+    SnapshotOffer, TerminalClientMsg, TerminalError, TerminalNotice, TerminalServerMsg,
 };
 pub use validation::ValidationError;
 pub use version::{PRODUCT_VERSION, PROTO, ProtoVersion, build_id};
