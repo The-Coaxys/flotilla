@@ -68,6 +68,9 @@ pub(crate) struct HostEntry {
     pub profile: HostProfile,
     pub phase: ConnPhase,
     supervisor: Option<Supervisor>,
+    /// Terminal session for this host; `None` until the first connection.
+    pub(crate) sync: Option<Arc<flc_sync::Sync>>,
+    pub(crate) shell: Option<Entity<flc_shell::ShellView>>,
     /// Bumped on every (re)connect so stale phase watchers are ignored.
     generation: u64,
 }
@@ -89,10 +92,13 @@ pub struct Workspace {
     // Keep onboarding alive even when the center pane displays another host.
     add_host: Option<Entity<add_host::AddHostForm>>,
     add_host_subscription: Option<Subscription>,
+    /// A host added from the form connects on the next render, where a window
+    /// is available to build its shell view.
+    deferred_connect: Option<usize>,
 }
 
 impl Workspace {
-    fn new(_window: &mut Window, cx: &mut Context<Self>) -> Self {
+    fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let path = HostStore::default_path()
             .unwrap_or_else(|| std::env::temp_dir().join("Flotilla").join("hosts.json"));
         let store = HostStore::new(path);
@@ -110,6 +116,8 @@ impl Workspace {
                     profile,
                     phase: ConnPhase::Idle,
                     supervisor: None,
+                    sync: None,
+                    shell: None,
                     generation: 0,
                 })
                 .collect(),
@@ -119,15 +127,42 @@ impl Workspace {
             focus: cx.focus_handle(),
             add_host: None,
             add_host_subscription: None,
+            deferred_connect: None,
         };
         if !ws.hosts.is_empty() {
             ws.selected = Some(0);
             ws.center = Center::Host;
         }
         for i in 0..ws.hosts.len() {
-            ws.connect(i, cx);
+            ws.connect(i, window, cx);
         }
         ws
+    }
+
+    /// Build the shell view for a connected host on first display. Requires a
+    /// window (the shell takes focus), so it runs from the render path.
+    pub(crate) fn ensure_shell(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(entry) = self.hosts.get_mut(index) else {
+            return;
+        };
+        if entry.shell.is_some() {
+            return;
+        }
+        let Some(sync) = entry.sync.clone() else {
+            return;
+        };
+        if !matches!(entry.phase, ConnPhase::Connected { .. }) {
+            return;
+        }
+        let shell = cx.new(|cx| {
+            flc_shell::ShellView::new(sync, flc_shell::ShellViewOptions::default(), window, cx)
+        });
+        entry.shell = Some(shell);
     }
 
     pub(crate) fn selected_phase(&self) -> Option<&ConnPhase> {
@@ -143,7 +178,7 @@ impl Workspace {
     }
 
     /// (Re)start the supervisor for host `index`.
-    pub(crate) fn connect(&mut self, index: usize, cx: &mut Context<Self>) {
+    pub(crate) fn connect(&mut self, index: usize, _window: &mut Window, cx: &mut Context<Self>) {
         let token = match self.hosts.get(index) {
             Some(entry) => self.secrets.get(&entry.profile.id).unwrap_or_else(|e| {
                 tracing::warn!("cannot read the device token: {e:#}");
@@ -156,6 +191,9 @@ impl Workspace {
         if let Some(old) = entry.supervisor.take() {
             old.stop();
         }
+        // A new connection gets a new session and shell bound to it.
+        entry.shell = None;
+        entry.sync = None;
         entry.generation += 1;
         let Some(spec) = crate::connect::connect_spec(&entry.profile, token) else {
             entry.phase = ConnPhase::Failed {
@@ -166,6 +204,22 @@ impl Workspace {
         };
         let supervisor = Supervisor::spawn_on(&rt, spec);
         let rx = supervisor.phase();
+        // The session must be created inside the runtime: it spawns the
+        // channel and layout tasks that survive individual transports.
+        let cache_dir = dirs::data_local_dir()
+            .map(|dir| dir.join("Flotilla").join("cache"))
+            .unwrap_or_else(|| std::env::temp_dir().join("Flotilla").join("cache"));
+        let links = supervisor.links();
+        let sync = {
+            let _guard = rt.enter();
+            Arc::new(flc_sync::Sync::new(
+                links,
+                Some(cache_dir),
+                flc_sync::Config::default(),
+            ))
+        };
+        entry.sync = Some(sync);
+        entry.shell = None;
         entry.supervisor = Some(supervisor);
         entry.phase = ConnPhase::Connecting;
         let (host_id, generation) = (entry.profile.id.clone(), entry.generation);
@@ -245,12 +299,14 @@ impl Workspace {
                     profile: profile.clone(),
                     phase: ConnPhase::Idle,
                     supervisor: None,
+                    sync: None,
+                    shell: None,
                     generation: 0,
                 });
                 let index = self.hosts.len() - 1;
                 self.selected = Some(index);
                 self.center = Center::Host;
-                self.connect(index, cx);
+                self.deferred_connect = Some(index);
             }
         }
         cx.notify();
@@ -321,7 +377,7 @@ impl Render for Workspace {
                     .min_h_0()
                     .flex()
                     .child(self.render_sidebar(cx))
-                    .child(self.render_center(cx)),
+                    .child(self.render_center(window, cx)),
             )
     }
 }

@@ -2,7 +2,7 @@
 use flc_conn::supervisor::ConnPhase;
 use flc_ui::theme::{ActiveTheme, Theme};
 use gpui::prelude::*;
-use gpui::{AnyElement, Context, Div, FontWeight, SharedString, Stateful, div, px};
+use gpui::{AnyElement, Context, Div, FontWeight, SharedString, Stateful, Window, div, px};
 
 use super::titlebar::tone_color;
 use super::{Center, Workspace};
@@ -52,12 +52,29 @@ fn kv(label: &'static str, value: impl Into<SharedString>, t: &Theme) -> impl In
 }
 
 impl Workspace {
-    pub(super) fn render_center(&self, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_center(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        if let Some(index) = self.deferred_connect.take() {
+            self.connect(index, window, cx);
+        }
+        if let Center::Host = self.center
+            && let Some(index) = self.selected
+        {
+            self.ensure_shell(index, window, cx);
+        }
         let t = cx.theme().clone();
         let body: AnyElement = match &self.center {
             Center::AddHost(form) => form.clone().into_any_element(),
+            // A connected host shows its live terminal workspace; the host card
+            // stays available while connecting or when the link has failed.
             Center::Host => match self.selected {
-                Some(i) if i < self.hosts.len() => self.render_host(i, cx).into_any_element(),
+                Some(i) if i < self.hosts.len() => match &self.hosts[i].shell {
+                    Some(shell) => shell.clone().into_any_element(),
+                    None => self.render_host(i, cx).into_any_element(),
+                },
                 _ => self.render_empty(cx).into_any_element(),
             },
             Center::Empty => self.render_empty(cx).into_any_element(),
@@ -165,10 +182,9 @@ impl Workspace {
                     .flex()
                     .gap(px(8.))
                     .pt(px(4.))
-                    .child(
-                        secondary_button("reconnect", "Reconnect", &t)
-                            .on_click(cx.listener(move |ws, _, _, cx| ws.connect(index, cx))),
-                    )
+                    .child(secondary_button("reconnect", "Reconnect", &t).on_click(
+                        cx.listener(move |ws, _, window, cx| ws.connect(index, window, cx)),
+                    ))
                     .child(
                         secondary_button("remove", "Remove", &t)
                             .text_color(t.danger)

@@ -2423,6 +2423,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "flc-shell"
+version = "0.2.0"
+dependencies = [
+ "fl-model",
+ "fl-term",
+ "flc-sync",
+ "flc-terminal",
+ "flc-ui",
+ "gpui",
+]
+
+[[package]]
 name = "flc-sync"
 version = "0.2.0"
 dependencies = [
@@ -2559,6 +2571,8 @@ dependencies = [
  "fl-proto",
  "fl-transport",
  "flc-conn",
+ "flc-shell",
+ "flc-sync",
  "flc-ui",
  "gpui",
  "hex",
