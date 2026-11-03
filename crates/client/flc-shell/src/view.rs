@@ -6,6 +6,7 @@
 //! blank window.
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use fl_model::layout::{Axis, Layout, SplitNode, SplitTree};
 use fl_model::{IncarnationId, PaneId, Size, SplitId, TabId, TerminalId, ViewId};
@@ -46,6 +47,8 @@ pub struct ShellView {
     focus: FocusHandle,
     rename: Option<(TabId, Entity<TextInput>)>,
     banner: Option<SharedString>,
+    /// Link latency published by the supervisor; `None` while disconnected.
+    rtt: Option<Duration>,
     _workspace: Task<()>,
     _events: Task<()>,
     _subscriptions: Vec<Subscription>,
@@ -146,6 +149,7 @@ impl ShellView {
             focus: cx.focus_handle(),
             rename: None,
             banner: None,
+            rtt: None,
             _workspace: Task::ready(()),
             _events: Task::ready(()),
             _subscriptions: Vec::new(),
@@ -212,6 +216,20 @@ impl ShellView {
         view
     }
 
+    /// Publish the current link latency to every pane, including panes the
+    /// daemon has not reported yet. `None` while disconnected disables
+    /// automatic predictive echo until a measurement returns.
+    pub fn set_rtt(&mut self, rtt: Option<Duration>, cx: &mut Context<Self>) {
+        if self.rtt == rtt {
+            return;
+        }
+        self.rtt = rtt;
+        for source in self.sources.values() {
+            source.set_rtt(rtt);
+        }
+        cx.notify();
+    }
+
     /// Window focus follows the shell; pane focus follows the layout.
     pub fn focus_handle(&self) -> FocusHandle {
         self.focus.clone()
@@ -251,6 +269,7 @@ impl ShellView {
                 None => {
                     let handle = self.sync.attach(terminal, incarnation, key.0);
                     let source = MirrorSource::new(handle);
+                    source.set_rtt(self.rtt);
                     self.sources.insert(source_key, source.clone());
                     source
                 }

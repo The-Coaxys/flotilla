@@ -174,6 +174,13 @@ impl Workspace {
         let shell = cx.new(|cx| {
             flc_shell::ShellView::new(sync, flc_shell::ShellViewOptions::default(), window, cx)
         });
+        // The phase already reached Connected, so no watch update will carry
+        // the latency: publish it now or Auto prediction stays disabled.
+        if let ConnPhase::Connected { rtt_ms, .. } = entry.phase {
+            shell.update(cx, |shell, cx| {
+                shell.set_rtt(Some(std::time::Duration::from_millis(rtt_ms.into())), cx);
+            });
+        }
         entry.shell = Some(shell);
     }
 
@@ -334,16 +341,28 @@ async fn watch_phase(
 ) {
     loop {
         let phase = rx.borrow_and_update().clone();
+        // Predictive echo is gated on the measured link latency: publish it
+        // whenever the link changes and clear it while there is no link.
+        let rtt = match &phase {
+            ConnPhase::Connected { rtt_ms, .. } => {
+                Some(std::time::Duration::from_millis((*rtt_ms).into()))
+            }
+            _ => None,
+        };
         let alive = this
             .update(cx, |ws, cx| {
-                if let Some(h) = ws
+                let Some(h) = ws
                     .hosts
                     .iter_mut()
                     .find(|h| h.profile.id == host_id && h.generation == generation)
-                {
-                    h.phase = phase;
-                    cx.notify();
+                else {
+                    return;
+                };
+                h.phase = phase;
+                if let Some(shell) = &h.shell {
+                    shell.update(cx, |shell, cx| shell.set_rtt(rtt, cx));
                 }
+                cx.notify();
             })
             .is_ok();
         if !alive || rx.changed().await.is_err() {
