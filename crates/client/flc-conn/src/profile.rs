@@ -40,10 +40,19 @@ mod tests {
         let p = HostProfile {
             id: "8d7c2a0e-0000-4000-8000-000000000001".into(),
             name: "vps".into(),
-            ssh: SshTarget { host: "203.0.113.7".into(), port: 22, user: "root".into() },
-            auth: SshAuth::KeyFile { path: PathBuf::from(r"C:\Users\me\.ssh\id_ed25519") },
+            ssh: SshTarget {
+                host: "203.0.113.7".into(),
+                port: 22,
+                user: "root".into(),
+            },
+            auth: SshAuth::KeyFile {
+                path: PathBuf::from(r"C:\Users\me\.ssh\id_ed25519"),
+            },
             host_key: Some("SHA256:abc".into()),
-            quic: Some(QuicEndpoint { port: 7443, cert_sha256: "00".repeat(32) }),
+            quic: Some(QuicEndpoint {
+                port: 7443,
+                cert_sha256: "00".repeat(32),
+            }),
             device_id: Some("dev-1".into()),
             socket_path: Some("/root/.flotilla/run/daemon.sock".into()),
         };

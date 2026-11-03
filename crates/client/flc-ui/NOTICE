@@ -1,0 +1,9 @@
+flc-ui includes code derived from gpui (https://github.com/zed-industries/zed),
+examples/input.rs at gpui 0.2.2, Copyright Zed Industries, Inc.,
+licensed under the Apache License, Version 2.0
+(http://www.apache.org/licenses/LICENSE-2.0). Changes: theming, public
+constructor/accessors, Windows key bindings, removal of the demo app.
+
+Bundled fonts:
+- Inter 4.1, Copyright the Inter Project Authors, SIL Open Font License 1.1 (assets/fonts/Inter-LICENSE.txt)
+- JetBrains Mono 2.304, Copyright JetBrains s.r.o., SIL Open Font License 1.1 (assets/fonts/JetBrainsMono-OFL.txt)
