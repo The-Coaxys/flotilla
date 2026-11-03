@@ -242,3 +242,54 @@ async fn shutdown_cancels_connecting_ssh() {
 async fn shutdown_cancels_standby_ssh_warmup() {
     shutdown_closes_pending_ssh(true).await;
 }
+
+/// A resume or focus change retries immediately with a fresh backlog: the
+/// supervisor must not sit out a long backoff after the machine wakes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn retry_now_resets_the_backoff_and_attempts_at_once() {
+    let mut h = Harness::new().await;
+    let sup = Supervisor::spawn(h.spec(true));
+    let mut rx = sup.phase();
+    wait_phase(
+        &mut rx,
+        Duration::from_secs(5),
+        "connected",
+        connected(TransportKind::Quic),
+    )
+    .await;
+
+    // Take the transports away and let the attempt counter climb past the
+    // point where the next wait would be seconds long.
+    h.stop_daemon().await;
+    h.relay.set_dropping(true);
+    h.ssh.kill_sessions().await;
+    let mut attempts = Vec::new();
+    while attempts.len() < 3 {
+        let phase = wait_phase(
+            &mut rx,
+            Duration::from_secs(15),
+            "retry",
+            |phase| matches!(phase, ConnPhase::Reconnecting { attempt, .. } if *attempt >= 3),
+        )
+        .await;
+        let ConnPhase::Reconnecting { attempt, .. } = phase else {
+            continue;
+        };
+        attempts.push(attempt);
+    }
+    // A resume must not wait out the seconds-long backoff that three failures
+    // accumulated: a new attempt starts at once.
+    let before = sup.attempts();
+    let started = Instant::now();
+    sup.retry_now();
+    while sup.attempts() == before {
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "no attempt after a resume: {:?}",
+            sup.current()
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let _ = &mut rx;
+    sup.shutdown().await;
+}

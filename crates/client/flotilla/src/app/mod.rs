@@ -95,6 +95,8 @@ pub struct Workspace {
     /// A host added from the form connects on the next render, where a window
     /// is available to build its shell view.
     deferred_connect: Option<usize>,
+    /// Window activation triggers an immediate reconnect attempt.
+    activation: Option<Subscription>,
 }
 
 impl Workspace {
@@ -128,7 +130,17 @@ impl Workspace {
             add_host: None,
             add_host_subscription: None,
             deferred_connect: None,
+            activation: None,
         };
+        // Waking the machine or returning to the window retries immediately
+        // instead of waiting out the reconnect backoff.
+        ws.activation = Some(cx.observe_window_activation(window, |ws, _window, _cx| {
+            for host in &ws.hosts {
+                if let Some(supervisor) = &host.supervisor {
+                    supervisor.retry_now();
+                }
+            }
+        }));
         if !ws.hosts.is_empty() {
             ws.selected = Some(0);
             ws.center = Center::Host;

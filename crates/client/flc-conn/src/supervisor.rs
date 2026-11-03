@@ -179,6 +179,8 @@ pub struct Supervisor {
     links: watch::Receiver<Option<ControlLink>>,
     client_session: ClientSessionId,
     cancel: CancellationToken,
+    retry: Arc<tokio::sync::Notify>,
+    attempts: Arc<std::sync::atomic::AtomicU32>,
     task: Option<JoinHandle<()>>,
 }
 
@@ -194,12 +196,24 @@ impl Supervisor {
         let (links_tx, links) = watch::channel(None);
         let client_session = ClientSessionId::new();
         let cancel = CancellationToken::new();
-        let task = runtime.spawn(run(spec, client_session, tx, links_tx, cancel.clone()));
+        let retry = Arc::new(tokio::sync::Notify::new());
+        let attempts = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let task = runtime.spawn(run(
+            spec,
+            client_session,
+            tx,
+            links_tx,
+            cancel.clone(),
+            retry.clone(),
+            attempts.clone(),
+        ));
         Self {
             phase: rx,
             links,
             client_session,
             cancel,
+            retry,
+            attempts,
             task: Some(task),
         }
     }
@@ -221,6 +235,19 @@ impl Supervisor {
     /// Sent in every Hello; stable for this supervisor's lifetime.
     pub fn client_session_id(&self) -> ClientSessionId {
         self.client_session
+    }
+
+    /// Connection attempts started so far (diagnostics and resume tests).
+    pub fn attempts(&self) -> u32 {
+        self.attempts.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Retry immediately: called when the OS resumes or the app regains
+    /// focus, so waking a laptop does not wait out a five-second backoff.
+    pub fn retry_now(&self) {
+        // `notify_one` stores a permit, so a resume that lands between two
+        // attempts still skips the next wait instead of being lost.
+        self.retry.notify_one();
     }
 
     pub fn stop(&self) {
@@ -247,6 +274,11 @@ struct Shared {
     client_session: ClientSessionId,
     /// Authenticated SSH session kept warm for fast failover.
     ssh: Mutex<Option<Arc<SshSession>>>,
+    /// Woken when the machine resumes or the window regains focus: the next
+    /// attempt runs immediately instead of waiting out its backoff.
+    retry: Arc<tokio::sync::Notify>,
+    /// Connection attempts started since the supervisor was created.
+    attempts: Arc<std::sync::atomic::AtomicU32>,
 }
 
 enum Transport {
@@ -340,11 +372,15 @@ async fn run(
     phase: watch::Sender<ConnPhase>,
     links: watch::Sender<Option<ControlLink>>,
     cancel: CancellationToken,
+    retry: Arc<tokio::sync::Notify>,
+    attempts: Arc<std::sync::atomic::AtomicU32>,
 ) {
     let shared = Arc::new(Shared {
         spec,
         client_session,
         ssh: Mutex::new(None),
+        retry,
+        attempts,
     });
     let mut attempt: u32 = 0;
     let mut warmup = None;
@@ -354,6 +390,9 @@ async fn run(
     let mut upgraded = false;
     set(&phase, ConnPhase::Connecting);
     'outer: loop {
+        shared
+            .attempts
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let established = establish(&shared, &cancel, &mut warmup).await;
         if cancel.is_cancelled() {
             break;
@@ -386,6 +425,7 @@ async fn run(
                     let delay = backoff(&shared.spec.timings, attempt);
                     tokio::select! {
                         _ = cancel.cancelled() => break,
+                        _ = shared.retry.notified() => { attempt = 0; }
                         _ = tokio::time::sleep(delay) => {}
                     }
                     continue;
@@ -453,6 +493,7 @@ async fn run(
                     let delay = backoff(&shared.spec.timings, attempt);
                     tokio::select! {
                         _ = cancel.cancelled() => break 'outer,
+                        _ = shared.retry.notified() => { attempt = 0; }
                         _ = tokio::time::sleep(delay) => {}
                     }
                 }
@@ -479,6 +520,7 @@ async fn run(
                 let delay = backoff(&shared.spec.timings, attempt);
                 tokio::select! {
                     _ = cancel.cancelled() => break 'outer,
+                    _ = shared.retry.notified() => { attempt = 0; }
                     _ = tokio::time::sleep(delay) => {}
                 }
             }
@@ -993,6 +1035,8 @@ mod tests {
             },
             client_session: ClientSessionId::new(),
             ssh: Mutex::new(None),
+            retry: Arc::new(tokio::sync::Notify::new()),
+            attempts: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         };
         let link = tokio::time::timeout(
             Duration::from_secs(2),
