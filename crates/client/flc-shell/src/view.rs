@@ -294,6 +294,30 @@ impl ShellView {
         }
     }
 
+    /// Move the active tab one slot in its view.
+    fn reorder_tab(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let Some(focus) = self.model.focus() else {
+            return;
+        };
+        let Some(view) = self.model.view(focus.view) else {
+            return;
+        };
+        let Some(current) = view.tabs.iter().position(|tab| Some(tab.id) == focus.tab) else {
+            return;
+        };
+        let index = if forward {
+            (current + 1).min(view.tabs.len() - 1)
+        } else {
+            current.saturating_sub(1)
+        };
+        if index == current {
+            return;
+        }
+        if let Some(op) = self.model.reorder_tab(index as u16) {
+            self.submit(op, cx);
+        }
+    }
+
     fn adjust_ratio(&mut self, pane: bool, forward: bool, cx: &mut Context<Self>) {
         let Some(layout) = self.model.layout() else {
             return;
@@ -425,6 +449,36 @@ impl ShellView {
             (false, false, true, "down") => self.focus_adjacent_pane(Axis::Vertical, true, cx),
             (false, true, true, "left") => self.adjust_ratio(true, false, cx),
             (false, true, true, "right") => self.adjust_ratio(true, true, cx),
+            // Reachable from the strip's keyboard model only.
+            (false, true, true, "w") => {
+                if let Some(op) = self.model.close_pane() {
+                    self.submit(op, cx);
+                }
+            }
+            (false, true, true, "v") => {
+                if let Some(op) = self.model.close_view() {
+                    self.submit(op, cx);
+                }
+            }
+            (false, true, true, "p") => {
+                let pinned = self
+                    .model
+                    .focus()
+                    .and_then(|focus| focus.tab)
+                    .and_then(|tab| {
+                        let focus = self.model.focus()?;
+                        self.model
+                            .layout()?
+                            .tab(focus.view, tab)
+                            .map(|item| item.pinned)
+                    })
+                    .unwrap_or(false);
+                if let Some(op) = self.model.pin_tab(!pinned) {
+                    self.submit(op, cx);
+                }
+            }
+            (true, true, false, "left") => self.reorder_tab(false, cx),
+            (true, true, false, "right") => self.reorder_tab(true, cx),
             (false, false, false, _) => return false,
             _ => return false,
         }
