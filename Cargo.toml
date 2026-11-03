@@ -9,6 +9,7 @@ members = [
     "crates/fl-term",
     "crates/daemon/fld-server",
     "crates/daemon/fld-prochost",
+    "crates/daemon/fld-store",
     "crates/daemon/flotillad",
     "crates/client/flc-conn",
     "crates/client/flc-ui",
@@ -26,6 +27,7 @@ default-members = [
     "crates/fl-term",
     "crates/daemon/fld-server",
     "crates/daemon/fld-prochost",
+    "crates/daemon/fld-store",
     "crates/daemon/flotillad",
     "crates/client/flc-conn",
 ]
@@ -46,6 +48,7 @@ fl-model = { path = "crates/fl-model" }
 fl-term = { path = "crates/fl-term" }
 fld-server = { path = "crates/daemon/fld-server" }
 fld-prochost = { path = "crates/daemon/fld-prochost" }
+fld-store = { path = "crates/daemon/fld-store" }
 flc-conn = { path = "crates/client/flc-conn" }
 flc-ui = { path = "crates/client/flc-ui" }
 
@@ -66,6 +69,7 @@ quinn = { version = "0.11", default-features = false, features = ["runtime-tokio
 rand = "0.10"
 rcgen = { version = "0.14", default-features = false, features = ["ring", "pem", "crypto"] }
 russh = { version = "0.65", default-features = false, features = ["ring", "flate2", "rsa"] }
+rusqlite = { version = "0.41.1", features = ["bundled", "backup"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
