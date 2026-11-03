@@ -51,6 +51,83 @@ pub struct ShellView {
     _subscriptions: Vec<Subscription>,
 }
 
+/// Workspace shortcuts, independent of GPUI event plumbing so the whole
+/// table is testable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Shortcut {
+    NewTerminal,
+    CloseTab,
+    RenameTab,
+    SplitPane(Axis),
+    SplitView(Axis),
+    CycleTab {
+        forward: bool,
+    },
+    FocusPane {
+        axis: Axis,
+        forward: bool,
+    },
+    /// `pane` selects the focused pane's split (true) or the view split.
+    AdjustRatio {
+        pane: bool,
+        forward: bool,
+    },
+    ClosePane,
+    CloseView,
+    TogglePin,
+    ReorderTab {
+        forward: bool,
+    },
+}
+
+/// The shortcut a keystroke means, or `None` when the terminal keeps it:
+/// plain Ctrl+letter, Alt+letter and shifted text must reach the shell, not
+/// the workspace.
+pub(crate) fn shortcut_for(ctrl: bool, shift: bool, alt: bool, key: &str) -> Option<Shortcut> {
+    use Shortcut::*;
+    Some(match (ctrl, shift, alt, key) {
+        (true, true, false, "t") => NewTerminal,
+        (true, true, false, "w") => CloseTab,
+        (true, true, false, "r") => RenameTab,
+        // Ctrl-Tab cycles forward; Ctrl-Shift-Tab cycles back.
+        (true, _, false, "tab") => CycleTab { forward: !shift },
+        (true, true, false, "left") => ReorderTab { forward: false },
+        (true, true, false, "right") => ReorderTab { forward: true },
+        (false, true, true, "=") | (false, true, true, "+") => SplitPane(Axis::Horizontal),
+        (false, true, true, "-") => SplitPane(Axis::Vertical),
+        (true, true, true, "=") | (true, true, true, "+") => SplitView(Axis::Horizontal),
+        (true, true, true, "-") => SplitView(Axis::Vertical),
+        (false, false, true, "left") => FocusPane {
+            axis: Axis::Horizontal,
+            forward: false,
+        },
+        (false, false, true, "right") => FocusPane {
+            axis: Axis::Horizontal,
+            forward: true,
+        },
+        (false, false, true, "up") => FocusPane {
+            axis: Axis::Vertical,
+            forward: false,
+        },
+        (false, false, true, "down") => FocusPane {
+            axis: Axis::Vertical,
+            forward: true,
+        },
+        (false, true, true, "left") => AdjustRatio {
+            pane: true,
+            forward: false,
+        },
+        (false, true, true, "right") => AdjustRatio {
+            pane: true,
+            forward: true,
+        },
+        (false, true, true, "w") => ClosePane,
+        (false, true, true, "v") => CloseView,
+        (false, true, true, "p") => TogglePin,
+        _ => return None,
+    })
+}
+
 impl ShellView {
     pub fn new(
         sync: Arc<Sync>,
@@ -359,108 +436,50 @@ impl ShellView {
     fn on_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
         let keystroke = &event.keystroke;
         let modifiers = &keystroke.modifiers;
-        let key = keystroke.key.as_str();
-        let (ctrl, shift, alt) = (modifiers.control, modifiers.shift, modifiers.alt);
-        match (ctrl, shift, alt, key) {
-            (true, true, false, "t") => self.create_terminal(cx),
-            (true, true, false, "w") => {
+        let Some(shortcut) = shortcut_for(
+            modifiers.control,
+            modifiers.shift,
+            modifiers.alt,
+            &keystroke.key,
+        ) else {
+            return false;
+        };
+        match shortcut {
+            Shortcut::NewTerminal => self.create_terminal(cx),
+            Shortcut::CloseTab => {
                 if let Some(op) = self.model.close_tab() {
                     self.submit(op, cx);
                 }
             }
-            (true, true, false, "r") => {
-                if let Some(focus) = self.model.focus()
-                    && let Some(tab) = focus.tab
-                    && let Some(item) = self
-                        .model
-                        .layout()
-                        .and_then(|layout| layout.tab(focus.view, tab))
-                {
-                    let editor = cx.new(|cx| TextInput::new(cx, "Tab name"));
-                    editor.update(cx, |input, cx| {
-                        if let Some(name) = &item.name {
-                            input.set_text(SharedString::from(name.clone()), cx);
-                        }
-                    });
-                    cx.subscribe(&editor, |this, _editor, event: &TextInputEvent, cx| {
-                        this.rename.take();
-                        // Enter commits even to an empty name: `None` restores
-                        // the automatic title. Escape leaves the tab alone.
-                        let name = match event {
-                            TextInputEvent::Submitted(name) => {
-                                let trimmed = name.trim();
-                                (!trimmed.is_empty()).then(|| trimmed.to_string())
-                            }
-                            TextInputEvent::Cancelled => {
-                                cx.notify();
-                                return;
-                            }
-                        };
-                        if let Some(op) = this.model.rename_tab(name) {
-                            this.submit(op, cx);
-                        }
-                        cx.notify();
-                    })
-                    .detach();
-                    self.rename = Some((tab, editor));
-                    cx.notify();
-                }
-            }
-            (false, true, true, "=") | (false, true, true, "+") => {
+            Shortcut::RenameTab => self.begin_rename(cx),
+            Shortcut::SplitPane(axis) => {
                 let terminal = TerminalId::new();
-                if let Some(op) =
-                    self.model
-                        .split_pane(terminal, Axis::Horizontal, Size::new(80, 24))
-                {
+                if let Some(op) = self.model.split_pane(terminal, axis, Size::new(80, 24)) {
                     self.submit(op, cx);
                 }
             }
-            (false, true, true, "-") => {
+            Shortcut::SplitView(axis) => {
                 let terminal = TerminalId::new();
-                if let Some(op) = self
-                    .model
-                    .split_pane(terminal, Axis::Vertical, Size::new(80, 24))
-                {
+                if let Some(op) = self.model.split_view(terminal, axis, Size::new(80, 24)) {
                     self.submit(op, cx);
                 }
             }
-            (true, true, true, "=") | (true, true, true, "+") => {
-                let terminal = TerminalId::new();
-                if let Some(op) =
-                    self.model
-                        .split_view(terminal, Axis::Horizontal, Size::new(80, 24))
-                {
-                    self.submit(op, cx);
-                }
+            Shortcut::CycleTab { forward } => self.next_tab(forward, cx),
+            Shortcut::FocusPane { axis, forward } => {
+                self.focus_adjacent_pane(axis, forward, cx);
             }
-            (true, true, true, "-") => {
-                let terminal = TerminalId::new();
-                if let Some(op) = self
-                    .model
-                    .split_view(terminal, Axis::Vertical, Size::new(80, 24))
-                {
-                    self.submit(op, cx);
-                }
-            }
-            (true, false, false, "tab") => self.next_tab(!shift, cx),
-            (false, false, true, "left") => self.focus_adjacent_pane(Axis::Horizontal, false, cx),
-            (false, false, true, "right") => self.focus_adjacent_pane(Axis::Horizontal, true, cx),
-            (false, false, true, "up") => self.focus_adjacent_pane(Axis::Vertical, false, cx),
-            (false, false, true, "down") => self.focus_adjacent_pane(Axis::Vertical, true, cx),
-            (false, true, true, "left") => self.adjust_ratio(true, false, cx),
-            (false, true, true, "right") => self.adjust_ratio(true, true, cx),
-            // Reachable from the strip's keyboard model only.
-            (false, true, true, "w") => {
+            Shortcut::AdjustRatio { pane, forward } => self.adjust_ratio(pane, forward, cx),
+            Shortcut::ClosePane => {
                 if let Some(op) = self.model.close_pane() {
                     self.submit(op, cx);
                 }
             }
-            (false, true, true, "v") => {
+            Shortcut::CloseView => {
                 if let Some(op) = self.model.close_view() {
                     self.submit(op, cx);
                 }
             }
-            (false, true, true, "p") => {
+            Shortcut::TogglePin => {
                 let pinned = self
                     .model
                     .focus()
@@ -477,13 +496,55 @@ impl ShellView {
                     self.submit(op, cx);
                 }
             }
-            (true, true, false, "left") => self.reorder_tab(false, cx),
-            (true, true, false, "right") => self.reorder_tab(true, cx),
-            (false, false, false, _) => return false,
-            _ => return false,
+            Shortcut::ReorderTab { forward } => self.reorder_tab(forward, cx),
         }
         cx.notify();
         true
+    }
+
+    /// Open the inline editor for the focused tab's name.
+    fn begin_rename(&mut self, cx: &mut Context<Self>) {
+        let Some(focus) = self.model.focus() else {
+            return;
+        };
+        let Some(tab) = focus.tab else {
+            return;
+        };
+        let Some(item) = self
+            .model
+            .layout()
+            .and_then(|layout| layout.tab(focus.view, tab))
+        else {
+            return;
+        };
+        let editor = cx.new(|cx| TextInput::new(cx, "Tab name"));
+        if let Some(name) = &item.name {
+            editor.update(cx, |input, cx| {
+                input.set_text(SharedString::from(name.clone()), cx);
+            });
+        }
+        cx.subscribe(&editor, |this, _editor, event: &TextInputEvent, cx| {
+            this.rename.take();
+            // Enter commits even to an empty name: `None` restores the
+            // automatic title. Escape leaves the tab alone.
+            let name = match event {
+                TextInputEvent::Submitted(name) => {
+                    let trimmed = name.trim();
+                    (!trimmed.is_empty()).then(|| trimmed.to_string())
+                }
+                TextInputEvent::Cancelled => {
+                    cx.notify();
+                    return;
+                }
+            };
+            if let Some(op) = this.model.rename_tab(name) {
+                this.submit(op, cx);
+            }
+            cx.notify();
+        })
+        .detach();
+        self.rename = Some((tab, editor));
+        cx.notify();
     }
 
     fn render_tab_strip(
@@ -941,5 +1002,78 @@ impl ShellView {
                 (handle.terminal(), handle.state().status.clone())
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod shortcut_tests {
+    use super::{Axis, Shortcut, shortcut_for};
+
+    fn chord(ctrl: bool, shift: bool, alt: bool, key: &str) -> Option<Shortcut> {
+        shortcut_for(ctrl, shift, alt, key)
+    }
+
+    #[test]
+    fn spec_chords_map_to_their_workspace_actions() {
+        use Shortcut::*;
+        assert_eq!(chord(true, true, false, "t"), Some(NewTerminal));
+        assert_eq!(chord(true, true, false, "w"), Some(CloseTab));
+        assert_eq!(chord(true, true, false, "r"), Some(RenameTab));
+        assert_eq!(
+            chord(false, true, true, "="),
+            Some(SplitPane(Axis::Horizontal))
+        );
+        assert_eq!(
+            chord(false, true, true, "-"),
+            Some(SplitPane(Axis::Vertical))
+        );
+        assert_eq!(
+            chord(true, true, true, "="),
+            Some(SplitView(Axis::Horizontal))
+        );
+        assert_eq!(
+            chord(true, true, true, "-"),
+            Some(SplitView(Axis::Vertical))
+        );
+        assert_eq!(
+            chord(false, false, true, "right"),
+            Some(FocusPane {
+                axis: Axis::Horizontal,
+                forward: true
+            })
+        );
+        assert_eq!(
+            chord(false, true, true, "left"),
+            Some(AdjustRatio {
+                pane: true,
+                forward: false
+            })
+        );
+    }
+
+    /// Ctrl-Tab cycles forward, Ctrl-Shift-Tab must cycle back instead of
+    /// falling through to no action.
+    #[test]
+    fn tab_cycling_honours_the_shift_modifier() {
+        assert_eq!(
+            chord(true, false, false, "tab"),
+            Some(Shortcut::CycleTab { forward: true })
+        );
+        assert_eq!(
+            chord(true, true, false, "tab"),
+            Some(Shortcut::CycleTab { forward: false })
+        );
+    }
+
+    /// Plain Ctrl+letter and typed text belong to the terminal.
+    #[test]
+    fn terminal_chords_are_not_workspace_shortcuts() {
+        for key in ["a", "c", "d", "l", "v", "z", "t", "w", "r"] {
+            assert_eq!(chord(true, false, false, key), None, "ctrl-{key}");
+            assert_eq!(chord(false, false, false, key), None, "{key}");
+            assert_eq!(chord(false, true, false, key), None, "shift-{key}");
+        }
+        assert_eq!(chord(false, false, false, "tab"), None);
+        assert_eq!(chord(false, true, false, "tab"), None);
     }
 }
