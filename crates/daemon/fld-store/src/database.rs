@@ -8,8 +8,9 @@ use crate::{
 };
 use fl_model::{
     IncarnationId, LogCursor, OperationId, ProcessInfo, ProcessState, Size, TerminalId, ViewId,
-    WorkspaceId,
+    WorkspaceId, WorktreeId,
     layout::{Layout, LayoutError, LayoutOp, MAX_TERMINALS},
+    workspace::LayoutScope,
 };
 use fl_prochost_proto::SpawnSpec;
 use rusqlite::{Connection, OpenFlags, Row, TransactionBehavior, params, types::ValueRef};
@@ -33,7 +34,7 @@ use std::{
     time::Duration,
 };
 
-const SCHEMA_VERSION: u32 = 2;
+const SCHEMA_VERSION: u32 = 3;
 const MAX_LAYOUT_BYTES: usize = 128 * 1024;
 const MAX_ENTRY_BYTES: usize = 512 * 1024;
 const MAX_TEXT_BYTES: usize = 4096;
@@ -61,6 +62,51 @@ const SCHEMA_V2: &str = "
     CREATE TABLE operations (
         operation BLOB PRIMARY KEY NOT NULL CHECK(length(operation) = 16),
         payload_hash BLOB NOT NULL CHECK(length(payload_hash) = 32)
+    ) STRICT;
+";
+// Version 3 adds workspaces, projects and worktrees (M2). Each worktree owns
+// one layout with the home layout's revision and deduplication semantics;
+// script terminals belong to a worktree but to no layout.
+const SCHEMA_V3: &str = "
+    CREATE TABLE workspace_meta (
+        singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+        tree_rev BLOB NOT NULL CHECK(length(tree_rev) BETWEEN 1 AND 10)
+    ) STRICT;
+    CREATE TABLE workspaces (
+        id BLOB PRIMARY KEY NOT NULL CHECK(length(id) = 16),
+        name TEXT NOT NULL CHECK(length(name) BETWEEN 1 AND 4096),
+        ord INTEGER NOT NULL CHECK(ord >= 0)
+    ) STRICT;
+    CREATE TABLE projects (
+        id BLOB PRIMARY KEY NOT NULL CHECK(length(id) = 16),
+        workspace BLOB NOT NULL REFERENCES workspaces(id),
+        name TEXT NOT NULL CHECK(length(name) BETWEEN 1 AND 4096),
+        path TEXT NOT NULL UNIQUE CHECK(length(path) BETWEEN 1 AND 4096),
+        kind TEXT NOT NULL CHECK(kind IN ('git', 'folder')),
+        default_branch TEXT CHECK(default_branch IS NULL OR length(default_branch) <= 4096),
+        worktree_root TEXT NOT NULL CHECK(length(worktree_root) BETWEEN 1 AND 4096),
+        ord INTEGER NOT NULL CHECK(ord >= 0)
+    ) STRICT;
+    CREATE TABLE worktrees (
+        id BLOB PRIMARY KEY NOT NULL CHECK(length(id) = 16),
+        project BLOB NOT NULL REFERENCES projects(id),
+        path TEXT NOT NULL UNIQUE CHECK(length(path) BETWEEN 1 AND 4096),
+        branch TEXT CHECK(branch IS NULL OR length(branch) <= 4096),
+        target TEXT CHECK(target IS NULL OR length(target) <= 4096),
+        label TEXT NOT NULL CHECK(length(label) <= 4096),
+        is_primary INTEGER NOT NULL CHECK(is_primary IN (0, 1)),
+        created_ms INTEGER NOT NULL CHECK(created_ms >= 0),
+        last_active_ms INTEGER NOT NULL CHECK(last_active_ms >= 0)
+    ) STRICT;
+    CREATE TABLE worktree_layouts (
+        worktree BLOB PRIMARY KEY NOT NULL REFERENCES worktrees(id),
+        state BLOB NOT NULL CHECK(length(state) BETWEEN 1 AND 131072)
+    ) STRICT;
+    CREATE TABLE scripts (
+        worktree BLOB NOT NULL REFERENCES worktrees(id),
+        kind TEXT NOT NULL CHECK(length(kind) BETWEEN 1 AND 4200),
+        terminal BLOB NOT NULL UNIQUE REFERENCES terminals(terminal),
+        PRIMARY KEY (worktree, kind)
     ) STRICT;
 ";
 
@@ -109,24 +155,30 @@ impl Database {
     }
 
     pub fn default_layout(&self) -> Result<Layout> {
+        self.scoped_layout(LayoutScope::Home)
+    }
+
+    /// The home layout, or one worktree's layout.
+    pub fn scoped_layout(&self, scope: LayoutScope) -> Result<Layout> {
         let transaction = self.connection.unchecked_transaction()?;
-        let (layout, _) = load_state(&transaction)?;
+        let state = load_state(&transaction)?;
         transaction.commit()?;
-        Ok(layout)
+        state.into_layout(scope)
     }
 
     /// Includes closed intents until explicit successful cleanup removes them.
     pub fn list_terminals(&self) -> Result<Vec<TerminalEntry>> {
         let transaction = self.connection.unchecked_transaction()?;
-        let (_, terminals) = load_state(&transaction)?;
+        let state = load_state(&transaction)?;
         transaction.commit()?;
-        Ok(terminals)
+        Ok(state.terminals)
     }
 
     pub fn terminal(&self, key: TerminalKey) -> Result<TerminalEntry> {
         let transaction = self.connection.unchecked_transaction()?;
-        let (_, terminals) = load_state(&transaction)?;
-        let entry = terminals
+        let state = load_state(&transaction)?;
+        let entry = state
+            .terminals
             .into_iter()
             .find(|entry| entry.spec.terminal == key.terminal)
             .ok_or(StoreError::NotFound(key.terminal))?;
@@ -135,8 +187,22 @@ impl Database {
         Ok(entry)
     }
 
+    /// The home layout operation (M1 `ApplyLayout`).
     pub fn apply_layout(
         &mut self,
+        operation: OperationId,
+        base_rev: u64,
+        op: LayoutOp,
+        defaults: &LaunchDefaults,
+    ) -> Result<AppliedLayout> {
+        self.apply_scoped_layout(LayoutScope::Home, operation, base_rev, op, defaults)
+    }
+
+    /// Commit one layout operation of `scope` with its spawn/close intents.
+    /// Terminals spawned by a worktree layout record that worktree.
+    pub fn apply_scoped_layout(
+        &mut self,
+        scope: LayoutScope,
         operation: OperationId,
         base_rev: u64,
         op: LayoutOp,
@@ -145,24 +211,41 @@ impl Database {
         op.validate()?;
         // Defaults are server policy, not part of the client's operation. A
         // retry after changing that policy still denotes the original request.
-        let payload = postcard::to_stdvec(&(base_rev, &op))?;
+        let payload = match scope {
+            LayoutScope::Home => postcard::to_stdvec(&(base_rev, &op))?,
+            LayoutScope::Worktree(worktree) => postcard::to_stdvec(&(worktree, base_rev, &op))?,
+        };
         let hash: BlobHash = Sha256::digest(&payload).into();
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let (mut layout, mut terminals) = load_state(&transaction)?;
+        let mut state = load_state(&transaction)?;
+        let worktree = match scope {
+            LayoutScope::Home => None,
+            LayoutScope::Worktree(worktree) => Some(worktree),
+        };
         if let Some(previous) = operation_hash(&transaction, operation)? {
             if previous != hash {
                 return Err(StoreError::OperationConflict(operation));
             }
             transaction.commit()?;
             return Ok(AppliedLayout {
-                layout,
+                layout: state.into_layout(scope)?,
                 spawned: None,
                 closed: SmallVec::new(),
                 replayed: true,
             });
         }
+        let terminals = &mut state.terminals;
+        let layout = match scope {
+            LayoutScope::Home => &mut state.home,
+            LayoutScope::Worktree(id) => state
+                .scoped
+                .iter_mut()
+                .find(|(owner, _)| *owner == id)
+                .map(|(_, layout)| layout)
+                .ok_or_else(|| StoreError::Missing(format!("worktree {id} not found")))?,
+        };
         if layout.rev != base_rev {
             return Err(StoreError::RevisionConflict {
                 expected: layout.rev,
@@ -193,7 +276,7 @@ impl Database {
                     quota_bytes: defaults.quota_bytes,
                 },
                 desired: true,
-                worktree: None,
+                worktree,
                 process: None,
                 launch_error: None,
                 checkpoint: None,
@@ -218,7 +301,17 @@ impl Database {
             write_entry(&transaction, entry)?;
             closed.push(key_of(entry));
         }
-        write_layout(&transaction, &layout)?;
+        match worktree {
+            None => write_layout(&transaction, layout)?,
+            Some(id) => {
+                write_scoped_layout(&transaction, id, layout)?;
+                transaction.execute(
+                    "UPDATE worktrees SET last_active_ms=?2 WHERE id=?1",
+                    params![id.as_bytes().as_slice(), sql_ms(now_ms())?],
+                )?;
+            }
+        }
+        let layout = layout.clone();
         transaction.execute(
             "INSERT INTO operations(operation, payload_hash) VALUES (?1, ?2)",
             params![operation.as_bytes().as_slice(), hash.as_slice()],
@@ -280,7 +373,7 @@ impl Database {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let (_, terminals) = load_state(&transaction)?;
+        let terminals = load_state(&transaction)?.terminals;
         let entry = terminals
             .iter()
             .find(|entry| entry.spec.terminal == key.terminal)
@@ -312,7 +405,7 @@ impl Database {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let (_, terminals) = load_state(&transaction)?;
+        let terminals = load_state(&transaction)?.terminals;
         let mut entry = terminals
             .into_iter()
             .find(|entry| entry.spec.terminal == key.terminal)
@@ -366,7 +459,7 @@ impl Database {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let (_, mut terminals) = load_state(&transaction)?;
+        let mut terminals = load_state(&transaction)?.terminals;
         let entry = terminals
             .iter_mut()
             .find(|entry| entry.spec.terminal == key.terminal)
@@ -411,10 +504,25 @@ fn migrate(connection: &mut Connection, root: &File, path: &Path, existed: bool)
         if version < 2 {
             transaction.execute_batch(SCHEMA_V2)?;
         }
+        if version < 3 {
+            // The home layout's workspace becomes the default workspace, so
+            // the M1 layout and its terminals stay where they were.
+            transaction.execute_batch(SCHEMA_V3)?;
+            let home = load_home_layout(&transaction)?;
+            transaction.execute(
+                "INSERT INTO workspaces(id,name,ord) VALUES(?1,'Default',0)",
+                [home.workspace.as_bytes().as_slice()],
+            )?;
+            transaction.execute(
+                "INSERT INTO workspace_meta(singleton,tree_rev) VALUES(1,?1)",
+                [postcard::to_stdvec(&1u64)?],
+            )?;
+        }
         transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     }
     // Never initialize over a missing/corrupt default or partially valid rows.
     load_state(&transaction)?;
+    load_tree(&transaction)?;
     let invalid_operations: bool = transaction.query_row(
         "SELECT EXISTS(SELECT 1 FROM operations WHERE typeof(operation)!='blob' OR length(operation)!=16 OR typeof(payload_hash)!='blob' OR length(payload_hash)!=32)",
         [], |row| row.get(0),
@@ -459,26 +567,112 @@ fn schema_version(connection: &Connection) -> Result<u32> {
     u32::try_from(version).map_err(|_| corrupt("invalid negative database schema version"))
 }
 
-fn load_state(connection: &Connection) -> Result<(Layout, Vec<TerminalEntry>)> {
-    let layout = {
-        let mut statement = connection.prepare("SELECT singleton,state FROM layout")?;
+/// Every layout, terminal intent and script owner, cross-checked: a desired
+/// terminal is owned by exactly one layout pane or one script; a closed
+/// intent is owned by nothing.
+pub(crate) struct State {
+    pub(crate) home: Layout,
+    pub(crate) scoped: Vec<(WorktreeId, Layout)>,
+    pub(crate) terminals: Vec<TerminalEntry>,
+    pub(crate) scripts: Vec<ScriptRow>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ScriptRow {
+    pub(crate) worktree: WorktreeId,
+    pub(crate) kind: String,
+    pub(crate) terminal: TerminalId,
+}
+
+impl State {
+    fn into_layout(self, scope: LayoutScope) -> Result<Layout> {
+        match scope {
+            LayoutScope::Home => Ok(self.home),
+            LayoutScope::Worktree(id) => self
+                .scoped
+                .into_iter()
+                .find(|(owner, _)| *owner == id)
+                .map(|(_, layout)| layout)
+                .ok_or_else(|| StoreError::Missing(format!("worktree {id} not found"))),
+        }
+    }
+}
+
+fn load_home_layout(connection: &Connection) -> Result<Layout> {
+    let mut statement = connection.prepare("SELECT singleton,state FROM layout")?;
+    let mut rows = statement.query([])?;
+    let row = rows
+        .next()?
+        .ok_or_else(|| corrupt("default workspace is absent"))?;
+    if row.get::<_, i64>(0)? != 1 {
+        return Err(corrupt("invalid default workspace singleton"));
+    }
+    let bytes = row_blob(row, 1, MAX_LAYOUT_BYTES)?;
+    let layout: Layout = decode(bytes, "layout")?;
+    layout
+        .validate()
+        .map_err(|error| corrupt(format!("invalid layout: {error}")))?;
+    if rows.next()?.is_some() {
+        return Err(corrupt("more than one default workspace is persisted"));
+    }
+    Ok(layout)
+}
+
+fn panes(layout: &Layout) -> impl Iterator<Item = TerminalId> + '_ {
+    layout
+        .views
+        .iter()
+        .flat_map(|view| &view.tabs)
+        .flat_map(|tab| &tab.panes)
+        .map(|pane| pane.terminal)
+}
+
+fn load_state(connection: &Connection) -> Result<State> {
+    let home = load_home_layout(connection)?;
+    let mut scoped = Vec::new();
+    {
+        let mut statement = connection.prepare(&format!(
+            "SELECT worktree,state FROM worktree_layouts ORDER BY worktree LIMIT {}",
+            MAX_WORKTREES + 1
+        ))?;
         let mut rows = statement.query([])?;
-        let row = rows
-            .next()?
-            .ok_or_else(|| corrupt("default workspace is absent"))?;
-        if row.get::<_, i64>(0)? != 1 {
-            return Err(corrupt("invalid default workspace singleton"));
+        while let Some(row) = rows.next()? {
+            if scoped.len() == MAX_WORKTREES {
+                return Err(corrupt("persisted worktree layout count exceeds its bound"));
+            }
+            let worktree =
+                WorktreeId::from_bytes(fixed_bytes(row_blob(row, 0, 16)?, "worktree ID")?);
+            let layout: Layout = decode(row_blob(row, 1, MAX_LAYOUT_BYTES)?, "worktree layout")?;
+            layout
+                .validate()
+                .map_err(|error| corrupt(format!("invalid worktree layout: {error}")))?;
+            scoped.push((worktree, layout));
         }
-        let bytes = row_blob(row, 1, MAX_LAYOUT_BYTES)?;
-        let layout: Layout = decode(bytes, "layout")?;
-        layout
-            .validate()
-            .map_err(|error| corrupt(format!("invalid layout: {error}")))?;
-        if rows.next()?.is_some() {
-            return Err(corrupt("more than one default workspace is persisted"));
+    }
+    let mut scripts = Vec::new();
+    {
+        let mut statement = connection.prepare(&format!(
+            "SELECT worktree,kind,terminal FROM scripts ORDER BY worktree,kind LIMIT {}",
+            MAX_TERMINALS + 1
+        ))?;
+        let mut rows = statement.query([])?;
+        while let Some(row) = rows.next()? {
+            if scripts.len() == MAX_TERMINALS {
+                return Err(corrupt("persisted script count exceeds 128"));
+            }
+            scripts.push(ScriptRow {
+                worktree: WorktreeId::from_bytes(fixed_bytes(
+                    row_blob(row, 0, 16)?,
+                    "worktree ID",
+                )?),
+                kind: row.get(1)?,
+                terminal: TerminalId::from_bytes(fixed_bytes(
+                    row_blob(row, 2, 16)?,
+                    "terminal ID",
+                )?),
+            });
         }
-        layout
-    };
+    }
     let mut statement = connection.prepare(
         "SELECT terminal,incarnation,desired,entry FROM terminals ORDER BY terminal LIMIT 129",
     )?;
@@ -507,37 +701,49 @@ fn load_state(connection: &Connection) -> Result<(Layout, Vec<TerminalEntry>)> {
         }
         terminals.push(entry);
     }
-    for pane in layout
-        .views
-        .iter()
-        .flat_map(|view| &view.tabs)
-        .flat_map(|tab| &tab.panes)
-    {
-        if !terminals
-            .iter()
-            .any(|entry| entry.spec.terminal == pane.terminal && entry.desired)
-        {
+    drop(rows);
+    drop(statement);
+    // Owner of every referenced terminal: the worktree it belongs to (None
+    // for the home layout).
+    let mut owners: BTreeMap<TerminalId, Option<WorktreeId>> = BTreeMap::new();
+    let references = panes(&home)
+        .map(|terminal| (terminal, None))
+        .chain(scoped.iter().flat_map(|(worktree, layout)| {
+            panes(layout).map(move |terminal| (terminal, Some(*worktree)))
+        }))
+        .chain(
+            scripts
+                .iter()
+                .map(|script| (script.terminal, Some(script.worktree))),
+        );
+    for (terminal, owner) in references {
+        if owners.insert(terminal, owner).is_some() {
             return Err(corrupt(format!(
-                "layout references missing or closed terminal {}",
-                pane.terminal
+                "terminal {terminal} has more than one owner"
+            )));
+        }
+        if !terminals.iter().any(|entry| {
+            entry.spec.terminal == terminal && entry.desired && entry.worktree == owner
+        }) {
+            return Err(corrupt(format!(
+                "layout or script references missing, closed or foreign terminal {terminal}"
             )));
         }
     }
     for entry in &terminals {
-        let referenced = layout
-            .views
-            .iter()
-            .flat_map(|view| &view.tabs)
-            .flat_map(|tab| &tab.panes)
-            .any(|pane| pane.terminal == entry.spec.terminal);
-        if entry.desired != referenced {
+        if entry.desired != owners.contains_key(&entry.spec.terminal) {
             return Err(corrupt(format!(
                 "terminal {} intent disagrees with layout",
                 entry.spec.terminal
             )));
         }
     }
-    Ok((layout, terminals))
+    Ok(State {
+        home,
+        scoped,
+        terminals,
+        scripts,
+    })
 }
 
 fn operation_hash(connection: &Connection, operation: OperationId) -> Result<Option<BlobHash>> {
@@ -558,6 +764,36 @@ fn write_layout(connection: &Connection, layout: &Layout) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+fn write_scoped_layout(
+    connection: &Connection,
+    worktree: WorktreeId,
+    layout: &Layout,
+) -> Result<()> {
+    let bytes = encode_layout(layout)?;
+    if connection.execute(
+        "UPDATE worktree_layouts SET state=?2 WHERE worktree=?1",
+        params![worktree.as_bytes().as_slice(), bytes],
+    )? != 1
+    {
+        return Err(corrupt(
+            "worktree layout update did not affect exactly one row",
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn sql_ms(value: u64) -> Result<i64> {
+    i64::try_from(value)
+        .map_err(|_| StoreError::Invalid("timestamp exceeds the SQLite range".into()))
 }
 
 fn write_entry(connection: &Connection, entry: &TerminalEntry) -> Result<()> {
@@ -1022,6 +1258,10 @@ fn check_private_file(file: &File) -> Result<()> {
     file.set_permissions(Permissions::from_mode(0o600))?;
     Ok(())
 }
+
+#[path = "tree.rs"]
+mod tree;
+use tree::{MAX_WORKTREES, load_tree};
 
 #[cfg(test)]
 #[path = "database_tests.rs"]

@@ -46,6 +46,20 @@ pub struct AppliedLayout {
     pub closed: smallvec::SmallVec<[TerminalKey; 4]>,
     pub replayed: bool,
 }
+/// Worktrees forgotten in one commit and the terminal intents they closed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemovedWorktrees {
+    pub rev: u64,
+    pub worktrees: Vec<WorktreeId>,
+    pub closed: Vec<TerminalKey>,
+}
+/// One worktree script and its current terminal incarnation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScriptEntry {
+    pub worktree: WorktreeId,
+    pub kind: String,
+    pub key: TerminalKey,
+}
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
     #[error("invalid durable state input: {0}")]
@@ -76,5 +90,11 @@ pub enum StoreError {
     StaleCheckpoint,
     #[error("terminal is still desired by its layout")]
     TerminalActive,
+    /// A workspace, project or worktree that does not exist.
+    #[error("{0}")]
+    Missing(String),
+    /// A project or worktree path that is already known.
+    #[error("{0}")]
+    Duplicate(String),
 }
 pub type Result<T, E = StoreError> = std::result::Result<T, E>;

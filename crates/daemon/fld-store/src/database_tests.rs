@@ -975,3 +975,349 @@ fn failed_relaunch_rolls_back_the_incarnation_row() {
     assert_eq!(unchanged.checkpoint, Some(checkpoint(4, 16, 3)));
     assert!(database.relaunch_terminal(key_of(&entry)).is_ok());
 }
+
+// --- Schema v3: workspaces, projects, worktrees, scoped layouts, scripts ---
+
+use fl_model::ProjectId;
+use fl_model::workspace::{Project, ProjectKind, Worktree};
+
+fn project(database: &Database, path: &str) -> (Project, Worktree) {
+    let workspace = database.workspace_tree().unwrap().workspaces[0].id;
+    let project = Project {
+        id: ProjectId::new(),
+        workspace,
+        name: "repo".into(),
+        path: path.into(),
+        kind: ProjectKind::Git,
+        default_branch: Some("main".into()),
+        worktree_root: format!("{path}-worktrees"),
+        order: 99,
+    };
+    let primary = worktree(&project, path, true);
+    (project, primary)
+}
+
+fn worktree(project: &Project, path: &str, is_primary: bool) -> Worktree {
+    Worktree {
+        id: WorktreeId::new(),
+        project: project.id,
+        path: path.into(),
+        branch: Some("main".into()),
+        target: (!is_primary).then(|| "main".into()),
+        label: "main".into(),
+        is_primary,
+        created_ms: 1,
+        last_active_ms: 1,
+    }
+}
+
+fn worktree_defaults(path: &str) -> LaunchDefaults {
+    let mut launch = defaults();
+    launch.cwd = path.into();
+    launch
+        .env
+        .insert("FLOTILLA_WORKTREE_PATH".into(), path.into());
+    launch
+}
+
+fn scoped_tab(
+    database: &mut Database,
+    scope: LayoutScope,
+    path: &str,
+) -> (OperationId, LayoutOp, AppliedLayout) {
+    let layout = database.scoped_layout(scope).unwrap();
+    let operation = OperationId::new();
+    let op = new_tab(&layout, TerminalId::new());
+    let applied = database
+        .apply_scoped_layout(
+            scope,
+            operation,
+            layout.rev,
+            op.clone(),
+            &worktree_defaults(path),
+        )
+        .unwrap();
+    (operation, op, applied)
+}
+
+fn script_spec(path: &str) -> SpawnSpec {
+    SpawnSpec {
+        terminal: TerminalId::new(),
+        incarnation: IncarnationId::new(),
+        argv: vec!["/bin/sh".into(), "-lc".into(), "make setup".into()],
+        cwd: path.into(),
+        env: BTreeMap::new(),
+        size: Size::new(80, 24),
+        quota_bytes: fl_prochost_proto::DEFAULT_QUOTA_BYTES,
+    }
+}
+
+/// A schema-2 database exactly as M1 wrote it, with one live terminal.
+fn version_two(root: &Path) -> (Layout, Vec<TerminalEntry>) {
+    let (layout, terminals) = {
+        let mut database = Database::open(root).unwrap();
+        create_terminal(&mut database);
+        (
+            database.default_layout().unwrap(),
+            database.list_terminals().unwrap(),
+        )
+    };
+    let connection = Connection::open(root.join("state.db")).unwrap();
+    connection
+        .execute_batch(
+            "DROP TABLE scripts; DROP TABLE worktree_layouts; DROP TABLE worktrees; \
+             DROP TABLE projects; DROP TABLE workspaces; DROP TABLE workspace_meta; \
+             PRAGMA user_version=2;",
+        )
+        .unwrap();
+    (layout, terminals)
+}
+
+#[test]
+fn v2_to_v3_migration_keeps_the_home_layout_and_terminals_and_backs_up_v2() {
+    let temporary = TempDir::new().unwrap();
+    let (layout, terminals) = version_two(temporary.path());
+    let database = Database::open(temporary.path()).unwrap();
+    assert_eq!(schema_version(&database.connection).unwrap(), 3);
+    assert_eq!(database.default_layout().unwrap(), layout);
+    assert_eq!(
+        postcard::to_stdvec(&database.list_terminals().unwrap()).unwrap(),
+        postcard::to_stdvec(&terminals).unwrap()
+    );
+    let tree = database.workspace_tree().unwrap();
+    assert_eq!(tree.rev, 1);
+    assert_eq!(tree.workspaces.len(), 1);
+    assert_eq!(tree.workspaces[0].name, "Default");
+    assert_eq!(tree.workspaces[0].id, layout.workspace);
+    assert!(tree.projects.is_empty() && tree.worktrees.is_empty());
+    let files = backups(temporary.path());
+    assert_eq!(files.len(), 1);
+    assert!(
+        files[0]
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("state.db.before-v2-to-v3-")
+    );
+    let backup = Connection::open_with_flags(&files[0], OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+    assert_eq!(schema_version(&backup).unwrap(), 2);
+    drop(database);
+    // Idempotent: reopening neither migrates nor backs up again.
+    let reopened = Database::open(temporary.path()).unwrap();
+    assert_eq!(reopened.default_layout().unwrap(), layout);
+    assert_eq!(backups(temporary.path()).len(), 1);
+}
+
+#[test]
+fn projects_and_worktrees_persist_with_revisions_and_reject_duplicates() {
+    let temporary = TempDir::new().unwrap();
+    let mut database = Database::open(temporary.path()).unwrap();
+    let (project, primary) = project(&database, "/srv/repo");
+    let (stored, rev) = database
+        .add_project(project.clone(), std::slice::from_ref(&primary))
+        .unwrap();
+    assert_eq!(rev, 2);
+    assert_eq!(stored.order, 0);
+    let linked = worktree(&stored, "/srv/repo-worktrees/feature", false);
+    assert_eq!(database.add_worktree(&linked).unwrap(), 3);
+    let tree = database.workspace_tree().unwrap();
+    assert_eq!(tree.projects, vec![stored.clone()]);
+    assert_eq!(tree.worktrees, vec![primary.clone(), linked.clone()]);
+    assert!(matches!(
+        database.add_project(project.clone(), std::slice::from_ref(&primary)),
+        Err(StoreError::Duplicate(_))
+    ));
+    assert!(matches!(
+        database.add_worktree(&Worktree {
+            id: WorktreeId::new(),
+            ..linked.clone()
+        }),
+        Err(StoreError::Duplicate(_))
+    ));
+    let mut foreign = project.clone();
+    foreign.workspace = WorkspaceId::new();
+    foreign.path = "/srv/other".into();
+    assert!(matches!(
+        database.add_project(foreign, &[]),
+        Err(StoreError::Missing(_))
+    ));
+    let (labelled, rev) = database.set_worktree_label(linked.id, "Feature").unwrap();
+    assert_eq!((labelled.label.as_str(), rev), ("Feature", 4));
+    assert_eq!(
+        database
+            .set_worktree_branch(linked.id, Some("main"))
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        database
+            .set_worktree_branch(linked.id, Some("other"))
+            .unwrap(),
+        Some(5)
+    );
+    assert!(matches!(
+        database.remove_worktree(primary.id),
+        Err(StoreError::Invalid(_))
+    ));
+    drop(database);
+    let database = Database::open(temporary.path()).unwrap();
+    let tree = database.workspace_tree().unwrap();
+    assert_eq!(tree.rev, 5);
+    assert_eq!(tree.worktrees[1].label, "Feature");
+    assert_eq!(tree.worktrees[1].branch.as_deref(), Some("other"));
+    assert_eq!(database.worktree(linked.id).unwrap().1, stored);
+}
+
+#[test]
+fn worktree_layouts_have_independent_revisions_dedup_and_spawn_in_the_worktree() {
+    let temporary = TempDir::new().unwrap();
+    let mut database = Database::open(temporary.path()).unwrap();
+    let (project, primary) = project(&database, "/srv/repo");
+    database
+        .add_project(project, std::slice::from_ref(&primary))
+        .unwrap();
+    let scope = LayoutScope::Worktree(primary.id);
+    let empty = database.scoped_layout(scope).unwrap();
+    assert_eq!(empty.rev, 0);
+    assert!(empty.views[0].tabs.is_empty());
+    let home = database.default_layout().unwrap();
+    let (operation, op, applied) = scoped_tab(&mut database, scope, "/srv/repo");
+    let entry = applied.spawned.unwrap();
+    assert_eq!(entry.worktree, Some(primary.id));
+    assert_eq!(entry.spec.cwd, "/srv/repo");
+    assert_eq!(
+        entry
+            .spec
+            .env
+            .get("FLOTILLA_WORKTREE_PATH")
+            .map(String::as_str),
+        Some("/srv/repo")
+    );
+    assert_eq!(applied.layout.rev, 1);
+    // The home layout is untouched by worktree operations.
+    assert_eq!(database.default_layout().unwrap(), home);
+    // Exact retry replays; same ID with another scope or payload conflicts.
+    let replay = database
+        .apply_scoped_layout(scope, operation, 0, op.clone(), &defaults())
+        .unwrap();
+    assert!(replay.replayed && replay.spawned.is_none());
+    assert_eq!(replay.layout, applied.layout);
+    assert!(matches!(
+        database.apply_scoped_layout(LayoutScope::Home, operation, 0, op, &defaults()),
+        Err(StoreError::OperationConflict(_))
+    ));
+    let stale = new_tab(&applied.layout, TerminalId::new());
+    assert!(matches!(
+        database.apply_scoped_layout(scope, OperationId::new(), 0, stale, &defaults()),
+        Err(StoreError::RevisionConflict {
+            expected: 1,
+            got: 0
+        })
+    ));
+    assert!(matches!(
+        database.scoped_layout(LayoutScope::Worktree(WorktreeId::new())),
+        Err(StoreError::Missing(_))
+    ));
+    drop(database);
+    let database = Database::open(temporary.path()).unwrap();
+    assert_eq!(database.scoped_layout(scope).unwrap(), applied.layout);
+    assert!(database.terminal(key_of(&entry)).unwrap().desired);
+}
+
+#[test]
+fn scripts_replace_previous_runs_and_removal_closes_every_owned_terminal() {
+    let temporary = TempDir::new().unwrap();
+    let mut database = Database::open(temporary.path()).unwrap();
+    let (project, primary) = project(&database, "/srv/repo");
+    let (project, _) = database
+        .add_project(project, std::slice::from_ref(&primary))
+        .unwrap();
+    let linked = worktree(&project, "/srv/repo-worktrees/a", false);
+    database.add_worktree(&linked).unwrap();
+    let (_, _, applied) = scoped_tab(
+        &mut database,
+        LayoutScope::Worktree(linked.id),
+        &linked.path,
+    );
+    let pane = applied.spawned.unwrap();
+    let (first, replaced) = database
+        .start_script(linked.id, "setup", script_spec(&linked.path))
+        .unwrap();
+    assert!(replaced.is_none());
+    assert_eq!(first.worktree, Some(linked.id));
+    let (second, replaced) = database
+        .start_script(linked.id, "setup", script_spec(&linked.path))
+        .unwrap();
+    assert_eq!(replaced, Some(key_of(&first)));
+    assert!(!database.terminal(key_of(&first)).unwrap().desired);
+    database.remove_terminal(key_of(&first)).unwrap();
+    let (run, _) = database
+        .start_script(linked.id, "run", script_spec(&linked.path))
+        .unwrap();
+    let scripts = database.scripts().unwrap();
+    assert_eq!(
+        scripts
+            .iter()
+            .map(|s| (s.kind.as_str(), s.key))
+            .collect::<Vec<_>>(),
+        vec![("run", key_of(&run)), ("setup", key_of(&second))]
+    );
+    assert_eq!(
+        database.close_script(linked.id, "run").unwrap(),
+        Some(key_of(&run))
+    );
+    assert_eq!(database.close_script(linked.id, "run").unwrap(), None);
+    // Home terminals survive worktree removal; owned ones are closed.
+    let (_, _, home) = create_terminal(&mut database);
+    let removed = database.remove_worktree(linked.id).unwrap();
+    assert_eq!(removed.worktrees, vec![linked.id]);
+    let mut closed = removed.closed.clone();
+    closed.sort_by_key(|key| key.terminal);
+    let mut expected = vec![key_of(&pane), key_of(&second)];
+    expected.sort_by_key(|key| key.terminal);
+    assert_eq!(closed, expected);
+    for key in &expected {
+        assert!(!database.terminal(*key).unwrap().desired);
+    }
+    assert!(database.terminal(key_of(&home)).unwrap().desired);
+    assert!(database.scripts().unwrap().is_empty());
+    assert!(matches!(
+        database.scoped_layout(LayoutScope::Worktree(linked.id)),
+        Err(StoreError::Missing(_))
+    ));
+    // Removing the project closes the primary's terminals and forgets it.
+    let (_, _, primary_pane) = scoped_tab(
+        &mut database,
+        LayoutScope::Worktree(primary.id),
+        &primary.path,
+    );
+    let removed = database.remove_project(project.id).unwrap();
+    assert_eq!(removed.closed, vec![key_of(&primary_pane.spawned.unwrap())]);
+    let tree = database.workspace_tree().unwrap();
+    assert!(tree.projects.is_empty() && tree.worktrees.is_empty());
+    drop(database);
+    let database = Database::open(temporary.path()).unwrap();
+    assert!(database.workspace_tree().unwrap().projects.is_empty());
+}
+
+#[test]
+fn a_terminal_owned_by_two_layouts_fails_closed_on_open() {
+    let temporary = TempDir::new().unwrap();
+    let mut database = Database::open(temporary.path()).unwrap();
+    let (project, primary) = project(&database, "/srv/repo");
+    database
+        .add_project(project, std::slice::from_ref(&primary))
+        .unwrap();
+    let (_, _, applied) = scoped_tab(
+        &mut database,
+        LayoutScope::Worktree(primary.id),
+        "/srv/repo",
+    );
+    // Copy the worktree's layout (and its terminal) into the home layout.
+    write_layout(&database.connection, &applied.layout).unwrap();
+    drop(database);
+    assert!(matches!(
+        Database::open(temporary.path()),
+        Err(StoreError::Corrupt(_))
+    ));
+}
