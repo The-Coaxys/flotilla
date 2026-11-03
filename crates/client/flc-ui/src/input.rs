@@ -9,10 +9,10 @@ use std::ops::Range;
 
 use gpui::{
     App, Bounds, ClipboardItem, Context, CursorStyle, ElementId, ElementInputHandler, Entity,
-    EntityInputHandler, FocusHandle, Focusable, GlobalElementId, KeyBinding, LayoutId, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point, ShapedLine,
-    SharedString, Style, TextRun, UTF16Selection, UnderlineStyle, Window, actions, div, fill,
-    point, prelude::*, px, relative, size,
+    EntityInputHandler, EventEmitter, FocusHandle, Focusable, GlobalElementId, KeyBinding,
+    LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point,
+    ShapedLine, SharedString, Style, TextRun, UTF16Selection, UnderlineStyle, Window, actions, div,
+    fill, point, prelude::*, px, relative, size,
 };
 use unicode_segmentation::*;
 
@@ -32,8 +32,19 @@ actions!(
         Paste,
         Cut,
         Copy,
+        Submit,
+        Cancel,
     ]
 );
+
+/// Emitted when a form field is confirmed or abandoned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TextInputEvent {
+    /// Enter: the field's final text.
+    Submitted(SharedString),
+    /// Escape: the edit was abandoned.
+    Cancelled,
+}
 
 pub struct TextInput {
     focus_handle: FocusHandle,
@@ -46,6 +57,8 @@ pub struct TextInput {
     last_bounds: Option<Bounds<Pixels>>,
     is_selecting: bool,
 }
+
+impl EventEmitter<TextInputEvent> for TextInput {}
 
 impl TextInput {
     fn left(&mut self, _: &Left, _: &mut Window, cx: &mut Context<Self>) {
@@ -97,6 +110,14 @@ impl TextInput {
             self.select_to(self.next_boundary(self.cursor_offset()), cx)
         }
         self.replace_text_in_range(None, "", window, cx)
+    }
+
+    fn submit(&mut self, _: &Submit, _: &mut Window, cx: &mut Context<Self>) {
+        cx.emit(TextInputEvent::Submitted(self.content.clone()));
+    }
+
+    fn cancel(&mut self, _: &Cancel, _: &mut Window, cx: &mut Context<Self>) {
+        cx.emit(TextInputEvent::Cancelled);
     }
 
     fn on_mouse_down(
@@ -593,6 +614,8 @@ impl Render for TextInput {
             .on_action(cx.listener(Self::paste))
             .on_action(cx.listener(Self::cut))
             .on_action(cx.listener(Self::copy))
+            .on_action(cx.listener(Self::submit))
+            .on_action(cx.listener(Self::cancel))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
@@ -668,5 +691,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-c", Copy, ctx),
         KeyBinding::new("ctrl-v", Paste, ctx),
         KeyBinding::new("ctrl-x", Cut, ctx),
+        KeyBinding::new("enter", Submit, ctx),
+        KeyBinding::new("escape", Cancel, ctx),
     ]);
 }

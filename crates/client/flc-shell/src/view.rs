@@ -11,6 +11,7 @@ use fl_model::layout::{Axis, Layout, SplitNode, SplitTree};
 use fl_model::{IncarnationId, PaneId, Size, SplitId, TabId, TerminalId, ViewId};
 use flc_sync::{MirrorStatus, Sync, SyncEvent};
 use flc_terminal::{EchoPolicy, TerminalView, TerminalViewOptions};
+use flc_ui::input::{TextInput, TextInputEvent};
 use flc_ui::theme::{ActiveTheme, Theme};
 use gpui::prelude::*;
 use gpui::{
@@ -43,7 +44,7 @@ pub struct ShellView {
     sources: HashMap<(TerminalId, IncarnationId), Arc<MirrorSource>>,
     terminals: HashMap<(ViewId, TabId, PaneId), Entity<TerminalView>>,
     focus: FocusHandle,
-    rename: Option<(TabId, String)>,
+    rename: Option<(TabId, Entity<TextInput>)>,
     banner: Option<SharedString>,
     _workspace: Task<()>,
     _events: Task<()>,
@@ -351,7 +352,33 @@ impl ShellView {
                         .layout()
                         .and_then(|layout| layout.tab(focus.view, tab))
                 {
-                    self.rename = Some((tab, item.name.clone().unwrap_or_default()));
+                    let editor = cx.new(|cx| TextInput::new(cx, "Tab name"));
+                    editor.update(cx, |input, cx| {
+                        if let Some(name) = &item.name {
+                            input.set_text(SharedString::from(name.clone()), cx);
+                        }
+                    });
+                    cx.subscribe(&editor, |this, _editor, event: &TextInputEvent, cx| {
+                        this.rename.take();
+                        // Enter commits even to an empty name: `None` restores
+                        // the automatic title. Escape leaves the tab alone.
+                        let name = match event {
+                            TextInputEvent::Submitted(name) => {
+                                let trimmed = name.trim();
+                                (!trimmed.is_empty()).then(|| trimmed.to_string())
+                            }
+                            TextInputEvent::Cancelled => {
+                                cx.notify();
+                                return;
+                            }
+                        };
+                        if let Some(op) = this.model.rename_tab(name) {
+                            this.submit(op, cx);
+                        }
+                        cx.notify();
+                    })
+                    .detach();
+                    self.rename = Some((tab, editor));
                     cx.notify();
                 }
             }
@@ -468,18 +495,10 @@ impl ShellView {
                     div()
                 })
                 .child(SharedString::from(label));
-            if self.rename.as_ref().is_some_and(|(id, _)| *id == tab_id) {
-                let draft = self
-                    .rename
-                    .as_ref()
-                    .map(|(_, text)| text.clone())
-                    .unwrap_or_default();
-                item = item.child(
-                    div()
-                        .px(px(4.))
-                        .text_color(t.text_primary)
-                        .child(SharedString::from(draft)),
-                );
+            if let Some((id, editor)) = &self.rename
+                && *id == tab_id
+            {
+                item = item.child(div().w(px(180.)).child(editor.clone()));
             }
             strip = strip.child(item);
         }
