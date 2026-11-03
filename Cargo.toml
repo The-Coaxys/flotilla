@@ -2,27 +2,36 @@
 resolver = "3"
 members = [
     "crates/fl-proto",
+    "crates/fl-prochost-proto",
     "crates/fl-transport",
     "crates/fl-testkit",
+    "crates/fl-model",
+    "crates/fl-term",
     "crates/daemon/fld-server",
+    "crates/daemon/fld-prochost",
     "crates/daemon/flotillad",
     "crates/client/flc-conn",
     "crates/client/flc-ui",
     "crates/client/flotilla",
 ]
+exclude = ["vendor/alacritty_terminal", "vendor/vte"]
 # gpui crates (flc-ui, flotilla) are excluded from default builds: on Linux they
 # are type-checked headless in CI; the real build happens on windows-latest.
 default-members = [
     "crates/fl-proto",
+    "crates/fl-prochost-proto",
     "crates/fl-transport",
     "crates/fl-testkit",
+    "crates/fl-model",
+    "crates/fl-term",
     "crates/daemon/fld-server",
+    "crates/daemon/fld-prochost",
     "crates/daemon/flotillad",
     "crates/client/flc-conn",
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.89"
 license = "LicenseRef-Proprietary"
@@ -30,14 +39,20 @@ publish = false
 
 [workspace.dependencies]
 fl-proto = { path = "crates/fl-proto" }
+fl-prochost-proto = { path = "crates/fl-prochost-proto" }
 fl-transport = { path = "crates/fl-transport" }
 fl-testkit = { path = "crates/fl-testkit" }
+fl-model = { path = "crates/fl-model" }
+fl-term = { path = "crates/fl-term" }
 fld-server = { path = "crates/daemon/fld-server" }
+fld-prochost = { path = "crates/daemon/fld-prochost" }
 flc-conn = { path = "crates/client/flc-conn" }
 flc-ui = { path = "crates/client/flc-ui" }
 
+alacritty_terminal = { version = "=0.26.0", path = "vendor/alacritty_terminal" }
+base64 = "0.22"
 anyhow = "1"
-bytes = "1"
+bytes = { version = "1", features = ["serde"] }
 clap = { version = "4.6", features = ["derive", "env"] }
 dirs = "7"
 futures = "0.3"
@@ -46,6 +61,7 @@ hex = "0.4"
 keyring = "4.2"
 libc = "0.2"
 postcard = { version = "1.1", features = ["use-std"] }
+portable-pty = "=0.9.0"
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
 rand = "0.10"
 rcgen = { version = "0.14", default-features = false, features = ["ring", "pem", "crypto"] }
@@ -54,6 +70,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+smallvec = { version = "1", features = ["serde"] }
 tempfile = "3"
 thiserror = "2"
 tokio = { version = "1.54", features = ["full"] }
@@ -62,6 +79,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 unicode-segmentation = "1.10"
 uuid = { version = "1", features = ["v4", "serde"] }
+vte = { version = "=0.15.0", path = "vendor/vte", features = ["ansi", "serde"] }
 zstd = "0.13"
 
 [profile.release]

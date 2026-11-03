@@ -1,0 +1,26 @@
+Flotilla modifications to vte 0.15.0
+==================================
+
+Upstream: https://github.com/alacritty/vte (v0.15.0)
+Copyright (c) 2016 Joe Wilm and upstream contributors.
+The original LICENSE-MIT and LICENSE-APACHE are preserved without modification.
+The ANSI module was originally part of alacritty_terminal and retains its
+Apache-2.0 source notice and Alacritty attribution.
+
+Flotilla patch, 2026-11-03, licensed under Apache-2.0 OR MIT:
+- src/lib.rs: bounded OSC accumulation and persistent discard-until-termination
+  states, plus parser consumer/continuation/overflow regressions.
+- src/params.rs: validated canonical parameter checkpoint representation.
+- src/snapshot.rs (new): explicit serde parser snapshots, bounded allocation
+  during deserialization, and validated direct-state restoration.
+- src/ansi.rs: logical synchronized-update state, stream-ordered boundaries,
+  explicit flush, clock-free processor snapshots, OSC7/OSC133 callbacks and
+  dispatch, charset/cursor serde derives, and consumer-behavior regressions.
+- Cargo.toml and Cargo.toml.orig: alloc-capable optional serde and serde_json
+  development dependency for serialization regressions.
+- CHANGELOG.md: patch behavior, resource limits, and public API documentation.
+
+These are narrowly scoped vendored source changes, not an upstream release.
+The containing engine must version its checkpoint envelope and retain its
+ordered flush/effect protocol; this parser does not serialize callbacks,
+wall-clock deadlines, or terminal consumer state.

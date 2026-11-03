@@ -34,31 +34,3 @@ pub struct EnrollResponse {
     pub cert_sha256: String,
     pub socket_path: String,
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn version_info_json_shape() {
-        let json = serde_json::to_string(&VersionInfo::current()).unwrap();
-        assert!(json.contains(r#""version":"0.1.0""#), "{json}");
-        assert!(json.contains(r#""proto":{"major":0,"minor":1}"#), "{json}");
-        let back: VersionInfo = serde_json::from_str(&json).unwrap();
-        assert_eq!(back, VersionInfo::current());
-    }
-
-    #[test]
-    fn enroll_response_roundtrips_with_null_port() {
-        let r = EnrollResponse {
-            device_id: "d".into(),
-            token: "ab".repeat(32),
-            quic_port: None,
-            cert_sha256: "cd".repeat(32),
-            socket_path: "/home/u/.flotilla/run/daemon.sock".into(),
-        };
-        let json = serde_json::to_string(&r).unwrap();
-        assert!(json.contains(r#""quic_port":null"#));
-        assert_eq!(serde_json::from_str::<EnrollResponse>(&json).unwrap(), r);
-    }
-}

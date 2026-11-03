@@ -1,0 +1,29 @@
+[package]
+name = "fld-prochost"
+description = "Independent persistent PTY ownership and lossless recovery journal"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+bytes.workspace = true
+fl-model.workspace = true
+fl-proto.workspace = true
+fl-prochost-proto.workspace = true
+futures.workspace = true
+libc.workspace = true
+portable-pty.workspace = true
+postcard.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

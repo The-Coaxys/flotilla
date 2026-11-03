@@ -1,0 +1,13 @@
+[package]
+name = "fl-prochost-proto"
+description = "Versioned local protocol for Flotilla's independent PTY process host"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+fl-model.workspace = true
+fl-proto.workspace = true
+serde.workspace = true
