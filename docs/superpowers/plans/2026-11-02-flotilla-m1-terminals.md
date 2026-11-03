@@ -113,6 +113,22 @@ Task 1's checkpoint schema is the first shared prerequisite; Task 2 freezes the 
 - OSC7 cwd, OSC133 prompt marks, title and bell observable; OSC52 asks once per host and remains denied without consent. All §5.1 features need an exercised path.
 - Predictive echo is an overlay only: high-latency shell typing looks immediate, wrong predictions disappear, and full-screen/password input is never guessed.
 
+## Performance evidence (M1, Linux x86_64, release build)
+
+Measured with a temporary driver over the production `fl-term` engine, then removed:
+
+| Measurement | Result |
+|---|---|
+| Parse throughput, 120×40, SGR + wide glyphs sent as 20 KiB chunks | 40 MiB in 535 ms → **74.8 MiB/s** |
+| Frame build for a full 120×40 screen | 2000 frames in 14.3 ms → **7.1 µs/frame** (0.04 % of a 60 Hz budget) |
+| Checkpoint save / restore of a full scrollback (10.9 MB) | 141 ms / 147 ms, byte-identical cells on both sides |
+
+Caveats: these are engine-side numbers on a Linux workstation, not the Windows
+client's measured paint time and not end-to-end daemon→client throughput over
+the VPS. A 10.9 MB checkpoint reflects a completely full scrollback; the daemon
+writes it off the UI path. Client window frame timing, DPI/IME behavior and RSS
+must be recorded from the installed Windows build before the milestone closes.
+
 ## Completion gate
 
 M1 is complete only with a released, installed Windows build used as a remote terminal against the VPS, the resilience/interaction matrix above, updated licenses/notices and docs, and recorded performance evidence. A compiling renderer, an interactive shell without durable recovery, or tests of disconnected pieces do not satisfy the milestone.
@@ -144,4 +160,7 @@ Resource limits, lossless-journal backpressure and the checkpoint/history distin
 - Task 8: `flc-shell` renders the daemon's projected layout as a recursive view split tree with per-view tab strips and terminal panes backed by `flc-terminal` views over `flc-sync` mirrors. Intents preview locally and submit `LayoutOp`s; unacknowledged operations, the offline copy and rejected operations are visible. New terminal, close tab/pane/view, rename (inline editor), pin, reorder, tab/view/pane selection, pane and view splits, and ratio changes are reachable from the strip and keyboard. Eight window-free model tests cover projection, focus after close, split geometry, ratio clamping, pinned ordering and attachable incarnations. The app builds one session and shell per connected host and keeps the host card while connecting.
 - Task 8 limits: split ratios are adjusted by keyboard and a divider click resets to even; pointer-dragging a divider, tab drag-and-drop with a drop-ring preview and the saved-layout launcher are not implemented yet. Panes report their own grid size, so the daemon's approved size stays authoritative.
 - A rejected layout intent is never silently dropped: the shell shows a banner and the next published layout replaces the local preview.
+- Task 9 (offline and resume): the supervisor exposes `retry_now()`, which skips an accumulated backoff with a fresh attempt budget; the app calls it for every host when the window is activated, so returning to a laptop reconnects at once instead of after the full backoff. A supervisor test with a real daemon, killed transports and three failed reconnects proves a new attempt starts within 500 ms of the call.
+- Task 9 limits: OS power-resume notifications are not wired (no `WM_POWERBROADCAST` handler), so a resume detected only while the app is backgrounded waits for the next activation; input accepted before a transport drop but acknowledged after the five-second TTL is reported expired and never reaches the PTY.
+- Framing regression found while running the full workspace suite: the large-message test sent a client version that protocol 0.2 validation rejects, so the writer failed before writing a byte while the reader waited forever — the workspace suite and both platform jobs deadlocked for the full job timeout. The compression test now frames 200 KiB of incompressible data through a free-standing wire type, and a new test pins that payload validation precedes writing: a rejected message surfaces as a clean close, never as a peer blocked on a frame.
 - Not yet carried on the terminal protocol: bell, OSC52 clipboard and title/cwd notifications. OSC52 reads receive no reply until the per-host consent flow lands. Owner leases reset on daemon restart.
