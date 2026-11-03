@@ -205,3 +205,81 @@ fn impossible_operations_leave_the_layout_untouched() {
     let refused = model.layout().map(|layout| layout.views.len()).unwrap();
     assert_eq!(refused, before.views.len());
 }
+
+/// Every intent the shell submits must be an operation the daemon's
+/// authoritative applier accepts, and applying it there must land exactly the
+/// terminals the shell projected locally.
+#[test]
+fn shell_intents_apply_cleanly_to_the_authoritative_layout() {
+    let (mut model, view, size) = workspace();
+    // The daemon's copy: what the server holds before the intents arrive.
+    let mut server = model.layout().unwrap().clone();
+
+    fn terminals(layout: &Layout) -> Vec<TerminalId> {
+        layout
+            .views
+            .iter()
+            .flat_map(|v| v.tabs.iter())
+            .flat_map(|t| t.panes.iter())
+            .map(|p| p.terminal)
+            .collect()
+    }
+
+    fn submit(model: &ShellModel, server: &mut Layout, op: Option<LayoutOp>, what: &str) {
+        let op = op.unwrap_or_else(|| panic!("{what} produced no operation"));
+        server.apply(op).expect("daemon rejects a shell intent");
+        assert_eq!(terminals(server), terminals(model.layout().unwrap()));
+    }
+
+    let first = TerminalId::new();
+    let op = model.new_tab(first, size, Some("build".into()));
+    let spawn = server
+        .apply(op.clone().expect("new tab"))
+        .expect("daemon rejects new tab")
+        .spawn
+        .expect("a new tab must ask the daemon to spawn its terminal");
+    assert_eq!(spawn.terminal, first);
+
+    let second = TerminalId::new();
+    let op = model.split_pane(second, Axis::Horizontal, size);
+    submit(&model, &mut server, op, "split pane");
+
+    let first_pane = model
+        .layout()
+        .unwrap()
+        .tab(view, model.focus().unwrap().tab.unwrap())
+        .unwrap()
+        .panes[0]
+        .id;
+    let op = model.select_pane(first_pane);
+    submit(&model, &mut server, op, "select pane");
+
+    let op = model.pin_tab(true);
+    submit(&model, &mut server, op, "pin");
+
+    let op = model.rename_tab(Some("tests".into()));
+    submit(&model, &mut server, op, "rename");
+
+    let third = TerminalId::new();
+    let op = model.split_view(third, Axis::Vertical, size);
+    submit(&model, &mut server, op, "split view");
+
+    // Work in the first view, where the split left two panes.
+    let view = model.layout().unwrap().views[0].id;
+    let op = model.select_view(view);
+    submit(&model, &mut server, op, "select view");
+    let tab = model.layout().unwrap().views[0].tabs[0].id;
+    let op = model.select_tab(tab);
+    submit(&model, &mut server, op, "select tab");
+
+    let op = model.close_pane();
+    submit(&model, &mut server, op, "close pane");
+
+    let op = model.close_tab();
+    submit(&model, &mut server, op, "close tab");
+
+    // One view remains: the shell refuses to empty the workspace, so no
+    // operation is submitted and the daemon's layout is untouched.
+    assert!(model.close_view().is_none());
+    assert_eq!(terminals(&server), terminals(model.layout().unwrap()));
+}
