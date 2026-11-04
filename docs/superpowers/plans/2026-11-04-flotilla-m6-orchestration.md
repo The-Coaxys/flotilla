@@ -83,6 +83,23 @@ Verified against a live daemon on this host (as the daemon's user):
   changed the durable layout (rev 1 -> 6, ratio 3500 in the tree) and refused `--ratio 100`.
 - `fl worktree review-add --path src/main.rs --body ...` appended a review thread (rev 0 -> 1).
 
+Integrated verification (parent, same live daemon, scripted `claude`):
+
+- Schema v9 migrated the existing state database with a
+  `state.db.before-v8-to-v9-*.db` backup.
+- `fl coordination-state` create/CAS/stale-conflict/lock/unlock/refusal all behaved as
+  specified (`revision_conflict`, `not_found` with non-zero exits).
+- A 2-role `fl team run` (`architect` + `builder`, one provider) started two sessions and two
+  named tabs (`team:architect`, `team:builder`), settled both roles `Finished`,
+  `fan_in_sent: true`, and the lead transcript contains exactly one fan-in `UserMessage`
+  naming the run and the settled count. `fl team list` and `fl team report` are durable.
+- `fl hook PreToolUse` appended a `ToolCall` row; `fl hook Stop` appended a `HookFact` and the
+  session's `status_source` became `Hook`; `fl instructions orchestration` prints the
+  embedded guide.
+- The native chat transcript renders `ChatEvent::HookFact` as a muted `hook` status row
+  (unit test `hook_facts_render_as_status_rows_not_turns`), so hook facts never look like a
+  turn outcome.
+
 Bug found by that run and fixed: `fl chat new` expected `Response::ChatSession` while the
 daemon replies `ChatSessions([session])`; the CLI now accepts the list reply (the same shape
 `flc-sync` reads).
