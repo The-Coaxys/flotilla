@@ -721,6 +721,10 @@ async fn git_actions_and_the_pull_request_loop() {
             work.to_str().unwrap(),
         ],
     );
+    // A clone does not inherit the seed repository's config, and the daemon
+    // commits inside this project, so the identity must be set here too.
+    git(&work, &["config", "user.name", "t"]);
+    git(&work, &["config", "user.email", "t@example.com"]);
     let github = "https://github.com/acme/widgets.git";
     git(&work, &["remote", "set-url", "origin", github]);
     git(
