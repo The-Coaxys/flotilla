@@ -424,11 +424,12 @@ async fn cached_layout_and_mirror_render_before_the_server_answers() {
     handle.send_input(b"printf 'MARKER%s\\n' cached\n".to_vec());
     wait_text(&handle, "MARKERcached", WAIT).await;
     let incarnation = handle.incarnation();
+    // Persist exactly the state the test just observed; the debounce is not a
+    // guarantee that the last record is already on disk.
+    handle.flush_cache().await;
     let live_checkpoint = handle
         .with_engine(|engine| engine.checkpoint().unwrap())
         .unwrap();
-    // Let the debounced cache write land.
-    tokio::time::sleep(Duration::from_millis(600)).await;
     assert!(cache_dir.join("workspace.bin").exists());
     sync.shutdown().await;
     sup.shutdown().await;
