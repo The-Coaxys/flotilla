@@ -216,6 +216,26 @@ impl Database {
         .map(|(_, rev)| rev)
     }
 
+    /// Record the merge-base target a worktree diffs against. Returns the new
+    /// tree revision when it changed.
+    pub fn set_worktree_target(
+        &mut self,
+        id: WorktreeId,
+        target: Option<&str>,
+    ) -> Result<Option<u64>> {
+        if let Some(target) = target {
+            validate_text("target branch", target, MAX_TEXT_BYTES).map_err(StoreError::Invalid)?;
+        }
+        self.update_worktree(id, |worktree| {
+            if worktree.target.as_deref() == target {
+                return false;
+            }
+            worktree.target = target.map(str::to_owned);
+            true
+        })
+        .map(|(_, rev)| rev)
+    }
+
     fn update_worktree(
         &mut self,
         id: WorktreeId,

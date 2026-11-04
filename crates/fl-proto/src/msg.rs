@@ -344,6 +344,39 @@ pub enum Request {
     DismissInbox {
         item: uuid::Uuid,
     },
+    // --- M6: `fl` CLI command surface (0.4) ---
+    /// Resolve the caller of one `fl` invocation from its working directory
+    /// and optional `FLOTILLA_SESSION_ID`.
+    ResolveCaller {
+        cwd: String,
+        session: Option<uuid::Uuid>,
+    },
+    /// Rename the checked-out branch of a git worktree.
+    RenameWorktreeBranch {
+        worktree: WorktreeId,
+        branch: String,
+    },
+    /// Change the merge-base target a worktree diffs against.
+    SetWorktreeTarget {
+        worktree: WorktreeId,
+        target: Option<String>,
+    },
+    /// Parse `.flotilla/config.json` and report its configured scripts.
+    CheckProjectScripts {
+        worktree: WorktreeId,
+    },
+    GetChatSession {
+        session: uuid::Uuid,
+    },
+    /// Sessions across every worktree, newest first.
+    ListChatHistory {
+        limit: u16,
+    },
+    /// The durable default workspace of an `fl` installation.
+    SelectWorkspace {
+        workspace: WorkspaceId,
+    },
+    GetSelectedWorkspace,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -385,6 +418,12 @@ pub enum Response {
     ChatEvents(fl_model::chat::ChatEventPage),
     ChatHits(Vec<fl_model::chat::ChatHit>),
     Inbox(Vec<fl_model::chat::InboxItem>),
+    // --- M6 ---
+    Caller(fl_model::workspace::CallerContext),
+    Workspace(fl_model::workspace::WorkspaceInfo),
+    SelectedWorkspace(Option<fl_model::workspace::WorkspaceInfo>),
+    ScriptCheck(fl_model::workspace::ProjectScriptCheck),
+    ChatSession(fl_model::chat::ChatSession),
 }
 
 /// Returned on the authenticated control stream before requesting channels.
@@ -653,6 +692,49 @@ impl Request {
                 )
             }
             Self::DismissInbox { item } => validation::non_nil("inbox item", *item),
+            // --- M6 ---
+            Self::ResolveCaller { cwd, session } => {
+                path(cwd)?;
+                if let Some(session) = session {
+                    validation::non_nil("chat session", *session)?;
+                }
+                Ok(())
+            }
+            Self::RenameWorktreeBranch { worktree, branch } => {
+                validation::non_nil_id("worktree", worktree.as_bytes())?;
+                if branch.trim().is_empty() {
+                    return Err(ValidationError::Invalid("branch"));
+                }
+                text("branch", branch, MAX_TEXT_BYTES)
+            }
+            Self::SetWorktreeTarget { worktree, target } => {
+                validation::non_nil_id("worktree", worktree.as_bytes())?;
+                if let Some(target) = target {
+                    if target.trim().is_empty() {
+                        return Err(ValidationError::Invalid("target branch"));
+                    }
+                    text("target branch", target, MAX_TEXT_BYTES)?;
+                }
+                Ok(())
+            }
+            Self::CheckProjectScripts { worktree } => {
+                validation::non_nil_id("worktree", worktree.as_bytes())
+            }
+            Self::GetChatSession { session } => validation::non_nil("chat session", *session),
+            Self::ListChatHistory { limit } => {
+                if *limit == 0 {
+                    return Err(ValidationError::Invalid("history limit"));
+                }
+                bound(
+                    "history limit",
+                    *limit as usize,
+                    fl_model::chat::MAX_CHAT_HISTORY,
+                )
+            }
+            Self::SelectWorkspace { workspace } => {
+                validation::non_nil_id("workspace", workspace.as_bytes())
+            }
+            Self::GetSelectedWorkspace => Ok(()),
             _ => Ok(()),
         }
     }
@@ -746,6 +828,42 @@ impl Response {
             Self::ChatEvents(value) => validation::chat_events(value),
             Self::ChatHits(values) => validation::chat_hits(values),
             Self::Inbox(values) => validation::inbox_items(values),
+            // --- M6 ---
+            Self::Caller(value) => {
+                validation::path(&value.cwd)?;
+                if let Some(worktree) = &value.worktree {
+                    validation::worktree(worktree)?;
+                }
+                if let Some(project) = &value.project {
+                    validation::project(project)?;
+                }
+                if let Some(session) = &value.session {
+                    validation::chat_session(session)?;
+                }
+                Ok(())
+            }
+            Self::Workspace(value) => {
+                validation::non_nil_id("workspace", value.id.as_bytes())?;
+                validation::text("workspace name", &value.name, MAX_TEXT_BYTES)
+            }
+            Self::SelectedWorkspace(Some(value)) => {
+                validation::non_nil_id("workspace", value.id.as_bytes())?;
+                validation::text("workspace name", &value.name, MAX_TEXT_BYTES)
+            }
+            Self::SelectedWorkspace(None) => Ok(()),
+            Self::ScriptCheck(value) => {
+                validation::non_nil_id("worktree", value.worktree.as_bytes())?;
+                validation::path(&value.config_path)?;
+                if let Some(error) = &value.error {
+                    validation::text("script config error", error, MAX_TEXT_BYTES)?;
+                }
+                validation::bound("run targets", value.runs.len(), validation::MAX_SCRIPTS)?;
+                for run in &value.runs {
+                    validation::text("run target", run, MAX_TEXT_BYTES)?;
+                }
+                Ok(())
+            }
+            Self::ChatSession(value) => validation::chat_session(value),
             Self::Written(_) | Self::Done => Ok(()),
             Self::DaemonInfo(value) => {
                 for text in [
@@ -1359,5 +1477,101 @@ mod tests {
             .map(|sequence| chat_event(id, sequence))
             .collect();
         assert!(Response::ChatEvents(page).validate().is_err());
+    }
+
+    #[test]
+    fn m6_cli_requests_and_responses_round_trip_and_validate() {
+        let worktree = WorktreeId::from_bytes([1; 16]);
+        let workspace = WorkspaceId::from_bytes([2; 16]);
+        let session = uuid::Uuid::from_bytes([3; 16]);
+        let requests = vec![
+            Request::ResolveCaller {
+                cwd: "/tmp/work".into(),
+                session: Some(session),
+            },
+            Request::RenameWorktreeBranch {
+                worktree,
+                branch: "feature/cli".into(),
+            },
+            Request::SetWorktreeTarget {
+                worktree,
+                target: Some("main".into()),
+            },
+            Request::SetWorktreeTarget {
+                worktree,
+                target: None,
+            },
+            Request::CheckProjectScripts { worktree },
+            Request::GetChatSession { session },
+            Request::ListChatHistory { limit: 16 },
+            Request::SelectWorkspace { workspace },
+            Request::GetSelectedWorkspace,
+        ];
+        for (index, request) in requests.into_iter().enumerate() {
+            request.validate().unwrap();
+            let message = ClientMsg::Rpc {
+                id: index as u64,
+                req: request,
+            };
+            assert_eq!(
+                ClientMsg::from_frame(&message.to_frame().unwrap()).unwrap(),
+                message
+            );
+        }
+        let info = fl_model::workspace::WorkspaceInfo {
+            id: workspace,
+            name: "Default".into(),
+            order: 0,
+        };
+        let check = fl_model::workspace::ProjectScriptCheck {
+            worktree,
+            config_path: "/tmp/work/.flotilla/config.json".into(),
+            error: None,
+            setup: true,
+            teardown: false,
+            runs: vec!["web".into()],
+        };
+        let caller = fl_model::workspace::CallerContext {
+            cwd: "/tmp/work".into(),
+            worktree: None,
+            project: None,
+            session: None,
+        };
+        for response in [
+            Response::Caller(caller),
+            Response::Workspace(info.clone()),
+            Response::SelectedWorkspace(Some(info)),
+            Response::SelectedWorkspace(None),
+            Response::ScriptCheck(check),
+        ] {
+            response.validate().unwrap();
+            let message = ServerMsg::RpcResult {
+                id: 1,
+                result: Ok(response),
+            };
+            assert_eq!(
+                ServerMsg::from_frame(&message.to_frame().unwrap()).unwrap(),
+                message
+            );
+        }
+        assert!(
+            Request::ResolveCaller {
+                cwd: "relative".into(),
+                session: None,
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            Request::ListChatHistory { limit: 0 }.validate().is_err()
+        );
+        assert!(
+            Request::SetWorktreeTarget {
+                worktree,
+                target: Some("  ".into()),
+            }
+            .validate()
+            .is_err()
+        );
     }
 }

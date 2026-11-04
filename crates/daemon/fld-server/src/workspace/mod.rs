@@ -16,8 +16,8 @@ use std::sync::{Arc, Mutex};
 
 use fl_model::layout::{Layout, LayoutOp};
 use fl_model::workspace::{
-    DaemonEvent, DirListing, FileContent, FileDiff, LayoutScope, Project, ProjectKind,
-    WorkspaceTree, Worktree, WorktreeStatus,
+    CallerContext, DaemonEvent, DirListing, FileContent, FileDiff, LayoutScope, Project,
+    ProjectKind, WorkspaceInfo, WorkspaceTree, Worktree, WorktreeStatus,
 };
 use fl_model::{OperationId, ProjectId, WorkspaceId, WorktreeId};
 use fl_proto::validation::{MAX_DIR_ENTRIES, MAX_FILE_BYTES};
@@ -192,6 +192,64 @@ impl WorkspaceService {
 
     pub(crate) async fn worktree(&self, id: WorktreeId) -> Result<(Worktree, Project), RpcError> {
         self.store(move |store| store.database.worktree(id)).await
+    }
+
+    /// Resolve `fl`'s caller from its working directory and optional chat
+    /// session. A missing session is not an error: stale `FLOTILLA_SESSION_ID`
+    /// values must not break commands that do not need one.
+    pub(crate) async fn resolve_caller(
+        &self,
+        cwd: String,
+        session: Option<uuid::Uuid>,
+    ) -> Result<CallerContext, RpcError> {
+        let tree = self.tree().await?;
+        let cwd_path = Path::new(&cwd);
+        let worktree = tree
+            .worktrees
+            .iter()
+            .filter(|worktree| cwd_path.starts_with(Path::new(&worktree.path)))
+            .max_by_key(|worktree| worktree.path.len())
+            .cloned();
+        let session = match session {
+            Some(id) => self.chat.session(id).await.ok(),
+            None => None,
+        };
+        let project = worktree
+            .as_ref()
+            .and_then(|worktree| tree.projects.iter().find(|p| p.id == worktree.project))
+            .cloned();
+        Ok(CallerContext {
+            cwd,
+            worktree,
+            project,
+            session,
+        })
+    }
+
+    /// Chat history across every worktree, newest first, bounded by `limit`.
+    pub(crate) async fn chat_history(
+        &self,
+        limit: u16,
+    ) -> Result<Vec<fl_model::chat::ChatSession>, RpcError> {
+        let mut sessions = self
+            .store(|store| store.database.all_chat_sessions())
+            .await?;
+        sessions.reverse();
+        sessions.truncate(usize::from(limit));
+        Ok(sessions)
+    }
+
+    pub(crate) async fn selected_workspace(&self) -> Result<Option<WorkspaceInfo>, RpcError> {
+        self.store(|store| store.database.selected_workspace())
+            .await
+    }
+
+    pub(crate) async fn select_workspace(
+        &self,
+        workspace: WorkspaceId,
+    ) -> Result<WorkspaceInfo, RpcError> {
+        self.store(move |store| store.database.set_selected_workspace(workspace))
+            .await
     }
 
     /// Stop watchers, drop cached state and retire the closed terminals of
@@ -511,6 +569,60 @@ impl WorkspaceService {
             .await?;
         self.tree_changed(rev);
         Ok(worktree)
+    }
+
+    /// Rename the branch checked out in a worktree, then record it durably.
+    pub(crate) async fn rename_branch(
+        &self,
+        id: WorktreeId,
+        branch: String,
+    ) -> Result<Worktree, RpcError> {
+        let _structure = self.structure.lock().await;
+        let (worktree, project) = self.worktree(id).await?;
+        if project.kind != ProjectKind::Git {
+            return Err(invalid(format!(
+                "{} is a folder project; it has no branch to rename",
+                project.name
+            )));
+        }
+        let (primary, name) = (PathBuf::from(&project.path), branch.clone());
+        blocking(move || fld_git::worktree::validate_branch_name(&primary, &name)).await?;
+        let (path, name) = (PathBuf::from(&worktree.path), branch.clone());
+        blocking(move || fld_git::ops::rename_branch(&path, &name)).await?;
+        let rev = self
+            .store(move |store| store.database.set_worktree_branch(id, Some(&branch)))
+            .await?;
+        if let Some(rev) = rev {
+            self.tree_changed(rev);
+        }
+        self.worktree(id).await.map(|(worktree, _)| worktree)
+    }
+
+    /// Change the branch this worktree diffs against.
+    pub(crate) async fn set_target(
+        &self,
+        id: WorktreeId,
+        target: Option<String>,
+    ) -> Result<Worktree, RpcError> {
+        let _structure = self.structure.lock().await;
+        let (worktree, project) = self.worktree(id).await?;
+        if project.kind != ProjectKind::Git {
+            return Err(invalid(format!(
+                "{} is a folder project; it has no target branch",
+                project.name
+            )));
+        }
+        if let Some(target) = &target {
+            let (primary, name) = (PathBuf::from(&project.path), target.clone());
+            blocking(move || fld_git::worktree::validate_branch_name(&primary, &name)).await?;
+        }
+        let rev = self
+            .store(move |store| store.database.set_worktree_target(id, target.as_deref()))
+            .await?;
+        if let Some(rev) = rev {
+            self.tree_changed(rev);
+        }
+        self.worktree(id).await.map(|(worktree, _)| worktree)
     }
 
     // --- Layouts ------------------------------------------------------------

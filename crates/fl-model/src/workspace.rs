@@ -190,6 +190,33 @@ pub struct ScriptState {
     pub state: ScriptRunState,
 }
 
+/// The caller of one `fl` invocation, resolved from `FLOTILLA_SESSION_ID`
+/// and the working directory (protocol 0.4).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CallerContext {
+    /// Absolute working directory supplied by the client.
+    pub cwd: String,
+    /// Longest worktree path containing `cwd`; `None` outside every worktree.
+    pub worktree: Option<Worktree>,
+    pub project: Option<Project>,
+    /// The chat session named by `FLOTILLA_SESSION_ID`, when it still exists.
+    pub session: Option<crate::chat::ChatSession>,
+}
+
+/// Configured scripts of one worktree, as parsed from `.flotilla/config.json`
+/// for `fl project scripts check` (protocol 0.4).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectScriptCheck {
+    pub worktree: WorktreeId,
+    pub config_path: String,
+    /// The config read or parse failure; `None` when the file is absent or valid.
+    pub error: Option<String>,
+    pub setup: bool,
+    pub teardown: bool,
+    /// Run target names that have at least one command, sorted by name.
+    pub runs: Vec<String>,
+}
+
 /// Where a layout lives: the host's home layout (M1) or one worktree's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum LayoutScope {

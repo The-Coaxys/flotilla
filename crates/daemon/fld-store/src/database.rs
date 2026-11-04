@@ -36,7 +36,7 @@ use std::{
     time::Duration,
 };
 
-const SCHEMA_VERSION: u32 = 7;
+const SCHEMA_VERSION: u32 = 8;
 const MAX_LAYOUT_BYTES: usize = 128 * 1024;
 const MAX_ENTRY_BYTES: usize = 512 * 1024;
 const MAX_TEXT_BYTES: usize = 4096;
@@ -557,6 +557,10 @@ fn migrate(connection: &mut Connection, root: &File, path: &Path, existed: bool)
                 "INSERT INTO chat_meta(singleton,fts5) VALUES(1,?1)",
                 [chat::initial_chat_meta(fts5)],
             )?;
+        }
+        if version < 8 {
+            transaction.execute_batch(cli::SCHEMA_V8)?;
+            transaction.execute("INSERT OR IGNORE INTO cli_meta(singleton) VALUES(1)", [])?;
         }
         transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     }
@@ -1320,6 +1324,9 @@ pub use chat::{ChatAppend, ChatEventEffects, NewInboxItem, PendingKind, PendingR
 
 #[path = "sections.rs"]
 mod sections;
+
+#[path = "cli.rs"]
+mod cli;
 
 #[cfg(test)]
 #[path = "database_tests.rs"]
