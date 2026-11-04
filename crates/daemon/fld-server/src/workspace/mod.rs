@@ -49,6 +49,10 @@ pub(crate) struct WorkspaceService {
     forge: Mutex<forge::ForgeCache>,
     /// Routed dispatches of this daemon lifetime.
     dispatches: Mutex<HashMap<fl_model::TaskRunId, fl_model::routing::TaskDispatch>>,
+    /// Cancels a pending dispatch when its worktree is removed.
+    dispatch_cancels: Mutex<HashMap<fl_model::TaskRunId, CancellationToken>>,
+    /// Cached provider discovery; handshakes are expensive and change slowly.
+    providers: tokio::sync::Mutex<Option<(std::time::Instant, Vec<fld_agent::ProviderDiscovery>)>>,
     cancel: CancellationToken,
 }
 
@@ -130,6 +134,8 @@ impl WorkspaceService {
             statuses: Mutex::default(),
             forge: Mutex::default(),
             dispatches: Mutex::default(),
+            dispatch_cancels: Mutex::default(),
+            providers: tokio::sync::Mutex::new(None),
             cancel,
         });
         service.reconcile().await?;
@@ -323,6 +329,19 @@ impl WorkspaceService {
     /// Forget a project; its files stay untouched.
     pub(crate) async fn remove_project(&self, project: ProjectId) -> Result<(), RpcError> {
         let _structure = self.structure.lock().await;
+        let tree = self.tree().await?;
+        let worktrees: Vec<WorktreeId> = tree
+            .worktrees
+            .iter()
+            .filter(|worktree| worktree.project == project)
+            .map(|worktree| worktree.id)
+            .collect();
+        // Stop providers and routed tasks before the cascade deletes their
+        // sessions and dispatches.
+        for worktree in &worktrees {
+            self.cancel_dispatches_for(*worktree);
+            self.chat.close_worktree(*worktree).await?;
+        }
         let removed = self
             .store(move |store| store.database.remove_project(project))
             .await?;
@@ -474,11 +493,16 @@ impl WorkspaceService {
                     )));
                 }
             }
+            // A provider or routed task must not outlive the worktree.
+            self.cancel_dispatches_for(id);
+            self.chat.close_worktree(id).await?;
             self.clone().teardown(&worktree, &project).await;
             self.unwatch(id);
             let (repo, dir) = (primary.clone(), path.clone());
             blocking(move || fld_git::worktree::remove_worktree(&repo, &dir, force)).await?;
         } else {
+            self.cancel_dispatches_for(id);
+            self.chat.close_worktree(id).await?;
             self.unwatch(id);
             let (repo, dir) = (primary.clone(), path.clone());
             blocking(move || fld_git::worktree::remove_worktree(&repo, &dir, true)).await?;

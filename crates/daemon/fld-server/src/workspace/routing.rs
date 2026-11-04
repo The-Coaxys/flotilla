@@ -7,7 +7,7 @@
 //! behalf, and a dispatch reports Prepared/Running/Completed/Failed truthfully.
 use super::{WorkspaceService, blocking, invalid, now_ms, rpc};
 use fl_model::WorktreeId;
-use fl_model::chat::{ChatEvent, PermissionMode, SessionState, TurnOutcome};
+use fl_model::chat::{ChatEvent, ChatSession, PermissionMode, SessionState, TurnOutcome};
 use fl_model::routing::{
     DispatchMode, GitTask, RouteSpec, RoutingMutation, RoutingState, TaskDispatch,
     TaskDispatchState, TemplateContext, render_template,
@@ -17,13 +17,20 @@ use fl_proto::{RpcError, RpcErrorCode};
 use fld_agent::{ProviderDiscovery, ProviderRegistry};
 use tokio::sync::broadcast;
 use tokio::time::{Duration, timeout};
+use tokio_util::sync::CancellationToken;
 
-use crate::chat::{ChatNotice, ChatService};
+use crate::chat::{ChatNotice, ChatService, bounded_with_marker};
+use crate::terminal::bounded;
 
 /// Provider discovery runs real CLI handshakes; keep it bounded.
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(20);
+/// Cached discovery avoids one handshake per `ListChatProviders` call.
+const DISCOVERY_TTL: Duration = Duration::from_secs(30);
 const MAX_STRUCTURED_TITLE: usize = 200;
 const MAX_STRUCTURED_BODY: usize = 60_000;
+/// In-memory dispatch history; older entries fall off (prompts included).
+const MAX_DISPATCH_HISTORY: usize = 128;
+const MAX_PROMPT_BYTES: usize = fl_proto::validation::MAX_MESSAGE_BYTES;
 
 impl WorkspaceService {
     pub(crate) async fn routing_state(&self) -> Result<RoutingState, RpcError> {
@@ -44,7 +51,15 @@ impl WorkspaceService {
     }
 
     /// Providers the daemon can actually drive, with the reason when it cannot.
+    /// Discovery performs real CLI handshakes, so a short cache prevents one
+    /// handshake per `ListChatProviders` call.
     pub(crate) async fn chat_providers(&self) -> Result<Vec<ProviderDiscovery>, RpcError> {
+        let mut cache = self.providers.lock().await;
+        if let Some((at, providers)) = cache.as_ref()
+            && at.elapsed() < DISCOVERY_TTL
+        {
+            return Ok(providers.clone());
+        }
         let discovered = timeout(DISCOVERY_TIMEOUT, ProviderRegistry::default().discover())
             .await
             .map_err(|_| {
@@ -53,6 +68,7 @@ impl WorkspaceService {
                     "provider discovery timed out; a provider CLI did not answer its handshake",
                 )
             })?;
+        *cache = Some((std::time::Instant::now(), discovered.clone()));
         Ok(discovered)
     }
 
@@ -146,7 +162,12 @@ impl WorkspaceService {
         .map_err(|error| invalid(format!("invalid .flotilla/config.json: {error}")))?;
         let template =
             routing.template_with_repo(task, project.id, project.workspace, repo_prompt.as_deref());
-        let prompt = render_template(&template, &template_context);
+        // Wire-bound the rendered prompt at construction; the adapter call and
+        // the displayed dispatch use exactly this bounded prompt.
+        let prompt = bounded_with_marker(
+            &render_template(&template, &template_context),
+            MAX_PROMPT_BYTES,
+        );
         if prompt.trim().is_empty() {
             return Err(invalid("the routed prompt is empty"));
         }
@@ -177,7 +198,7 @@ impl WorkspaceService {
         // idle and speaks the routed provider.
         let session = match mode {
             DispatchMode::ReuseSubmit | DispatchMode::ReusePrepare => {
-                self.idle_chat(id, &route.provider).await
+                self.idle_chat(id, &route).await
             }
             _ => None,
         };
@@ -207,7 +228,7 @@ impl WorkspaceService {
             }
             Err(error) => {
                 let failed = TaskDispatchState::Failed {
-                    message: error.message.clone(),
+                    message: bounded(error.message.clone()),
                 };
                 self.update_dispatch(dispatch.id, |dispatch| {
                     dispatch.state = failed.clone();
@@ -220,10 +241,11 @@ impl WorkspaceService {
     }
 
     fn remember_dispatch(&self, dispatch: TaskDispatch) {
-        self.dispatches
-            .lock()
-            .expect("dispatches poisoned")
-            .insert(dispatch.id, dispatch.clone());
+        {
+            let mut dispatches = self.dispatches.lock().expect("dispatches poisoned");
+            dispatches.insert(dispatch.id, dispatch.clone());
+            prune_dispatch_history(&mut dispatches);
+        }
         self.publish(DaemonEvent::TaskDispatchChanged(dispatch));
     }
 
@@ -250,25 +272,82 @@ impl WorkspaceService {
         state: TaskDispatchState,
         prompt: Option<String>,
     ) {
+        let state = match state {
+            TaskDispatchState::Failed { message } => TaskDispatchState::Failed {
+                message: bounded(message),
+            },
+            other => other,
+        };
+        self.dispatch_cancels
+            .lock()
+            .expect("dispatch cancels poisoned")
+            .remove(&id);
         self.update_dispatch(id, |dispatch| {
-            dispatch.state = state;
-            if let Some(prompt) = prompt {
-                dispatch.prompt = prompt;
+            let mut changed = dispatch.state != state;
+            if changed {
+                dispatch.state = state;
             }
-            true
+            if let Some(prompt) = prompt
+                && dispatch.prompt != prompt
+            {
+                dispatch.prompt = prompt;
+                changed = true;
+            }
+            changed
         });
     }
 
-    async fn idle_chat(&self, worktree: WorktreeId, provider: &str) -> Option<uuid::Uuid> {
+    /// Register the cancellation handle of a running dispatch.
+    fn register_dispatch_cancel(&self, id: fl_model::TaskRunId) -> CancellationToken {
+        let token = CancellationToken::new();
+        self.dispatch_cancels
+            .lock()
+            .expect("dispatch cancels poisoned")
+            .insert(id, token.clone());
+        token
+    }
+
+    /// Cancel every pending dispatch of a removed worktree.
+    fn cancel_dispatches_for(&self, worktree: WorktreeId) {
+        let ids: Vec<_> = self
+            .dispatches
+            .lock()
+            .expect("dispatches poisoned")
+            .iter()
+            .filter(|(_, dispatch)| dispatch.worktree == worktree)
+            .map(|(id, _)| *id)
+            .collect();
+        let tokens: Vec<_> = {
+            let mut cancels = self
+                .dispatch_cancels
+                .lock()
+                .expect("dispatch cancels poisoned");
+            ids.iter().filter_map(|id| cancels.remove(id)).collect()
+        };
+        for token in tokens {
+            token.cancel();
+        }
+        for id in ids {
+            self.finish_dispatch(
+                id,
+                TaskDispatchState::Failed {
+                    message: "the worktree was removed; the routed task was stopped".into(),
+                },
+                None,
+            );
+        }
+    }
+
+    /// An idle chat is reusable only when it speaks the route's provider and
+    /// exact model, uses the routed permission mode, and has no unsupported
+    /// thinking setting. Reusing a differently configured chat would silently
+    /// change the routed action's policy.
+    async fn idle_chat(&self, worktree: WorktreeId, route: &RouteSpec) -> Option<uuid::Uuid> {
         let sessions = self.chat.list_sessions(worktree).await.ok()?;
         sessions
             .into_iter()
             .rev()
-            .find(|session| {
-                session.provider == provider
-                    && session.status == SessionState::Idle
-                    && session.resume.is_some()
-            })
+            .find(|session| reusable_for_route(session, route))
             .map(|session| session.id)
     }
 
@@ -279,9 +358,26 @@ impl WorkspaceService {
         mut notices: broadcast::Receiver<ChatNotice>,
     ) {
         let weak = std::sync::Arc::downgrade(self);
+        let cancel = self.register_dispatch_cancel(id);
         tokio::spawn(async move {
             loop {
-                match notices.recv().await {
+                let notice = tokio::select! {
+                    _ = cancel.cancelled() => {
+                        if let Some(service) = weak.upgrade() {
+                            service.finish_dispatch(
+                                id,
+                                TaskDispatchState::Failed {
+                                    message: "the worktree was removed; the routed task was stopped"
+                                        .into(),
+                                },
+                                None,
+                            );
+                        }
+                        return;
+                    }
+                    notice = notices.recv() => notice,
+                };
+                match notice {
                     Ok(ChatNotice::Event {
                         session: event_session,
                         record,
@@ -391,20 +487,32 @@ impl WorkspaceService {
         let worktree = dispatch.worktree;
         let id = dispatch.id;
         let schema = ChatService::output_schema(task).to_owned();
+        let cancel = self.register_dispatch_cancel(id);
         tokio::spawn(async move {
             let Some(service) = weak.upgrade() else {
                 return;
             };
-            let result = service
-                .chat
-                .structured_call(
+            let result = tokio::select! {
+                _ = cancel.cancelled() => Err(invalid(
+                    "the worktree was removed; the routed task was stopped",
+                )),
+                result = service.chat.structured_call(
                     &route.provider,
                     route.model.clone(),
                     std::path::PathBuf::from(cwd),
                     prompt,
                     schema,
-                )
-                .await;
+                ) => result,
+            };
+            // Do not apply a completed answer into a worktree that is already
+            // being removed.
+            let result = if cancel.is_cancelled() {
+                Err(invalid(
+                    "the worktree was removed; the routed task was stopped",
+                ))
+            } else {
+                result
+            };
             let outcome = match result {
                 Ok(json) => service.apply_structured(task, worktree, &json).await,
                 Err(error) => Err(error),
@@ -517,4 +625,107 @@ impl WorkspaceService {
             _ => Err(invalid("not a structured routed task")),
         }
     }
+}
+
+/// Keep only the newest in-memory dispatches. The cap includes their prompts,
+/// so a long-lived daemon cannot accumulate rendered prompts indefinitely.
+fn prune_dispatch_history(
+    dispatches: &mut std::collections::HashMap<fl_model::TaskRunId, TaskDispatch>,
+) {
+    if dispatches.len() <= MAX_DISPATCH_HISTORY {
+        return;
+    }
+    let excess = dispatches.len() - MAX_DISPATCH_HISTORY;
+    let mut oldest: Vec<_> = dispatches
+        .iter()
+        .map(|(id, dispatch)| (*id, dispatch.created_ms))
+        .collect();
+    oldest.sort_by_key(|(_, created)| *created);
+    for (id, _) in oldest.into_iter().take(excess) {
+        dispatches.remove(&id);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fl_model::chat::StatusSource;
+
+    fn dispatch(created_ms: u64) -> TaskDispatch {
+        TaskDispatch {
+            id: fl_model::TaskRunId::new(),
+            worktree: WorktreeId::new(),
+            task: GitTask::Commit,
+            mode: DispatchMode::NewSubmit,
+            session: None,
+            prompt: "prompt".into(),
+            state: TaskDispatchState::Prepared,
+            created_ms,
+        }
+    }
+
+    fn session(route: &RouteSpec) -> ChatSession {
+        ChatSession {
+            id: uuid::Uuid::new_v4(),
+            worktree: WorktreeId::new(),
+            provider: route.provider.clone(),
+            label: "chat".into(),
+            status: SessionState::Idle,
+            status_source: StatusSource::Structured,
+            model: route.model.clone(),
+            thinking: route.thinking.clone(),
+            permission_mode: PermissionMode::Ask,
+            resume: Some(fl_model::chat::ResumeTarget {
+                provider_id: route.provider.clone(),
+                adapter: fl_model::chat::AdapterKind::ClaudeStream,
+                native_id: "native".into(),
+                cwd: "/tmp".into(),
+            }),
+            seq: 0,
+            created_ms: 1,
+            updated_ms: 1,
+        }
+    }
+
+    #[test]
+    fn routed_reuse_requires_the_exact_route_configuration() {
+        let route = RouteSpec::new("claude");
+        let matching = session(&route);
+        assert!(reusable_for_route(&matching, &route));
+        let mut different_model = matching.clone();
+        different_model.model = Some("other".into());
+        assert!(!reusable_for_route(&different_model, &route));
+        let mut read_only = matching.clone();
+        read_only.permission_mode = PermissionMode::ReadOnly;
+        assert!(!reusable_for_route(&read_only, &route));
+        let mut running = matching.clone();
+        running.status = SessionState::Running;
+        assert!(!reusable_for_route(&running, &route));
+        let mut thinking = route.clone();
+        thinking.thinking = Some("high".into());
+        assert!(!reusable_for_route(&matching, &thinking));
+    }
+
+    #[test]
+    fn dispatch_history_keeps_only_the_newest_entries() {
+        let mut dispatches = std::collections::HashMap::new();
+        for created in 0..(MAX_DISPATCH_HISTORY as u64 + 7) {
+            let value = dispatch(created);
+            dispatches.insert(value.id, value);
+            prune_dispatch_history(&mut dispatches);
+        }
+        assert_eq!(dispatches.len(), MAX_DISPATCH_HISTORY);
+        assert!(dispatches.values().all(|item| item.created_ms >= 7));
+    }
+}
+
+/// Routed reuse is allowed only for a session configured exactly like the
+/// route: same provider, model, permission mode and thinking setting.
+fn reusable_for_route(session: &ChatSession, route: &RouteSpec) -> bool {
+    session.provider == route.provider
+        && session.status == SessionState::Idle
+        && session.resume.is_some()
+        && session.model == route.model
+        && session.permission_mode == PermissionMode::Ask
+        && session.thinking == route.thinking
 }
