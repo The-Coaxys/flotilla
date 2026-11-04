@@ -85,6 +85,10 @@ impl Fixture {
         let repo = self.dir.path().join("repo");
         std::fs::create_dir(&repo).unwrap();
         git(&repo, &["init", "-q", "-b", "main"]);
+        // The daemon performs commits in this repository, so the identity must
+        // live in the repo, not in the runner's global git config.
+        git(&repo, &["config", "user.name", "t"]);
+        git(&repo, &["config", "user.email", "t@example.com"]);
         std::fs::write(repo.join("README.md"), "one\ntwo\nthree\n").unwrap();
         std::fs::write(repo.join(".gitignore"), ".env\n*.out\n").unwrap();
         std::fs::write(repo.join(".worktreeinclude"), ".env\n").unwrap();
