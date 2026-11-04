@@ -264,4 +264,11 @@ pub enum DaemonEvent {
     },
     /// Inbox items were added, read, or dismissed (protocol 0.4).
     InboxChanged,
+    /// A coordination value or lock changed (protocol 0.4). `version` is 0
+    /// for a deletion; watchers re-read the key instead of trusting this.
+    CoordinationChanged {
+        scope: crate::coordination::CoordinationScope,
+        key: String,
+        version: u64,
+    },
 }

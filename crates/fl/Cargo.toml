@@ -24,6 +24,7 @@ uuid.workspace = true
 
 # The end-to-end test runs a real daemon and process host, which are Unix-only.
 [target.'cfg(unix)'.dev-dependencies]
+fld-agent.workspace = true
 fld-prochost.workspace = true
 fld-server.workspace = true
 fl-prochost-proto.workspace = true

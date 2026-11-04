@@ -95,6 +95,171 @@ pub enum Command {
         #[command(subcommand)]
         command: AgentCommand,
     },
+    /// Print a Flotilla-authored instruction guide.
+    ///
+    /// With no topic, lists the topics. Works without a daemon.
+    Instructions {
+        /// Guide topic.
+        #[arg(value_enum)]
+        topic: Option<InstructionTopic>,
+    },
+    /// Durable per-scope coordination state with compare-and-set and locks.
+    CoordinationState {
+        #[command(subcommand)]
+        command: CoordinationCommand,
+    },
+    /// Team runs: 1-8 role chats, one lead fan-in.
+    Team {
+        #[command(subcommand)]
+        command: TeamCommand,
+    },
+    /// Record one normalized provider hook event for a chat session.
+    Hook {
+        /// Hook name, e.g. PreToolUse, PostToolUse, Stop or notify.
+        event: String,
+        /// Chat session (default: FLOTILLA_SESSION_ID or the caller's session).
+        #[arg(long)]
+        session: Option<Uuid>,
+        /// Hook JSON payload; `-` reads stdin (the default when stdin is piped).
+        #[arg(long, value_name = "JSON")]
+        payload: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum InstructionTopic {
+    Orchestration,
+    Layout,
+    Worktree,
+    Review,
+    Browser,
+}
+
+impl InstructionTopic {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Orchestration => "orchestration",
+            Self::Layout => "layout",
+            Self::Worktree => "worktree",
+            Self::Review => "review",
+            Self::Browser => "browser",
+        }
+    }
+}
+
+/// Namespace a coordination key or lock lives in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Default)]
+pub enum CoordinationScopeArg {
+    /// The caller's worktree (default).
+    #[default]
+    Worktree,
+    /// The caller's workspace, or the selected workspace.
+    Workspace,
+    /// The whole Flotilla home.
+    Global,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum CoordinationCommand {
+    /// Show a value, its version and any unexpired lock.
+    Get {
+        key: String,
+        #[arg(long, value_enum, default_value = "worktree")]
+        scope: CoordinationScopeArg,
+    },
+    /// Write a value; --if-version is a compare-and-set (0 creates only).
+    Set {
+        key: String,
+        /// Value text; pass --value-file for longer content.
+        #[arg(long, conflicts_with = "value_file")]
+        value: Option<String>,
+        /// Read the value from a file.
+        #[arg(long, value_name = "PATH", conflicts_with = "value")]
+        value_file: Option<String>,
+        /// Expected current version (0 means create only).
+        #[arg(long)]
+        if_version: Option<u64>,
+        #[arg(long, value_enum, default_value = "worktree")]
+        scope: CoordinationScopeArg,
+    },
+    /// Delete a value, optionally only at an expected version.
+    Delete {
+        key: String,
+        #[arg(long)]
+        if_version: Option<u64>,
+        #[arg(long, value_enum, default_value = "worktree")]
+        scope: CoordinationScopeArg,
+    },
+    /// Print the current value and every new version until interrupted.
+    Watch {
+        key: String,
+        #[arg(long, value_enum, default_value = "worktree")]
+        scope: CoordinationScopeArg,
+        /// Exit after this many seconds (0 waits until interrupted).
+        #[arg(long, default_value_t = 0, value_name = "SECONDS")]
+        timeout: u64,
+    },
+    /// Acquire or extend an advisory lock.
+    Lock {
+        key: String,
+        /// Identity that owns the lock.
+        #[arg(long)]
+        owner: String,
+        /// Lock lifetime; minimum 1 second, maximum 24 hours.
+        #[arg(long, default_value_t = 300, value_name = "SECONDS")]
+        ttl_seconds: u64,
+        #[arg(long, value_enum, default_value = "worktree")]
+        scope: CoordinationScopeArg,
+    },
+    /// Release a lock held by --owner.
+    Unlock {
+        key: String,
+        #[arg(long)]
+        owner: String,
+        #[arg(long, value_enum, default_value = "worktree")]
+        scope: CoordinationScopeArg,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum TeamCommand {
+    /// Launch a run from a JSON file.
+    Run {
+        /// JSON run file: {"lead": "...", "roles": [{"label","provider","prompt"}]}.
+        #[arg(long, value_name = "PATH")]
+        file: String,
+    },
+    /// Show one run, or the newest run of the caller's worktree.
+    Status {
+        #[arg(long)]
+        run: Option<Uuid>,
+    },
+    /// List the worktree's runs, newest first.
+    List,
+    /// Cancel a run and its live role chats.
+    Cancel {
+        /// Run id (default: the newest run of the caller's worktree).
+        #[arg(long)]
+        run: Option<Uuid>,
+    },
+    /// Read every role report, or submit the caller role's report.
+    Report {
+        /// Run id (default: the newest run of the caller's worktree).
+        #[arg(long)]
+        run: Option<Uuid>,
+        /// Role label (default: the role whose session is FLOTILLA_SESSION_ID).
+        #[arg(long)]
+        role: Option<String>,
+        /// Report summary (at most 16 KiB); omit to read reports instead.
+        #[arg(long, conflicts_with = "summary_file")]
+        summary: Option<String>,
+        /// Read the summary from a file.
+        #[arg(long, value_name = "PATH", conflicts_with = "summary")]
+        summary_file: Option<String>,
+        /// Path of a result file produced by the role.
+        #[arg(long)]
+        result_file: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]

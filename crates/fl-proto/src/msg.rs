@@ -382,6 +382,68 @@ pub enum Request {
         workspace: WorkspaceId,
     },
     GetSelectedWorkspace,
+    // --- M6 slice 2: coordination, team runs, hooks (0.4) ---
+    /// One coordination entry and any unexpired lock.
+    CoordinationGet {
+        scope: fl_model::coordination::CoordinationScope,
+        key: String,
+    },
+    /// Write a value. `if_version` is a compare-and-set; 0 creates only.
+    CoordinationSet {
+        scope: fl_model::coordination::CoordinationScope,
+        key: String,
+        value: String,
+        if_version: Option<u64>,
+    },
+    CoordinationDelete {
+        scope: fl_model::coordination::CoordinationScope,
+        key: String,
+        if_version: Option<u64>,
+    },
+    /// Acquire or extend an advisory lock held by `owner`.
+    LockCoordination {
+        scope: fl_model::coordination::CoordinationScope,
+        key: String,
+        owner: String,
+        ttl_ms: u64,
+    },
+    UnlockCoordination {
+        scope: fl_model::coordination::CoordinationScope,
+        key: String,
+        owner: String,
+    },
+    /// Launch 1–8 role chats, one tab each, in `worktree`.
+    TeamRun {
+        worktree: WorktreeId,
+        spec: fl_model::team::TeamRunSpec,
+    },
+    /// One run, or the newest run of the worktree.
+    TeamStatus {
+        worktree: WorktreeId,
+        run: Option<uuid::Uuid>,
+    },
+    TeamList {
+        worktree: WorktreeId,
+    },
+    TeamCancel {
+        run: uuid::Uuid,
+    },
+    /// Submit one role's bounded report.
+    TeamReportSubmit {
+        run: uuid::Uuid,
+        role: String,
+        summary: String,
+        result_file: Option<String>,
+    },
+    /// Read a run with every role report.
+    TeamReport {
+        run: uuid::Uuid,
+    },
+    /// Ingest one normalized provider hook for a chat session.
+    HookEvent {
+        session: uuid::Uuid,
+        event: fl_model::coordination::HookEvent,
+    },
 }
 
 /// See `ServerMsg`: wire enums stay unboxed so the bytes remain stable.
@@ -431,6 +493,16 @@ pub enum Response {
     SelectedWorkspace(Option<fl_model::workspace::WorkspaceInfo>),
     ScriptCheck(fl_model::workspace::ProjectScriptCheck),
     ChatSession(fl_model::chat::ChatSession),
+    // --- M6 slice 2 ---
+    CoordinationSnapshot(fl_model::coordination::CoordinationSnapshot),
+    CoordinationValue(fl_model::coordination::CoordinationValue),
+    CoordinationLock(fl_model::coordination::CoordinationLock),
+    TeamRun(fl_model::team::TeamRun),
+    TeamRuns(Vec<fl_model::team::TeamRun>),
+    HookRecorded {
+        session: uuid::Uuid,
+        sequence: u64,
+    },
 }
 
 /// Returned on the authenticated control stream before requesting channels.
@@ -544,7 +616,7 @@ impl WireMessage for ServerMsg {
 
 impl Request {
     pub fn validate(&self) -> Result<(), ValidationError> {
-        use validation::{bound, path, text};
+        use validation::{bound, bound_u64, path, text};
         match self {
             Self::MutateReview {
                 worktree, mutation, ..
@@ -750,6 +822,98 @@ impl Request {
                 validation::non_nil_id("workspace", workspace.as_bytes())
             }
             Self::GetSelectedWorkspace => Ok(()),
+            // --- M6 slice 2 ---
+            Self::CoordinationGet { scope, key } => {
+                validation::coordination_scope(scope)?;
+                validation::coordination_key(key)
+            }
+            Self::CoordinationSet {
+                scope, key, value, ..
+            } => {
+                validation::coordination_scope(scope)?;
+                validation::coordination_key(key)?;
+                bound(
+                    "coordination value",
+                    value.len(),
+                    fl_model::coordination::MAX_COORDINATION_VALUE_BYTES,
+                )
+            }
+            Self::CoordinationDelete { scope, key, .. } => {
+                validation::coordination_scope(scope)?;
+                validation::coordination_key(key)
+            }
+            Self::LockCoordination {
+                scope,
+                key,
+                owner,
+                ttl_ms,
+            } => {
+                validation::coordination_scope(scope)?;
+                validation::coordination_key(key)?;
+                validation::coordination_owner(owner)?;
+                bound_u64("lock ttl", *ttl_ms, fl_model::coordination::MAX_LOCK_TTL_MS)?;
+                if *ttl_ms < fl_model::coordination::MIN_LOCK_TTL_MS {
+                    return Err(ValidationError::Invalid("lock ttl"));
+                }
+                Ok(())
+            }
+            Self::UnlockCoordination { scope, key, owner } => {
+                validation::coordination_scope(scope)?;
+                validation::coordination_key(key)?;
+                validation::coordination_owner(owner)
+            }
+            Self::TeamRun { worktree, spec } => {
+                validation::non_nil_id("team worktree", worktree.as_bytes())?;
+                spec.validate().map_err(ValidationError::InvalidPayload)
+            }
+            Self::TeamStatus { worktree, .. } | Self::TeamList { worktree } => {
+                validation::non_nil_id("team worktree", worktree.as_bytes())
+            }
+            Self::TeamCancel { run } | Self::TeamReport { run } => {
+                validation::non_nil("team run", *run)
+            }
+            Self::TeamReportSubmit {
+                run,
+                role,
+                summary,
+                result_file,
+            } => {
+                validation::non_nil("team run", *run)?;
+                text(
+                    "team role label",
+                    role,
+                    fl_model::team::MAX_TEAM_LABEL_BYTES,
+                )?;
+                if role.trim().is_empty() {
+                    return Err(ValidationError::Invalid("team role label"));
+                }
+                text(
+                    "team report summary",
+                    summary,
+                    fl_model::team::MAX_TEAM_SUMMARY_BYTES,
+                )?;
+                if summary.trim().is_empty() {
+                    return Err(ValidationError::Invalid("team report summary"));
+                }
+                if let Some(path) = result_file {
+                    text(
+                        "team result file",
+                        path,
+                        fl_model::team::MAX_TEAM_RESULT_FILE_BYTES,
+                    )?;
+                    if path.trim().is_empty() {
+                        return Err(ValidationError::Invalid("team result file"));
+                    }
+                }
+                Ok(())
+            }
+            Self::HookEvent {
+                session,
+                event: hook,
+            } => {
+                validation::non_nil("chat session", *session)?;
+                validation::hook_event(hook)
+            }
             _ => Ok(()),
         }
     }
@@ -879,6 +1043,12 @@ impl Response {
                 Ok(())
             }
             Self::ChatSession(value) => validation::chat_session(value),
+            Self::CoordinationSnapshot(value) => validation::coordination_snapshot(value),
+            Self::CoordinationValue(value) => validation::coordination_value(value),
+            Self::CoordinationLock(value) => validation::coordination_lock(value),
+            Self::TeamRun(value) => validation::team_run(value),
+            Self::TeamRuns(values) => validation::team_runs(values),
+            Self::HookRecorded { session, .. } => validation::non_nil("chat session", *session),
             Self::Written(_) | Self::Done => Ok(()),
             Self::DaemonInfo(value) => {
                 for text in [
@@ -1609,6 +1779,251 @@ mod tests {
                 target: Some("  ".into()),
             }
             .validate()
+            .is_err()
+        );
+    }
+
+    fn team_fixture() -> (
+        fl_model::team::TeamRun,
+        fl_model::coordination::CoordinationScope,
+    ) {
+        use fl_model::team::{TeamReport, TeamRole, TeamRoleSpec, TeamRun, TeamRunSpec, TeamState};
+        let worktree = WorktreeId::from_bytes([7; 16]);
+        let spec = TeamRunSpec {
+            lead: Some("architect".into()),
+            roles: vec![
+                TeamRoleSpec {
+                    label: "architect".into(),
+                    provider: "claude".into(),
+                    model: None,
+                    prompt: "design".into(),
+                },
+                TeamRoleSpec {
+                    label: "builder".into(),
+                    provider: "codex".into(),
+                    model: Some("gpt".into()),
+                    prompt: "build".into(),
+                },
+            ],
+        };
+        spec.validate().unwrap();
+        let run = TeamRun {
+            id: uuid::Uuid::from_bytes([3; 16]),
+            worktree,
+            lead: "architect".into(),
+            state: TeamState::Running,
+            roles: spec
+                .roles
+                .iter()
+                .enumerate()
+                .map(|(index, role)| TeamRole {
+                    index: index as u16,
+                    label: role.label.clone(),
+                    provider: role.provider.clone(),
+                    session: Some(uuid::Uuid::from_bytes([4 + index as u8; 16])),
+                    tab: Some(fl_model::TabId::from_bytes([9 + index as u8; 16])),
+                    state: TeamState::Running,
+                    report: (index == 0).then(|| TeamReport {
+                        summary: "done".into(),
+                        result_file: None,
+                        submitted_ms: 5,
+                    }),
+                })
+                .collect(),
+            created_ms: 1,
+            updated_ms: 2,
+            fan_in_sent: false,
+        };
+        (
+            run,
+            fl_model::coordination::CoordinationScope::Worktree(worktree),
+        )
+    }
+
+    #[test]
+    fn coordination_and_team_requests_and_responses_roundtrip() {
+        use fl_model::coordination::{
+            CoordinationLock, CoordinationSnapshot, CoordinationValue, HookEvent,
+        };
+        let (run, scope) = team_fixture();
+        let key = "task/claims".to_string();
+        let requests = [
+            Request::CoordinationGet {
+                scope,
+                key: key.clone(),
+            },
+            Request::CoordinationSet {
+                scope,
+                key: key.clone(),
+                value: "{\"owner\":\"builder\"}".into(),
+                if_version: Some(3),
+            },
+            Request::CoordinationDelete {
+                scope,
+                key: key.clone(),
+                if_version: None,
+            },
+            Request::LockCoordination {
+                scope,
+                key: key.clone(),
+                owner: "builder".into(),
+                ttl_ms: 30_000,
+            },
+            Request::UnlockCoordination {
+                scope,
+                key: key.clone(),
+                owner: "builder".into(),
+            },
+            Request::TeamRun {
+                worktree: run.worktree,
+                spec: fl_model::team::TeamRunSpec {
+                    lead: None,
+                    roles: vec![fl_model::team::TeamRoleSpec {
+                        label: "only".into(),
+                        provider: "claude".into(),
+                        model: None,
+                        prompt: "work".into(),
+                    }],
+                },
+            },
+            Request::TeamStatus {
+                worktree: run.worktree,
+                run: Some(run.id),
+            },
+            Request::TeamList {
+                worktree: run.worktree,
+            },
+            Request::TeamCancel { run: run.id },
+            Request::TeamReportSubmit {
+                run: run.id,
+                role: "architect".into(),
+                summary: "summary".into(),
+                result_file: Some("/tmp/result.md".into()),
+            },
+            Request::TeamReport { run: run.id },
+            Request::HookEvent {
+                session: uuid::Uuid::from_bytes([5; 16]),
+                event: HookEvent {
+                    name: "PreToolUse".into(),
+                    tool: Some("Bash".into()),
+                    tool_id: Some("tool-1".into()),
+                    detail: "ls".into(),
+                    success: None,
+                },
+            },
+        ];
+        for request in requests {
+            request.validate().unwrap();
+            let message = ClientMsg::Rpc {
+                id: 7,
+                req: request,
+            };
+            assert_eq!(
+                ClientMsg::from_frame(&message.to_frame().unwrap()).unwrap(),
+                message
+            );
+        }
+
+        let value = CoordinationValue {
+            scope,
+            key: key.clone(),
+            value: "ready".into(),
+            version: 4,
+            updated_ms: 10,
+        };
+        let lock = CoordinationLock {
+            scope,
+            key: key.clone(),
+            owner: "builder".into(),
+            acquired_ms: 10,
+            expires_ms: 20_000,
+        };
+        let responses = [
+            Response::CoordinationSnapshot(CoordinationSnapshot {
+                value: Some(value.clone()),
+                lock: Some(lock.clone()),
+            }),
+            Response::CoordinationValue(value),
+            Response::CoordinationLock(lock),
+            Response::TeamRun(run.clone()),
+            Response::TeamRuns(vec![run.clone()]),
+            Response::HookRecorded {
+                session: uuid::Uuid::from_bytes([5; 16]),
+                sequence: 12,
+            },
+        ];
+        for response in responses {
+            response.validate().unwrap();
+            let message = ServerMsg::RpcResult {
+                id: 8,
+                result: Ok(response),
+            };
+            assert_eq!(
+                ServerMsg::from_frame(&message.to_frame().unwrap()).unwrap(),
+                message
+            );
+        }
+
+        assert!(
+            Request::CoordinationGet {
+                scope,
+                key: " ".into(),
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            Request::LockCoordination {
+                scope,
+                key: "k".into(),
+                owner: "o".into(),
+                ttl_ms: 0,
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            Request::TeamRun {
+                worktree: run.worktree,
+                spec: fl_model::team::TeamRunSpec {
+                    lead: None,
+                    roles: Vec::new(),
+                },
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            Request::TeamReportSubmit {
+                run: run.id,
+                role: "architect".into(),
+                summary: "x".repeat(fl_model::team::MAX_TEAM_SUMMARY_BYTES + 1),
+                result_file: None,
+            }
+            .validate()
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn coordination_event_is_checked_and_roundtrips() {
+        let event = DaemonEvent::CoordinationChanged {
+            scope: fl_model::coordination::CoordinationScope::Global,
+            key: "k".into(),
+            version: 2,
+        };
+        crate::validation::daemon_event(&event).unwrap();
+        let message = ServerMsg::Event(event);
+        assert_eq!(
+            ServerMsg::from_frame(&message.to_frame().unwrap()).unwrap(),
+            message
+        );
+        assert!(
+            crate::validation::daemon_event(&DaemonEvent::CoordinationChanged {
+                scope: fl_model::coordination::CoordinationScope::Global,
+                key: String::new(),
+                version: 0,
+            })
             .is_err()
         );
     }

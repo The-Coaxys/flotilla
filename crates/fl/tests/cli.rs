@@ -99,7 +99,8 @@ impl Control {
 
 struct Fixture {
     dir: tempfile::TempDir,
-    daemon: DaemonHandle,
+    daemon: Option<DaemonHandle>,
+    config: DaemonConfig,
     repo: PathBuf,
     workspace: WorkspaceId,
     project: ProjectId,
@@ -108,6 +109,10 @@ struct Fixture {
 
 impl Fixture {
     async fn new() -> Self {
+        Self::new_with(None).await
+    }
+
+    async fn new_with(providers: Option<fld_agent::ProviderRegistry>) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let home = FlotillaHome::new(dir.path().join(".flotilla"));
         home.ensure_dirs().unwrap();
@@ -141,6 +146,8 @@ impl Fixture {
             env: BTreeMap::from([("TERM".into(), "xterm-256color".into())]),
             quota_bytes: fl_prochost_proto::DEFAULT_QUOTA_BYTES,
         };
+        config.providers = providers;
+        let start_config = config.clone();
         let daemon = tokio::time::timeout(WAIT, async {
             loop {
                 match fld_server::start(config.clone()).await {
@@ -183,7 +190,8 @@ impl Fixture {
             .id;
         Self {
             dir,
-            daemon,
+            daemon: Some(daemon),
+            config: start_config,
             repo,
             workspace,
             project: project.id,
@@ -192,7 +200,29 @@ impl Fixture {
     }
 
     fn home(&self) -> &FlotillaHome {
-        self.daemon.home()
+        &self.config.home
+    }
+
+    /// Stop and restart the daemon on the same home, as a VPS reboot would.
+    async fn restart(&mut self) {
+        if let Some(daemon) = self.daemon.take() {
+            daemon.shutdown().await;
+        }
+        let config = self.config.clone();
+        let daemon = tokio::time::timeout(WAIT, async {
+            loop {
+                match fld_server::start(config.clone()).await {
+                    Ok(daemon) => break daemon,
+                    Err(fld_server::ServerError::AlreadyRunning(_)) => {
+                        tokio::time::sleep(Duration::from_millis(20)).await
+                    }
+                    Err(error) => panic!("daemon restart: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("daemon restarts");
+        self.daemon = Some(daemon);
     }
 
     async fn fl(&self, args: &[&str]) -> std::process::Output {
@@ -223,8 +253,10 @@ impl Fixture {
         })
     }
 
-    async fn shutdown(self) {
-        self.daemon.shutdown().await;
+    async fn shutdown(mut self) {
+        if let Some(daemon) = self.daemon.take() {
+            daemon.shutdown().await;
+        }
         drop(self.dir);
     }
 }
@@ -484,4 +516,537 @@ async fn unreachable_daemon_is_a_nonzero_refusal() {
     assert!(!output.status.success());
     let error: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(error["error"]["code"], "unavailable");
+}
+
+/// A scripted `claude` CLI: its help and initialize handshake match the real
+/// adapter probe, and each user message gets one completed turn.
+const STUB_PROVIDER: &str = r#"#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo "stub-claude 1.0.0"
+  exit 0
+fi
+if [ "$1" = "--help" ]; then
+  echo "--input-format --output-format --include-partial-messages --resume --session-id manual"
+  exit 0
+fi
+sid=""
+previous=""
+for argument in "$@"; do
+  if [ "$previous" = "--session-id" ] || [ "$previous" = "--resume" ]; then
+    sid="$argument"
+  fi
+  previous="$argument"
+done
+if [ -z "$sid" ]; then
+  sid="00000000-0000-0000-0000-000000000000"
+fi
+while IFS= read -r line; do
+  case "$line" in
+    *'"subtype":"initialize"'*)
+      printf '{"type":"control_response","response":{"subtype":"success","request_id":"1","response":{}}}\n'
+      ;;
+    *'"type":"user"'*)
+      printf '{"type":"result","subtype":"success","is_error":false,"result":"stub answer","session_id":"%s","duration_ms":1,"num_turns":1,"total_cost_usd":0,"usage":{}}\n' "$sid"
+      ;;
+  esac
+done
+"#;
+
+fn stub_provider(dir: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join("claude-stub");
+    std::fs::write(&path, STUB_PROVIDER).unwrap();
+    let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&path, permissions).unwrap();
+    path
+}
+
+/// Two distinct provider entries that both speak the Claude stream protocol.
+fn stub_registry(stub: &Path) -> fld_agent::ProviderRegistry {
+    let mut registry = fld_agent::ProviderRegistry::default();
+    for id in ["claude", "codex"] {
+        let mut spec = registry.get("claude").unwrap().clone();
+        spec.id = id.into();
+        spec.name = if id == "claude" {
+            "Stub Claude"
+        } else {
+            "Stub Codex"
+        }
+        .into();
+        spec.command = stub.to_path_buf();
+        spec.args.clear();
+        registry.override_provider(spec).unwrap();
+    }
+    registry
+}
+
+async fn wait_for_team(fixture: &Fixture) -> Value {
+    let deadline = tokio::time::Instant::now() + WAIT;
+    loop {
+        let value = fixture.fl_json(&["team", "status", "--json"]).await;
+        let state = value["run"]["state"].as_str().unwrap_or_default();
+        if state == "Finished" || state == "Failed" {
+            return value;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "team run never settled: {value}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn team_runs_coordination_locks_hooks_and_instructions() {
+    let stub_dir = tempfile::tempdir().unwrap();
+    let stub = stub_provider(stub_dir.path());
+    let mut fixture = Fixture::new_with(Some(stub_registry(&stub))).await;
+
+    // --- instructions: embedded, no daemon needed ------------------------
+    let guide = fixture.fl(&["instructions", "orchestration"]).await;
+    assert!(guide.status.success());
+    let text = String::from_utf8_lossy(&guide.stdout);
+    assert!(
+        text.contains("# Orchestration"),
+        "guide missing title:\n{text}"
+    );
+    assert!(text.contains("fl coordination-state"));
+    assert!(text.contains("fl team run"));
+    let guide_json = fixture
+        .fl_json(&["instructions", "orchestration", "--json"])
+        .await;
+    assert_eq!(guide_json["topic"], "orchestration");
+    assert!(string(&guide_json, "markdown").contains("fl team"));
+    let topics = fixture.fl_json(&["instructions", "--json"]).await;
+    assert_eq!(topics["topics"].as_array().unwrap().len(), 5);
+
+    // --- coordination: CAS, lock ownership and watch ---------------------
+    let set = fixture
+        .fl_json(&[
+            "coordination-state",
+            "set",
+            "plan/owner",
+            "--value",
+            "alice",
+            "--if-version",
+            "0",
+            "--json",
+        ])
+        .await;
+    assert_eq!(set["entry"]["version"], 1);
+    let stale = fixture
+        .fl(&[
+            "coordination-state",
+            "set",
+            "plan/owner",
+            "--value",
+            "bob",
+            "--if-version",
+            "2",
+            "--json",
+        ])
+        .await;
+    assert!(!stale.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&stale.stdout).unwrap()["error"]["code"],
+        "revision_conflict",
+        "stale CAS must carry the daemon's conflict"
+    );
+
+    let locked = fixture
+        .fl_json(&[
+            "coordination-state",
+            "lock",
+            "plan/owner",
+            "--owner",
+            "agent-a",
+            "--ttl-seconds",
+            "60",
+            "--json",
+        ])
+        .await;
+    assert_eq!(locked["lock"]["owner"], "agent-a");
+    let held = fixture
+        .fl(&[
+            "coordination-state",
+            "lock",
+            "plan/owner",
+            "--owner",
+            "agent-b",
+            "--json",
+        ])
+        .await;
+    assert!(!held.status.success());
+    let held_json: Value = serde_json::from_slice(&held.stdout).unwrap();
+    assert_eq!(held_json["error"]["code"], "revision_conflict");
+    assert!(string(&held_json["error"], "message").contains("agent-a"));
+    let unlocked = fixture.fl(&[
+        "coordination-state",
+        "unlock",
+        "plan/owner",
+        "--owner",
+        "agent-b",
+        "--json",
+    ]);
+    let unlocked = unlocked.await;
+    assert!(!unlocked.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&unlocked.stdout).unwrap()["error"]["code"],
+        "not_owner"
+    );
+    fixture
+        .fl_json(&["coordination-state", "get", "plan/owner", "--json"])
+        .await;
+
+    // A watcher sees the initial version and the next write, then exits.
+    let binary = env!("CARGO_BIN_EXE_fl").to_owned();
+    let home = fixture.home().root().to_path_buf();
+    let repo = fixture.repo.clone();
+    let watcher = tokio::spawn(async move {
+        tokio::process::Command::new(binary)
+            .args([
+                "coordination-state",
+                "watch",
+                "plan/owner",
+                "--json",
+                "--timeout",
+                "5",
+            ])
+            .env("FLOTILLA_HOME", home)
+            .env_remove("FLOTILLA_SESSION_ID")
+            .env_remove("FLOTILLA_SOCKET")
+            .current_dir(repo)
+            .output()
+            .await
+            .unwrap()
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    fixture
+        .fl_json(&[
+            "coordination-state",
+            "set",
+            "plan/owner",
+            "--value",
+            "bob",
+            "--if-version",
+            "1",
+            "--json",
+        ])
+        .await;
+    let watched = tokio::time::timeout(WAIT, watcher).await.unwrap().unwrap();
+    assert!(watched.status.success());
+    let lines: Vec<Value> = String::from_utf8_lossy(&watched.stdout)
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(
+        lines.len() >= 2,
+        "watcher missed the new version: {lines:?}"
+    );
+    assert_eq!(lines.last().unwrap()["value"]["version"], 2);
+    assert_eq!(lines.last().unwrap()["value"]["value"], "bob");
+
+    // Refusals: wrong version delete and an unknown worktree target.
+    let wrong_delete = fixture
+        .fl(&[
+            "coordination-state",
+            "delete",
+            "plan/owner",
+            "--if-version",
+            "1",
+            "--json",
+        ])
+        .await;
+    assert!(!wrong_delete.status.success());
+    let unknown = fixture
+        .fl(&[
+            "coordination-state",
+            "set",
+            "plan/owner",
+            "--value",
+            "x",
+            "--worktree",
+            "no-such-worktree",
+            "--json",
+        ])
+        .await;
+    assert!(!unknown.status.success());
+
+    // --- team run across two provider entries ----------------------------
+    let team_file = fixture.dir.path().join("team.json");
+    std::fs::write(
+        &team_file,
+        serde_json::to_vec(&serde_json::json!({
+            "lead": "architect",
+            "roles": [
+                {"label": "architect", "provider": "claude", "prompt": "Design the change."},
+                {"label": "builder", "provider": "codex", "prompt": "Build the change."},
+                {"label": "reviewer", "provider": "claude", "prompt": "Review the change."}
+            ]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let launched = fixture
+        .fl_json(&[
+            "team",
+            "run",
+            "--file",
+            team_file.to_str().unwrap(),
+            "--json",
+        ])
+        .await;
+    let run_id = string(&launched["run"], "id");
+    let status = wait_for_team(&fixture).await;
+    assert_eq!(status["run"]["state"], "Finished");
+    let roles = status["run"]["roles"].as_array().unwrap();
+    assert_eq!(roles.len(), 3);
+    let mut sessions = Vec::new();
+    let mut tabs = Vec::new();
+    for role in roles {
+        assert_eq!(role["state"], "Finished");
+        sessions.push(string(role, "session"));
+        tabs.push(string(role, "tab"));
+    }
+    sessions.sort();
+    sessions.dedup();
+    tabs.sort();
+    tabs.dedup();
+    assert_eq!(sessions.len(), 3, "each role has its own session");
+    assert_eq!(tabs.len(), 3, "each role has its own tab");
+    assert_eq!(status["run"]["lead"], "architect");
+    assert_eq!(status["run"]["fan_in_sent"], true);
+
+    let chats = fixture.fl_json(&["chat", "list", "--json"]).await;
+    assert_eq!(chats["sessions"].as_array().unwrap().len(), 3);
+    let layout = fixture.fl_json(&["layout", "views", "--json"]).await;
+    let names: Vec<String> = layout["layout"]["views"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|view| view["tabs"].as_array().unwrap())
+        .filter_map(|tab| tab["name"].as_str().map(str::to_owned))
+        .collect();
+    for label in ["architect", "builder", "reviewer"] {
+        assert!(
+            names.iter().any(|name| name == &format!("team:{label}")),
+            "layout has no tab for {label}: {names:?}"
+        );
+    }
+
+    // Exactly one fan-in message, and it is short.
+    let lead = roles
+        .iter()
+        .find(|role| role["label"] == "architect")
+        .unwrap();
+    let lead_session = string(lead, "session");
+    let page = fixture
+        .fl_json(&["chat", "events", &lead_session, "--json"])
+        .await;
+    let fan_ins: Vec<&Value> = page["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|record| {
+            record["event"]["UserMessage"]["text"]
+                .as_str()
+                .is_some_and(|text| text.starts_with("Team run "))
+        })
+        .collect();
+    assert_eq!(fan_ins.len(), 1, "exactly one lead fan-in");
+    assert!(
+        fan_ins[0]["event"]["UserMessage"]["text"]
+            .as_str()
+            .unwrap()
+            .len()
+            < 2048
+    );
+
+    // Reports are durable and readable, and a role can submit one.
+    let submitted = fixture
+        .fl_json(&[
+            "team",
+            "report",
+            "--run",
+            &run_id,
+            "--role",
+            "builder",
+            "--summary",
+            "Built the change.",
+            "--result-file",
+            "out/build.md",
+            "--json",
+        ])
+        .await;
+    let builder = submitted["run"]["roles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|role| role["label"] == "builder")
+        .unwrap();
+    assert_eq!(builder["report"]["summary"], "Built the change.");
+    assert_eq!(builder["report"]["result_file"], "out/build.md");
+    let report = fixture
+        .fl_json(&["team", "report", "--run", &run_id, "--json"])
+        .await;
+    assert_eq!(report["run"]["roles"].as_array().unwrap().len(), 3);
+    let listed = fixture.fl_json(&["team", "list", "--json"]).await;
+    assert_eq!(listed["runs"].as_array().unwrap().len(), 1);
+
+    // A second run can be cancelled; the first survives untouched.
+    let cancel_file = fixture.dir.path().join("team-cancel.json");
+    std::fs::write(
+        &cancel_file,
+        serde_json::to_vec(&serde_json::json!({
+            "roles": [
+                {"label": "one", "provider": "claude", "prompt": "First."},
+                {"label": "two", "provider": "codex", "prompt": "Second."}
+            ]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let second = fixture
+        .fl_json(&[
+            "team",
+            "run",
+            "--file",
+            cancel_file.to_str().unwrap(),
+            "--json",
+        ])
+        .await;
+    let second_id = string(&second["run"], "id");
+    let cancelled = fixture
+        .fl_json(&["team", "cancel", "--run", &second_id, "--json"])
+        .await;
+    assert_eq!(cancelled["run"]["state"], "Cancelled");
+
+    // Malformed team files are refused locally with a reason.
+    let malformed = fixture.dir.path().join("bad-team.json");
+    std::fs::write(&malformed, "{\"roles\": []}").unwrap();
+    let refused = fixture
+        .fl(&[
+            "team",
+            "run",
+            "--file",
+            malformed.to_str().unwrap(),
+            "--json",
+        ])
+        .await;
+    assert!(!refused.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&refused.stdout).unwrap()["error"]["code"],
+        "invalid_argument"
+    );
+
+    // --- hooks become chat facts; never a turn outcome -------------------
+    let session = sessions[0].clone();
+    let before = fixture
+        .fl_json(&["chat", "events", &session, "--json"])
+        .await["events"]
+        .as_array()
+        .unwrap()
+        .len();
+    fixture
+        .fl_json(&[
+            "hook",
+            "PreToolUse",
+            "--session",
+            &session,
+            "--payload",
+            "{\"tool_name\":\"Bash\",\"tool_use_id\":\"t1\",\"tool_input\":{\"command\":\"ls\"}}",
+            "--json",
+        ])
+        .await;
+    fixture
+        .fl_json(&[
+            "hook",
+            "PostToolUse",
+            "--session",
+            &session,
+            "--payload",
+            "{\"tool_name\":\"Bash\",\"tool_use_id\":\"t1\",\"tool_response\":{\"is_error\":false}}",
+            "--json",
+        ])
+        .await;
+    fixture
+        .fl_json(&[
+            "hook",
+            "Stop",
+            "--session",
+            &session,
+            "--payload",
+            "{\"hook_event_name\":\"Stop\"}",
+            "--json",
+        ])
+        .await;
+    let page = fixture
+        .fl_json(&["chat", "events", &session, "--json"])
+        .await;
+    let mut statuses: Vec<String> = Vec::new();
+    let mut saw_hook_status = false;
+    for record in page["events"].as_array().unwrap().iter().skip(before) {
+        if let Some(call) = record["event"]["ToolCall"].as_object() {
+            assert_eq!(call["title"], "Bash");
+            statuses.push(call["status"].as_str().unwrap().to_owned());
+        }
+        if let Some(fact) = record["event"]["HookFact"].as_object()
+            && fact["kind"] == "TurnEnded"
+        {
+            saw_hook_status = true;
+        }
+        // A hook must not fabricate a turn end.
+        assert!(
+            record["event"].get("TurnEnd").is_none(),
+            "hook invented a turn outcome: {record}"
+        );
+    }
+    assert!(statuses.contains(&"Running".to_owned()));
+    assert!(statuses.contains(&"Completed".to_owned()));
+    assert!(saw_hook_status);
+    let session_value = fixture.fl_json(&["chat", "list", "--json"]).await;
+    let listed_session = session_value["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|candidate| candidate["id"] == serde_json::json!(session))
+        .unwrap();
+    assert_eq!(listed_session["status_source"], "Hook");
+
+    // A hook for an unknown session is a refusal with the daemon's reason.
+    let unknown_hook = fixture
+        .fl(&[
+            "hook",
+            "Stop",
+            "--session",
+            "00000000-0000-0000-0000-000000000001",
+            "--payload",
+            "{}",
+            "--json",
+        ])
+        .await;
+    assert!(!unknown_hook.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&unknown_hook.stdout).unwrap()["error"]["code"],
+        "not_found"
+    );
+
+    // --- restart: durable runs, roles and reports ------------------------
+    fixture.restart().await;
+    let after = fixture
+        .fl_json(&["team", "status", "--run", &run_id, "--json"])
+        .await;
+    assert_eq!(after["run"]["state"], "Finished");
+    let builder = after["run"]["roles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|role| role["label"] == "builder")
+        .unwrap();
+    assert_eq!(builder["report"]["summary"], "Built the change.");
+    let listed = fixture.fl_json(&["team", "list", "--json"]).await;
+    assert_eq!(listed["runs"].as_array().unwrap().len(), 2);
+
+    fixture.shutdown().await;
 }

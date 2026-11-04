@@ -1,10 +1,12 @@
 //! Shared domain values. This crate has no terminal engine, transport or UI dependency.
 pub mod chat;
+pub mod coordination;
 pub mod forge;
 pub mod layout;
 pub mod review;
 pub mod routing;
 pub mod sections;
+pub mod team;
 pub mod workspace;
 
 use serde::{Deserialize, Serialize};

@@ -7,6 +7,7 @@ mod chat;
 pub mod devices;
 mod events;
 pub mod identity;
+mod instructions;
 pub mod listen;
 pub mod paths;
 pub mod session;
@@ -55,6 +56,9 @@ pub struct DaemonConfig {
     pub prochost_executable: Option<PathBuf>,
     /// Launch policy for new terminals (empty argv: the user's login shell).
     pub launch: LaunchDefaults,
+    /// Provider overrides for tests and embedded hosts. Production leaves this
+    /// empty and uses the built-in registry.
+    pub providers: Option<fld_agent::ProviderRegistry>,
 }
 
 /// Production launch policy: login shell in `$HOME`, 256 MiB journal quota.
@@ -79,6 +83,7 @@ impl DaemonConfig {
             hello_timeout: Duration::from_secs(3),
             prochost_executable: None,
             launch: default_launch(),
+            providers: None,
         }
     }
 }
@@ -131,9 +136,21 @@ pub async fn start(config: DaemonConfig) -> Result<DaemonHandle, ServerError> {
     .await?;
     let cancel = CancellationToken::new();
     let events = Arc::new(events::EventBus::default());
-    let chat = chat::ChatService::start(terminals.clone(), events.clone(), cancel.child_token())
-        .await
-        .map_err(|error| std::io::Error::other(format!("starting chats: {}", error.message)))?;
+    let chat = match config.providers.clone() {
+        Some(registry) => {
+            chat::ChatService::start_with_registry(
+                terminals.clone(),
+                events.clone(),
+                cancel.child_token(),
+                registry,
+            )
+            .await
+        }
+        None => {
+            chat::ChatService::start(terminals.clone(), events.clone(), cancel.child_token()).await
+        }
+    }
+    .map_err(|error| std::io::Error::other(format!("starting chats: {}", error.message)))?;
     let workspace = workspace::WorkspaceService::start(
         home.clone(),
         terminals.clone(),

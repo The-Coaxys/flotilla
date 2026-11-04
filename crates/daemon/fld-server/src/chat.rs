@@ -17,6 +17,7 @@ use fl_model::chat::{
     InboxKind, MAX_CHAT_TEXT, PermissionMode, QuestionResponse, ResumeTarget, SessionConfig,
     SessionState, StatusSource, TurnOutcome,
 };
+use fl_model::coordination::{HookEvent, HookFact, HookFactKind};
 use fl_model::routing::GitTask;
 use fl_model::workspace::DaemonEvent;
 use fl_proto::{RpcError, RpcErrorCode};
@@ -234,6 +235,9 @@ fn sanitize_event(event: &mut ChatEvent, depth: usize) {
             sanitize_bounded(output, MAX_CHAT_TEXT);
         }
         ChatEvent::ProcessExited { .. } => {}
+        ChatEvent::HookFact(fact) => {
+            fact.detail = bounded_with_marker(&fact.detail, MAX_CHAT_TEXT);
+        }
     }
 }
 
@@ -315,7 +319,7 @@ impl ChatService {
         Self::start_with_registry(terminals, events, cancel, ProviderRegistry::default()).await
     }
 
-    async fn start_with_registry(
+    pub(crate) async fn start_with_registry(
         terminals: Arc<TerminalService>,
         events: Arc<EventBus>,
         cancel: CancellationToken,
@@ -428,6 +432,72 @@ impl ChatService {
             .await
     }
 
+    /// The configured launch spec for a provider, when it is known.
+    pub(crate) fn provider(&self, id: &str) -> Option<fld_agent::ProviderSpec> {
+        self.registry.get(id).cloned()
+    }
+
+    /// Deliver a message once the session is idle, bounded by `wait`. The
+    /// lead fan-in uses this so a still-running turn is not refused.
+    pub(crate) async fn send_when_idle(
+        self: &Arc<Self>,
+        id: uuid::Uuid,
+        text: String,
+        wait: Duration,
+    ) -> Result<(), RpcError> {
+        let deadline = tokio::time::Instant::now() + wait;
+        loop {
+            let session = self.session(id).await?;
+            match session.status {
+                SessionState::Idle => return self.send(id, text).await,
+                SessionState::Closed => {
+                    return Err(invalid(
+                        "the session is closed and cannot receive a message",
+                    ));
+                }
+                SessionState::Failed { message } => {
+                    return Err(invalid(format!(
+                        "the session failed and cannot receive a message: {message}"
+                    )));
+                }
+                _ => {}
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(internal(
+                    "the session stayed busy; the message was not delivered",
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Turn one normalized provider hook into a durable chat fact. Hooks may
+    /// start/end tools and move status with `StatusSource::Hook`; they never
+    /// create approvals, questions or turn outcomes.
+    pub(crate) async fn ingest_hook(
+        &self,
+        id: uuid::Uuid,
+        hook: HookEvent,
+    ) -> Result<u64, RpcError> {
+        let session = self.session(id).await?;
+        let event = hook_chat_event(&hook);
+        let record = EventRecord {
+            schema_version: CHAT_SCHEMA_VERSION,
+            session_id: id,
+            incarnation: uuid::Uuid::new_v4(),
+            sequence: 0,
+            timestamp_ms: now_ms(),
+            native_session_id: session
+                .resume
+                .as_ref()
+                .map(|resume| resume.native_id.clone()),
+            turn_id: None,
+            event,
+        };
+        self.record_event(id, record).await?;
+        Ok(self.session(id).await?.seq)
+    }
+
     // --- Session lifecycle -------------------------------------------------
 
     #[allow(clippy::too_many_arguments)]
@@ -439,6 +509,32 @@ impl ChatService {
         thinking: Option<String>,
         permission_mode: PermissionMode,
         resume: Option<ResumeTarget>,
+    ) -> Result<ChatSession, RpcError> {
+        self.start_chat_with(
+            worktree,
+            provider,
+            model,
+            thinking,
+            permission_mode,
+            resume,
+            None,
+        )
+        .await
+    }
+
+    /// Start a chat with trusted, Flotilla-authored role instructions. The
+    /// orchestration contract is prepended for adapters that advertise hook
+    /// support and accept a developer-instruction channel.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn start_chat_with(
+        self: &Arc<Self>,
+        worktree: WorktreeId,
+        provider: String,
+        model: Option<String>,
+        thinking: Option<String>,
+        permission_mode: PermissionMode,
+        resume: Option<ResumeTarget>,
+        instructions: Option<String>,
     ) -> Result<ChatSession, RpcError> {
         if thinking
             .as_deref()
@@ -456,7 +552,7 @@ impl ChatService {
                 format!("{MAX_LIVE_CHATS} chats are already running; close one first"),
             ));
         }
-        let spec = self
+        let mut spec = self
             .registry
             .get(&provider)
             .cloned()
@@ -468,11 +564,18 @@ impl ChatService {
         if let Some(target) = &resume {
             self.claim_provider(&spec.id, &target.native_id, id)?;
         }
+        // Hooks invoked from the provider discover their session through the
+        // environment; the adapter never sees this as a protocol switch.
+        spec.env
+            .insert("FLOTILLA_SESSION_ID".into(), id.to_string());
+        spec.env
+            .insert("FLOTILLA_WORKTREE_PATH".into(), tree_worktree.path.clone());
+        let instructions = crate::instructions::with_contract(&spec, instructions);
         let config = SessionConfig {
             cwd: PathBuf::from(&tree_worktree.path),
             model: model.clone(),
             permission_mode,
-            instructions: None,
+            instructions,
             session_id: Some(id),
             provider_config_json: None,
             output_schema_json: None,
@@ -779,7 +882,7 @@ impl ChatService {
                 format!("{MAX_LIVE_CHATS} chats are already running; close one first"),
             ));
         }
-        let spec = self
+        let mut spec = self
             .registry
             .get(&session.provider)
             .cloned()
@@ -830,11 +933,16 @@ impl ChatService {
             ));
         }
         self.claim_provider(&session.provider, &resume.native_id, id)?;
+        spec.env
+            .insert("FLOTILLA_SESSION_ID".into(), session.id.to_string());
+        spec.env
+            .insert("FLOTILLA_WORKTREE_PATH".into(), tree.path.clone());
+        let instructions = crate::instructions::with_contract(&spec, None);
         let config = SessionConfig {
             cwd: current,
             model: session.model.clone(),
             permission_mode: session.permission_mode,
-            instructions: None,
+            instructions,
             session_id: Some(session.id),
             provider_config_json: None,
             output_schema_json: None,
@@ -1358,6 +1466,63 @@ fn needs_pending_clear(event: &ChatEvent) -> bool {
     )
 }
 
+/// Normalize a hook name into a chat fact. Only known names become tool or
+/// turn facts; anything else is retained as a notification.
+fn hook_chat_event(hook: &HookEvent) -> ChatEvent {
+    let name: String = hook
+        .name
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect::<String>()
+        .to_ascii_lowercase();
+    let tool = hook.tool.clone().unwrap_or_else(|| hook.name.clone());
+    let call = |status: fl_model::chat::ToolStatus, output: Option<BoundedText>| {
+        ChatEvent::ToolCall(fl_model::chat::ToolCall {
+            id: hook
+                .tool_id
+                .clone()
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+            kind: fld_agent::tool_kind(&tool),
+            title: tool.clone(),
+            input_summary: BoundedText {
+                text: bounded_with_marker(&hook.detail, MAX_CHAT_TEXT),
+                truncated: false,
+            },
+            status,
+            output,
+            diff: None,
+        })
+    };
+    match name.as_str() {
+        "pretooluse" | "toolstart" | "toolstarted" => {
+            call(fl_model::chat::ToolStatus::Running, None)
+        }
+        "posttooluse" | "toolend" | "toolended" => call(
+            if hook.success == Some(false) {
+                fl_model::chat::ToolStatus::Failed
+            } else {
+                fl_model::chat::ToolStatus::Completed
+            },
+            Some(BoundedText {
+                text: bounded_with_marker(&hook.detail, MAX_CHAT_TEXT),
+                truncated: false,
+            }),
+        ),
+        "userpromptsubmit" | "turnstart" | "turnstarted" => ChatEvent::HookFact(HookFact {
+            kind: HookFactKind::TurnStarted,
+            detail: bounded_with_marker(&hook.detail, MAX_CHAT_TEXT),
+        }),
+        "stop" | "agentturncomplete" | "turnend" | "turnended" => ChatEvent::HookFact(HookFact {
+            kind: HookFactKind::TurnEnded,
+            detail: bounded_with_marker(&hook.detail, MAX_CHAT_TEXT),
+        }),
+        _ => ChatEvent::HookFact(HookFact {
+            kind: HookFactKind::Notification,
+            detail: bounded_with_marker(&format!("{}: {}", hook.name, hook.detail), MAX_CHAT_TEXT),
+        }),
+    }
+}
+
 /// Durable effects of one event. Subagent children contribute their own
 /// approval/question cards so a nested request can be answered by its child ID.
 fn event_effects(
@@ -1499,6 +1664,17 @@ fn event_effects(
                 created_ms: timestamp,
             });
         }
+        ChatEvent::HookFact(fact) => match fact.kind {
+            // A hook may only move status, and it is labelled as a hook. It
+            // never asserts a turn outcome, a completion or an approval.
+            HookFactKind::TurnStarted => {
+                effects.status = Some((SessionState::Running, StatusSource::Hook));
+            }
+            HookFactKind::TurnEnded => {
+                effects.status = Some((SessionState::Idle, StatusSource::Hook));
+            }
+            HookFactKind::Notification => {}
+        },
         ChatEvent::ProcessExited { expected, .. } => {
             effects.status = Some((
                 if *expected {
@@ -1882,5 +2058,51 @@ mod tests {
             .await
             .expect_err("thinking is not supported by either adapter");
         assert_eq!(error.code, RpcErrorCode::Unsupported);
+    }
+
+    #[test]
+    fn hooks_map_to_tool_and_status_facts_never_turn_outcomes() {
+        let hook = |name: &str, success: Option<bool>| fl_model::coordination::HookEvent {
+            name: name.into(),
+            tool: Some("Bash".into()),
+            tool_id: Some("t1".into()),
+            detail: "ls".into(),
+            success,
+        };
+        for name in [
+            "PreToolUse",
+            "PostToolUse",
+            "Stop",
+            "SubagentStop",
+            "Notification",
+            "SessionStart",
+            "agent-turn-complete",
+        ] {
+            let event = hook_chat_event(&hook(name, None));
+            assert!(
+                !matches!(event, ChatEvent::TurnEnd { .. }),
+                "{name} invented a turn outcome"
+            );
+            assert!(!matches!(event, ChatEvent::Error { .. }));
+        }
+        match hook_chat_event(&hook("PreToolUse", None)) {
+            ChatEvent::ToolCall(call) => {
+                assert_eq!(call.id, "t1");
+                assert_eq!(call.status, fl_model::chat::ToolStatus::Running);
+            }
+            other => panic!("expected a tool start, got {other:?}"),
+        }
+        match hook_chat_event(&hook("PostToolUse", Some(false))) {
+            ChatEvent::ToolCall(call) => {
+                assert_eq!(call.status, fl_model::chat::ToolStatus::Failed)
+            }
+            other => panic!("expected a tool end, got {other:?}"),
+        }
+        match hook_chat_event(&hook("Stop", None)) {
+            ChatEvent::HookFact(fact) => {
+                assert_eq!(fact.kind, fl_model::coordination::HookFactKind::TurnEnded)
+            }
+            other => panic!("expected a hook fact, got {other:?}"),
+        }
     }
 }

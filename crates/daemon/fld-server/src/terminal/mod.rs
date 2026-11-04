@@ -90,13 +90,16 @@ fn rpc(code: RpcErrorCode, message: impl Into<String>) -> RpcError {
 
 pub(crate) fn store_rpc(error: StoreError) -> RpcError {
     let code = match &error {
-        StoreError::RevisionConflict { .. } => RpcErrorCode::RevisionConflict,
+        StoreError::RevisionConflict { .. } | StoreError::Conflict(_) => {
+            RpcErrorCode::RevisionConflict
+        }
         StoreError::OperationConflict(_)
         | StoreError::Layout(_)
         | StoreError::Invalid(_)
         | StoreError::Duplicate(_) => RpcErrorCode::InvalidArgument,
         StoreError::NotFound(_) | StoreError::Missing(_) => RpcErrorCode::NotFound,
         StoreError::WrongIncarnation => RpcErrorCode::WrongIncarnation,
+        StoreError::NotOwner(_) => RpcErrorCode::NotOwner,
         _ => RpcErrorCode::Internal,
     };
     rpc(code, error.to_string())

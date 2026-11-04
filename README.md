@@ -88,13 +88,33 @@ and keeps whichever connects first; on an SSH link it re-probes QUIC every
 
 - **`fl`, a scriptable client for the same daemon.** Status, workspaces,
   sections, worktree state and checks, review threads, project scripts, tabs,
-  layouts, chats, history and agents, all with `--json` and daemon error codes
-  as exit statuses.
+  layouts, chats, history, agents, team runs, coordination state and hooks,
+  all with `--json` and daemon error codes as exit statuses.
 - **Roots in your shell.** Caller resolution uses `FLOTILLA_SESSION_ID` and the
   canonical cwd; `--worktree` accepts an id, a label or a path. Mutating
   commands prove the durable effect rather than the printed line.
+- **Teams that meet in one place.** `fl team run --file team.json` launches
+  1–8 role chats, each in its own named tab of the target worktree, each with
+  its label, run id and report contract. Only structured adapter events move a
+  role; the lead receives exactly one short fan-in when every role settles.
+  Runs, roles and reported summaries are durable, so `team status`,
+  `team report` and `team list` keep working after a daemon restart. Provider
+  processes are daemon-owned and are not reattached, so a restarted run shows
+  its last durable state.
+- **Coordination instead of guesswork.** `fl coordination-state` keeps
+  per-worktree, per-workspace or global values with a monotonic version,
+  compare-and-set (`--if-version`, 0 creates only), delete, and `watch` that
+  prints every new version. Advisory `lock`/`unlock` carries an owner and a TTL;
+  a stale version or a held lock exits non-zero with the daemon's reason.
+- **Guides and hooks in the binary.** `fl instructions
+  [orchestration|layout|worktree|review|browser]` prints Flotilla-authored
+  guides that ship with `fl` and work without a daemon. Provider hooks call
+  `fl hook <event>`; tool start/end become tool rows and turn start/end moves
+  the status with source `Hook`, while hooks can never approve, answer a
+  question, or invent a turn outcome.
 - **Refusals instead of guesses.** Terminal-only agent delivery, queued chat
-  while a turn is live, and unknown targets fail with the daemon's reason.
+  while a turn is live, stale compare-and-set writes, held locks, malformed
+  team files and unknown targets fail with a clear reason.
 
 ## What M3 delivers
 

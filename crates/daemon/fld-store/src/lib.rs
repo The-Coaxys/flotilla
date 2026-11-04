@@ -96,5 +96,11 @@ pub enum StoreError {
     /// A project or worktree path that is already known.
     #[error("{0}")]
     Duplicate(String),
+    /// A compare-and-set or advisory-lock conflict, with the reason.
+    #[error("{0}")]
+    Conflict(String),
+    /// The caller does not own the coordination lock it tried to release.
+    #[error("{0}")]
+    NotOwner(String),
 }
 pub type Result<T, E = StoreError> = std::result::Result<T, E>;

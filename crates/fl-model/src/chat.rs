@@ -278,6 +278,9 @@ pub enum ChatEvent {
         code: Option<i32>,
         expected: bool,
     },
+    /// A provider hook observation. Its status source is always `Hook`, and it
+    /// never asserts a turn outcome or grants a permission.
+    HookFact(crate::coordination::HookFact),
 }
 
 #[cfg(test)]
@@ -544,6 +547,7 @@ pub fn search_text(event: &ChatEvent) -> String {
             ChatEvent::Error { message, .. } => text.push(message),
             ChatEvent::Diagnostic { output, .. } => text.bounded(output),
             ChatEvent::ProcessExited { .. } => {}
+            ChatEvent::HookFact(fact) => text.push(&fact.detail),
         }
     }
     let mut text = Text(String::new());

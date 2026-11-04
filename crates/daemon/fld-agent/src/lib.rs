@@ -190,7 +190,16 @@ pub(crate) fn string(value: &serde_json::Value, field: &str) -> String {
         .unwrap_or_default()
         .to_owned()
 }
-pub(crate) fn tool_kind(name: &str) -> ToolKind {
+
+/// Adapters that have a real developer-instruction channel. ACP and Cursor
+/// reject `SessionConfig::instructions` instead of silently dropping it.
+pub fn supports_instructions(kind: AdapterKind) -> bool {
+    matches!(
+        kind,
+        AdapterKind::ClaudeStream | AdapterKind::CodexAppServer | AdapterKind::PiRpc
+    )
+}
+pub fn tool_kind(name: &str) -> ToolKind {
     let lower = name.to_ascii_lowercase();
     if lower.starts_with("mcp") {
         ToolKind::Mcp
