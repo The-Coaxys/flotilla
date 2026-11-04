@@ -1287,7 +1287,7 @@ impl HostWorkspace {
                 .flex_1()
                 .min_h(px(0.))
                 .p(px(16.))
-                .text_size(t.text_size_sm)
+                .text_size(t.text_size_sm * t.chat_scale)
                 .text_color(t.text_secondary)
                 .child("No durable events yet. The daemon appends one page at a time.")
                 .into_any_element()
@@ -1371,7 +1371,7 @@ impl HostWorkspace {
             .border_b_1()
             .border_color(t.border)
             .bg(t.chrome_bg)
-            .text_size(t.text_size_sm)
+            .text_size(t.text_size_sm * t.chat_scale)
             .child(
                 div()
                     .font_weight(FontWeight::SEMIBOLD)
@@ -1500,7 +1500,7 @@ impl HostWorkspace {
                         .py(px(7.))
                         .rounded(t.radius_md)
                         .bg(t.control_bg)
-                        .text_size(t.text_size)
+                        .text_size(t.text_size * t.chat_scale)
                         .text_color(t.text_primary)
                         .child(SharedString::from(text.clone())),
                 )
@@ -1513,13 +1513,13 @@ impl HostWorkspace {
                     .flex()
                     .flex_col()
                     .gap(px(5.))
-                    .text_size(t.text_size)
+                    .text_size(t.text_size * t.chat_scale)
                     .text_color(t.text_primary);
                 body = body.children(render_markdown(text, t));
                 if !*complete {
                     body = body.child(
                         div()
-                            .text_size(t.text_size_sm)
+                            .text_size(t.text_size_sm * t.chat_scale)
                             .text_color(t.text_tertiary)
                             .child("▍ streaming"),
                     );
@@ -1544,7 +1544,7 @@ impl HostWorkspace {
                             .items_center()
                             .gap(px(6.))
                             .cursor_pointer()
-                            .text_size(t.text_size_sm)
+                            .text_size(t.text_size_sm * t.chat_scale)
                             .text_color(t.text_secondary)
                             .child(if expanded { "▾" } else { "▸" })
                             .child(SharedString::from(format!(
@@ -1560,7 +1560,7 @@ impl HostWorkspace {
                     block = block.child(
                         div()
                             .pl(px(16.))
-                            .text_size(t.text_size_sm)
+                            .text_size(t.text_size_sm * t.chat_scale)
                             .text_color(t.text_secondary)
                             .child(SharedString::from(text.clone())),
                     );
@@ -1584,7 +1584,7 @@ impl HostWorkspace {
                         .flex()
                         .items_center()
                         .gap(px(6.))
-                        .text_size(t.text_size_sm)
+                        .text_size(t.text_size_sm * t.chat_scale)
                         .text_color(t.text_primary)
                         .child("✎")
                         .child(SharedString::from(format!("Edited {path}"))),
@@ -1652,7 +1652,7 @@ impl HostWorkspace {
                     .w_full()
                     .px(px(16.))
                     .py(px(4.))
-                    .text_size(t.text_size_sm)
+                    .text_size(t.text_size_sm * t.chat_scale)
                     .text_color(match outcome {
                         TurnOutcome::Completed => t.text_secondary,
                         TurnOutcome::Cancelled => t.warning,
@@ -1682,7 +1682,7 @@ impl HostWorkspace {
                 .flex()
                 .flex_col()
                 .gap(px(2.))
-                .text_size(t.text_size_sm)
+                .text_size(t.text_size_sm * t.chat_scale)
                 .text_color(t.danger)
                 .child(SharedString::from(format!(
                     "{}{code}: {message}",
@@ -1693,7 +1693,7 @@ impl HostWorkspace {
                 .w_full()
                 .px(px(16.))
                 .py(px(4.))
-                .text_size(t.text_size_sm)
+                .text_size(t.text_size_sm * t.chat_scale)
                 .text_color(t.text_tertiary)
                 .child(SharedString::from(format!(
                     "Provider process exited{}{}.",
@@ -1751,7 +1751,7 @@ impl HostWorkspace {
                     .items_center()
                     .gap(px(6.))
                     .cursor_pointer()
-                    .text_size(t.text_size_sm)
+                    .text_size(t.text_size_sm * t.chat_scale)
                     .child(if expanded { "▾" } else { "▸" })
                     .child(
                         div()
@@ -1798,7 +1798,7 @@ impl HostWorkspace {
                 if tool.input_truncated {
                     section = section.child(
                         div()
-                            .text_size(t.text_size_sm)
+                            .text_size(t.text_size_sm * t.chat_scale)
                             .text_color(t.text_tertiary)
                             .child("(input truncated by the daemon)"),
                     );
@@ -1872,7 +1872,7 @@ impl HostWorkspace {
                             .flex()
                             .items_center()
                             .gap(px(6.))
-                            .text_size(t.text_size_sm)
+                            .text_size(t.text_size_sm * t.chat_scale)
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(if resolved {
                                 t.text_secondary
@@ -1891,7 +1891,7 @@ impl HostWorkspace {
                         d.child(mono_block(details, t)).when(truncated, |d| {
                             d.child(
                                 div()
-                                    .text_size(t.text_size_sm)
+                                    .text_size(t.text_size_sm * t.chat_scale)
                                     .text_color(t.text_tertiary)
                                     .child("(details truncated by the daemon)"),
                             )
@@ -1904,7 +1904,7 @@ impl HostWorkspace {
                 card = card.child(
                     div()
                         .px(px(10.))
-                        .text_size(t.text_size_sm)
+                        .text_size(t.text_size_sm * t.chat_scale)
                         .text_color(t.text_tertiary)
                         .child("The provider offered no approval decisions for this request."),
                 );
@@ -1972,7 +1972,7 @@ impl HostWorkspace {
                         .flex()
                         .items_center()
                         .gap(px(6.))
-                        .text_size(t.text_size_sm)
+                        .text_size(t.text_size_sm * t.chat_scale)
                         .font_weight(FontWeight::SEMIBOLD)
                         .text_color(if resolved { t.text_secondary } else { t.accent })
                         .child("Question from the provider")
@@ -1992,13 +1992,13 @@ impl HostWorkspace {
                 .gap(px(4.))
                 .child(
                     div()
-                        .text_size(t.text_size_sm)
+                        .text_size(t.text_size_sm * t.chat_scale)
                         .text_color(t.text_primary)
                         .child(SharedString::from(question.text.clone())),
                 )
                 .child(
                     div()
-                        .text_size(t.text_size_sm)
+                        .text_size(t.text_size_sm * t.chat_scale)
                         .text_color(t.text_tertiary)
                         .child(if question.multi {
                             "Select all that apply."
@@ -2017,7 +2017,7 @@ impl HostWorkspace {
                 if resolved {
                     group = group.child(
                         div()
-                            .text_size(t.text_size_sm)
+                            .text_size(t.text_size_sm * t.chat_scale)
                             .text_color(t.text_secondary)
                             .child(SharedString::from(format!(
                                 "{} {}",
@@ -2048,7 +2048,7 @@ impl HostWorkspace {
                     .py(px(3.))
                     .rounded(t.radius_sm)
                     .cursor_pointer()
-                    .text_size(t.text_size_sm)
+                    .text_size(t.text_size_sm * t.chat_scale)
                     .when(checked, |d| d.bg(t.row_selected))
                     .child(if checked {
                         if multi { "☑" } else { "◉" }
@@ -2088,7 +2088,7 @@ impl HostWorkspace {
                         .gap(px(3.))
                         .child(
                             div()
-                                .text_size(t.text_size_sm)
+                                .text_size(t.text_size_sm * t.chat_scale)
                                 .text_color(t.text_tertiary)
                                 .child(if question.secret {
                                     "Secret answer — visible while typing in this build."
@@ -2108,7 +2108,7 @@ impl HostWorkspace {
                 .gap(px(4.))
                 .child(
                     div()
-                        .text_size(t.text_size_sm)
+                        .text_size(t.text_size_sm * t.chat_scale)
                         .text_color(t.text_primary)
                         .child("MCP form: supply the structured JSON answer."),
                 )
@@ -2121,7 +2121,7 @@ impl HostWorkspace {
         if let Some(error) = error {
             body = body.child(
                 div()
-                    .text_size(t.text_size_sm)
+                    .text_size(t.text_size_sm * t.chat_scale)
                     .text_color(t.danger)
                     .child(error),
             );
@@ -2229,7 +2229,7 @@ impl HostWorkspace {
         if let Some(error) = error {
             row = row.child(
                 div()
-                    .text_size(t.text_size_sm)
+                    .text_size(t.text_size_sm * t.chat_scale)
                     .text_color(t.danger)
                     .child(error),
             );
@@ -2267,7 +2267,7 @@ impl HostWorkspace {
         row = row
             .child(
                 div()
-                    .text_size(t.text_size_sm)
+                    .text_size(t.text_size_sm * t.chat_scale)
                     .text_color(t.text_tertiary)
                     .child(status_note),
             )
@@ -2290,7 +2290,7 @@ impl HostWorkspace {
 
 fn generic_note(t: &Theme) -> AnyElement {
     div()
-        .text_size(t.text_size_sm)
+        .text_size(t.text_size_sm * t.chat_scale)
         .text_color(t.text_tertiary)
         .child(
             "Plain text only: this daemon serves no file index, so @-file mentions are not offered.",
@@ -2346,7 +2346,7 @@ impl HostWorkspace {
         };
         body = body.child(actions).child(
             div()
-                .text_size(t.text_size_sm)
+                .text_size(t.text_size_sm * t.chat_scale)
                 .text_color(if offline { t.danger } else { t.text_secondary })
                 .child(live_note),
         );
@@ -2361,7 +2361,7 @@ impl HostWorkspace {
         if sessions.is_empty() {
             body = body.child(
                 div()
-                    .text_size(t.text_size_sm)
+                    .text_size(t.text_size_sm * t.chat_scale)
                     .text_color(t.text_secondary)
                     .child("No chat sessions in this worktree yet."),
             );
@@ -2389,7 +2389,7 @@ impl HostWorkspace {
             if search.busy {
                 body = body.child(
                     div()
-                        .text_size(t.text_size_sm)
+                        .text_size(t.text_size_sm * t.chat_scale)
                         .text_color(t.text_secondary)
                         .child("Searching…"),
                 );
@@ -2397,7 +2397,7 @@ impl HostWorkspace {
             if let Some(error) = search.error.clone() {
                 body = body.child(
                     div()
-                        .text_size(t.text_size_sm)
+                        .text_size(t.text_size_sm * t.chat_scale)
                         .text_color(t.danger)
                         .child(error),
                 );
@@ -2421,7 +2421,7 @@ impl HostWorkspace {
                             let hover = t.raised_hover;
                             move |s| s.bg(hover)
                         })
-                        .text_size(t.text_size_sm)
+                        .text_size(t.text_size_sm * t.chat_scale)
                         .child(
                             div()
                                 .text_color(t.text_primary)
@@ -2438,7 +2438,7 @@ impl HostWorkspace {
             if !search.busy && search.hits.is_empty() && search.error.is_none() {
                 body = body.child(
                     div()
-                        .text_size(t.text_size_sm)
+                        .text_size(t.text_size_sm * t.chat_scale)
                         .text_color(t.text_tertiary)
                         .child("No archived transcript hits yet."),
                 );
@@ -2483,7 +2483,7 @@ impl HostWorkspace {
                 let hover = t.raised_hover;
                 move |s| s.bg(hover)
             })
-            .text_size(t.text_size_sm)
+            .text_size(t.text_size_sm * t.chat_scale)
             .child(
                 div()
                     .flex()
@@ -2577,7 +2577,7 @@ impl HostWorkspace {
                     .gap(px(6.))
                     .child(
                         div()
-                            .text_size(t.text_size_sm)
+                            .text_size(t.text_size_sm * t.chat_scale)
                             .text_color(t.danger)
                             .child(error),
                     )
@@ -2618,7 +2618,7 @@ impl HostWorkspace {
                     .flex_col()
                     .gap(px(1.))
                     .when(selected, |d| d.bg(t.row_selected))
-                    .text_size(t.text_size_sm)
+                    .text_size(t.text_size_sm * t.chat_scale)
                     .child(
                         div()
                             .flex()
@@ -2682,7 +2682,7 @@ impl HostWorkspace {
         if let Some(error) = form.error.clone() {
             card = card.child(
                 div()
-                    .text_size(t.text_size_sm)
+                    .text_size(t.text_size_sm * t.chat_scale)
                     .text_color(t.danger)
                     .child(error),
             );
@@ -2725,7 +2725,7 @@ impl HostWorkspace {
         if let Some(error) = self.chat.inbox_error.clone() {
             body = body.child(
                 div()
-                    .text_size(t.text_size_sm)
+                    .text_size(t.text_size_sm * t.chat_scale)
                     .text_color(t.danger)
                     .child(error),
             );
@@ -2752,7 +2752,7 @@ impl HostWorkspace {
                     .bg(t.surface_bg)
                     .border_1()
                     .border_color(t.border)
-                    .text_size(t.text_size_sm)
+                    .text_size(t.text_size_sm * t.chat_scale)
                     .child(ui_chip(
                         inbox_kind_label(item.kind),
                         inbox_kind_color(item.kind, t),
@@ -2880,7 +2880,7 @@ impl HostWorkspace {
             .flex()
             .flex_col()
             .gap(px(6.))
-            .text_size(t.text_size_sm);
+            .text_size(t.text_size_sm * t.chat_scale);
         for toast in self.chat.toasts.iter().take(TOASTS_SHOWN) {
             let session = toast.session;
             let seq = toast.seq;
@@ -3055,7 +3055,7 @@ fn render_markdown(text: &str, t: &Theme) -> Vec<AnyElement> {
                 if let Some(language) = language {
                     block = block.child(
                         div()
-                            .text_size(t.text_size_sm)
+                            .text_size(t.text_size_sm * t.chat_scale)
                             .text_color(t.text_tertiary)
                             .child(SharedString::from(language)),
                     );
@@ -3198,7 +3198,7 @@ fn diff_block(source: &str, truncated: bool, t: &Theme) -> AnyElement {
 
 fn label(text: &str, t: &Theme) -> AnyElement {
     div()
-        .text_size(t.text_size_sm)
+        .text_size(t.text_size_sm * t.chat_scale)
         .font_weight(FontWeight::MEDIUM)
         .text_color(t.text_secondary)
         .child(SharedString::from(text.to_owned()))
@@ -3207,7 +3207,7 @@ fn label(text: &str, t: &Theme) -> AnyElement {
 
 fn note(text: &str, t: &Theme) -> AnyElement {
     div()
-        .text_size(t.text_size_sm)
+        .text_size(t.text_size_sm * t.chat_scale)
         .text_color(t.text_secondary)
         .child(SharedString::from(text.to_owned()))
         .into_any_element()
@@ -3220,7 +3220,7 @@ fn ui_chip(label: impl Into<SharedString>, color: gpui::Hsla, t: &Theme) -> gpui
         .py(px(1.))
         .rounded(t.radius_sm)
         .bg(t.control_bg)
-        .text_size(t.text_size_sm)
+        .text_size(t.text_size_sm * t.chat_scale)
         .text_color(color)
         .child(label)
 }
@@ -3240,7 +3240,7 @@ fn ui_button(
         .py(px(3.))
         .rounded(t.radius_sm)
         .bg(if enabled { t.control_bg } else { t.surface_bg })
-        .text_size(t.text_size_sm)
+        .text_size(t.text_size_sm * t.chat_scale)
         .text_color(if enabled {
             t.text_primary
         } else {

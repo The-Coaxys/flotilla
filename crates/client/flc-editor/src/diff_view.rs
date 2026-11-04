@@ -431,7 +431,7 @@ impl Render for DiffView {
             .flex_col()
             .bg(t.surface_bg)
             .text_color(t.text_primary)
-            .text_size(t.mono_size)
+            .text_size(t.editor_size)
             .line_height(px(20.))
             .font(mono_font(&t))
             .child(header)

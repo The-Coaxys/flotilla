@@ -97,3 +97,80 @@ holds; no new wire calls.
 - Not covered by this slice: theme editor, PiP, browser tabs, Shared Context, custom command
   CRUD, performance HUD, keymap editor. Ctrl+Shift+P currently opens the palette; it is the
   documented PiP key and should move when PiP lands.
+
+### Slice: theme editor, keymap editor, and the Ctrl+Shift+P decision
+
+Native client only (`crates/client/flc-ui`, `flc-terminal`, `flc-shell`, `flc-editor`,
+`flotilla`); no daemon or wire change.
+
+**Hotkey collision (decided from spec §8.3).** The spec assigns `Ctrl+Shift+P` to PiP and
+`Ctrl+Shift+K` to the palette's Global mode, so the palette no longer answers `Ctrl+Shift+P`.
+That chord is now a reserved keymap action (`pip.toggle`, group *Reserved*) whose handler
+states in the top banner that PiP lands in its own slice, and whose chord cannot be taken by
+any other action. `Ctrl+Shift+,` (Settings) is new; it is listed in the keymap editor like
+every other app binding.
+
+- `flc_ui::theme_settings` — modes System/Light/Dark; per-mode Background/Accent/Highlight
+  with the documented sliders (Background intensity and alpha, Accent and Highlight
+  prominence); resolution into `Theme` tokens (mix + WCAG luminance/contrast with a
+  readable-text floor); `SurfaceFonts` (UI/editor/terminal families, editor, terminal-tab,
+  right-panel-terminal sizes, chat scale); hex parse/format. Shipped dark defaults resolve to
+  the spec's `#27262B` / `#3D8BFD` / `#2D2E33`.
+- `flc_ui::theme` — light token set; `Theme` carries the per-surface font fields the editor,
+  diff, terminal and chat read.
+- `flotilla::settings` — `<config>/Flotilla/settings.json` beside `hosts.json`: a default
+  workspace entry, per-workspace overrides keyed by the daemon's workspace id, and the
+  per-surface fonts. Writes are atomic (temp file + rename). A corrupt file is reported and
+  left untouched; saving refuses until the user explicitly replaces it.
+- Terminal palettes stay independent: rendering uses the engine's 269 colors unless the
+  workspace's explicit override is on, which replaces only the 16 ANSI cells (cube, greys and
+  named defaults stay the engine's). `TerminalViewOptions.palette` feeds the renderer;
+  `ShellViewOptions` carries font family/size/palette to every pane.
+- Live application: every theme, palette or font edit rebuilds the GPUI `Theme` global and
+  refreshes windows; `ShellView::set_presentation` pushes font/size/palette into every live
+  terminal, and panel (setup/run/teardown) terminals are sized separately. Editor and diff
+  render with the editor font/size, chat text multiplies by the chat scale.
+- `flc_ui::keymap` — chord parse/canonical spelling/labels, the effective action table
+  (quit, add host, palette Global, palette Files, Settings, reserved PiP), the fixed
+  surface-handler table (text input, palette, editor), `keymap.json` load/save with notes for
+  unknown actions and bad chords, and conflict checks: no modifier, terminal-owned plain
+  `Ctrl+<letter>` (spec §8.3 "the terminal comes first"), another action's chord, or a
+  focused surface's handler. Refusal explains the conflict and changes nothing.
+- Settings overlay (Theme and Keyboard tabs): mode, Light/Dark palette editing, an 18×8 color
+  canvas, 12 swatches, a hex field, the four sliders, copy Light↔Dark, copy from any workspace
+  with saved settings, Save / Reset / Set as default; explicit terminal-palette override with
+  16 ANSI swatches; per-surface font family chips and size steppers. Keyboard tab lists every
+  action with its chord, captures a new chord on click, shows refusals, resets one action or
+  all of them, and lists the fixed surface handlers.
+- `install_keymap` clears GPUI's bindings and reinstalls the text-input keys, so a rebind
+  actually replaces the old chord instead of leaving both alive.
+- Tests: theme resolution (spec tokens, system mode, intensity/alpha, prominence), contrast
+  math and nudging, hex parse/format, font clamps, JSON tolerance; chord parsing/labels,
+  default uniqueness, unmodified/terminal/duplicate/surface refusals, file round-trip and
+  corrupt-file reporting, reset; settings store atomic round-trip, per-workspace fallback and
+  copy independence, explicit palette override, clamping, corrupt-file preservation; canvas
+  and stepper math; terminal palette builder.
+- Live X11 run under Xvfb `DISPLAY=:99` against the `flsmoke` daemon (rebuilt at the
+  integration tip so both sides speak protocol 0.4): `Ctrl+,` opened the overlay; the Accent
+  swatch `#FF8A3D` and the Background hex `#101820` applied live to every surface; the
+  terminal-tab size stepper moved 12.5 → 14.5 and the visible terminal text grew; `Save`
+  wrote `~/.config/Flotilla/settings.json` (dark background `1054752`/`#101820`, accent
+  `16747069`/`#FF8A3D`, `fonts.terminal_size` 14.5); restarting the client brought both the
+  theme and the larger terminal font back.
+- Keymap editor live: the Command-palette row captured `Ctrl+P` and was refused with
+  "Ctrl+P is sent to the terminal while it has focus (spec §8.3: the terminal comes first).",
+  leaving the binding unchanged; a second capture succeeded, applied live, and the new chord
+  opened the palette. Screenshots: `m7-theme-01-start.png`, `-02-settings-theme.png`,
+  `-03-accent-picked.png`, `-04-background-set.png`, `-05-background-hex.png`,
+  `-06-scrolled.png`, `-07-font-size.png`, `-08-live-applied.png`, `-09-persisted.png`,
+  `-10-keymap.png`, `-11-conflict-refused.png`, `-12-rebound.png`, `-13-rebind-fires.png`
+  in `/srv/super-eng/.shots`.
+- Base note: the slice sits on `origin/m3-forge` (the lineage that contains the palette
+  commit and the protocol the smoke daemon speaks), not on `origin/main`, whose daemon still
+  reports protocol 0.2 and rejects this client.
+- Not proven live in this pass: `keymap.json` persistence (the save click missed the button;
+  load/save/round-trip and corruption handling are unit-tested), a rebind of *Palette: Files*
+  specifically (the captured row was the palette Global action), the terminal ANSI override,
+  chat scale and editor font, and per-workspace (worktree) theme selection — the live run
+  edited the Home/default entry. Remaining in M7: the PiP window itself, Windows Mica tied to
+  the alpha slider, and a repeated keymap save with reliable coordinates.

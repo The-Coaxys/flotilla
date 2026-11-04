@@ -60,7 +60,7 @@ pub fn class_color(class: HighlightClass, t: &Theme) -> Hsla {
 
 pub(crate) fn mono_font(t: &Theme) -> Font {
     Font {
-        family: t.font_mono.clone(),
+        family: t.editor_font.clone(),
         features: FontFeatures::disable_ligatures(),
         fallbacks: None,
         weight: FontWeight::NORMAL,
@@ -835,7 +835,7 @@ impl Render for EditorView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = cx.theme().clone();
         let font = mono_font(&t);
-        let font_size = t.mono_size;
+        let font_size = t.editor_size;
         let text_system = window.text_system();
         let font_id = text_system.resolve_font(&font);
         if let Ok(advance) = text_system.advance(font_id, font_size, 'm') {

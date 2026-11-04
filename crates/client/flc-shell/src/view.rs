@@ -20,17 +20,26 @@ use gpui::Focusable as _;
 use gpui::prelude::*;
 use gpui::{
     AsyncApp, Context, Div, Entity, FocusHandle, InteractiveElement, IntoElement, KeyDownEvent,
-    ParentElement, Render, SharedString, Styled, Subscription, Task, WeakEntity, Window, div, px,
-    relative,
+    ParentElement, Pixels, Render, SharedString, Styled, Subscription, Task, WeakEntity, Window,
+    div, px, relative,
 };
 use tokio::sync::broadcast;
 
 use crate::model::{Focus, ShellModel};
 use crate::source::MirrorSource;
 
-#[derive(Debug, Clone, Default)]
+/// Presentation settings applied to every terminal pane of the shell
+/// (spec §8.2: font and size are set per surface; the terminal palette is an
+/// explicit, independent override of the engine's own).
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct ShellViewOptions {
     pub echo_policy: EchoPolicy,
+    /// `None`: the theme's terminal font.
+    pub font_family: Option<SharedString>,
+    /// `None`: the theme's terminal size.
+    pub font_size: Option<Pixels>,
+    /// `None`: the palette carried by each frame (the engine's).
+    pub palette: Option<Vec<u32>>,
 }
 
 /// What the shell asks its host to do outside the layout model.
@@ -345,6 +354,26 @@ impl ShellView {
     ///
     /// Panes read the latency when input is typed, so nothing re-renders:
     /// heartbeats update it every few seconds.
+    /// Apply new presentation settings to every terminal pane, live.
+    pub fn set_presentation(&mut self, options: ShellViewOptions, cx: &mut Context<Self>) {
+        if self.options == options {
+            return;
+        }
+        self.options = options;
+        let presentation = self.options.clone();
+        for terminal in self.terminals.values() {
+            terminal.update(cx, |view, cx| {
+                let mut next = view.options().clone();
+                next.echo_policy = presentation.echo_policy;
+                next.font_family = presentation.font_family.clone();
+                next.font_size = presentation.font_size;
+                next.palette = presentation.palette.clone();
+                view.set_options(next, cx);
+            });
+        }
+        cx.notify();
+    }
+
     pub fn set_rtt(&mut self, rtt: Option<Duration>) {
         if self.rtt == rtt {
             return;
@@ -402,6 +431,9 @@ impl ShellView {
             };
             let options = TerminalViewOptions {
                 echo_policy: self.options.echo_policy,
+                font_family: self.options.font_family.clone(),
+                font_size: self.options.font_size,
+                palette: self.options.palette.clone(),
                 ..TerminalViewOptions::default()
             };
             let terminal_view = cx.new(|cx| TerminalView::new(source, options, window, cx));
