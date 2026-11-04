@@ -11,8 +11,8 @@
 //! back to `LIKE`; both modes are recorded in `chat_meta.fts5`.
 use super::*;
 use fl_model::chat::{
-    ChatEvent, ChatEventPage, ChatHit, ChatSession, EventRecord, InboxItem, InboxKind, InboxState,
-    ResumeTarget, SessionState, StatusSource, CHAT_SCHEMA_VERSION,
+    CHAT_SCHEMA_VERSION, ChatEvent, ChatEventPage, ChatHit, ChatSession, EventRecord, InboxItem,
+    InboxKind, InboxState, ResumeTarget, SessionState, StatusSource,
 };
 
 const MAX_CHAT_EVENT_BYTES: usize = 2 * 1024 * 1024;
@@ -716,9 +716,8 @@ impl Database {
     /// that was Running when the previous daemon stopped. The store never
     /// fabricates a completed turn; the transcript instead explains the gap.
     fn record_interrupted_turns(connection: &Connection, now: u64) -> Result<()> {
-        let mut statement = connection.prepare(
-            "SELECT id,seq,incarnation,status FROM chat_sessions WHERE archived=0",
-        )?;
+        let mut statement = connection
+            .prepare("SELECT id,seq,incarnation,status FROM chat_sessions WHERE archived=0")?;
         let rows = statement.query_map([], |row| {
             Ok((
                 row.get::<_, Vec<u8>>(0)?,
@@ -766,11 +765,20 @@ impl Database {
             connection.execute(
                 "INSERT INTO chat_events(session,sequence,record,search_text)
                  VALUES(?1,?2,?3,?4)",
-                params![id.as_bytes().as_slice(), sequence_key(sequence), bytes, search],
+                params![
+                    id.as_bytes().as_slice(),
+                    sequence_key(sequence),
+                    bytes,
+                    search
+                ],
             )?;
             connection.execute(
                 "UPDATE chat_sessions SET seq=?2,updated_ms=max(updated_ms,?3) WHERE id=?1",
-                params![id.as_bytes().as_slice(), sequence_key(sequence), sql_ms(now)?],
+                params![
+                    id.as_bytes().as_slice(),
+                    sequence_key(sequence),
+                    sql_ms(now)?
+                ],
             )?;
         }
         Ok(())
@@ -1334,9 +1342,7 @@ fn substring_snippet(text: &str, query: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fl_model::chat::{
-        ApprovalDecision, BoundedText, ChatEvent, PermissionMode, TextUpdate,
-    };
+    use fl_model::chat::{ApprovalDecision, BoundedText, ChatEvent, PermissionMode, TextUpdate};
 
     fn root() -> tempfile::TempDir {
         tempfile::tempdir().unwrap()
@@ -1620,7 +1626,10 @@ mod tests {
         let pending = db.chat_pending(id).unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].request, "child-approval");
-        assert_eq!(db.chat_session(id).unwrap().status, SessionState::AwaitingInput);
+        assert_eq!(
+            db.chat_session(id).unwrap().status,
+            SessionState::AwaitingInput
+        );
         let inbox = db.chat_inbox().unwrap();
         assert_eq!(inbox.len(), 1);
         assert_eq!(inbox[0].kind, InboxKind::Approval);

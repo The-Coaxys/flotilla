@@ -552,15 +552,13 @@ impl Request {
             Self::MutateRouting { mutation, .. } => {
                 mutation.validate().map_err(ValidationError::Invalid)
             }
-            Self::DispatchGitTask { worktree, context, .. } => {
+            Self::DispatchGitTask {
+                worktree, context, ..
+            } => {
                 validation::non_nil_id("dispatch worktree", worktree.as_bytes())?;
                 // User context is interpolated into the rendered prompt, so it
                 // must already fit the same bound as the prompt itself.
-                text(
-                    "dispatch context",
-                    context,
-                    validation::MAX_MESSAGE_BYTES,
-                )
+                text("dispatch context", context, validation::MAX_MESSAGE_BYTES)
             }
             Self::ListChatSessions { worktree } => {
                 validation::non_nil_id("chat worktree", worktree.as_bytes())

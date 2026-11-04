@@ -514,7 +514,7 @@ impl Machine {
             turns,
             usage,
             model: self.info.model.clone(),
-            outcome,
+            outcome: outcome.clone(),
         })?;
         self.active_turn = None;
         self.starting_turn = false;
@@ -531,9 +531,7 @@ impl Machine {
             TurnOutcome::Failed => self.set_state(SessionState::Failed {
                 message: "the provider reported a failed turn".into(),
             }),
-            TurnOutcome::Completed | TurnOutcome::Cancelled => {
-                self.set_state(SessionState::Idle)
-            }
+            TurnOutcome::Completed | TurnOutcome::Cancelled => self.set_state(SessionState::Idle),
         }
     }
     pub fn user_event(&mut self, id: String, text: String) -> Result<()> {

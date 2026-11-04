@@ -153,7 +153,7 @@ async fn control(
             server_session_id: lease.id,
         }))
         .await?;
-    let mut rpcs = JoinSet::new();
+    let mut rpcs: JoinSet<(u64, Result<Response, RpcError>)> = JoinSet::new();
     // Registered before any RPC runs, so no change after a reply is missed.
     // Peers older than protocol 0.3 cannot decode `ServerMsg::Event`.
     let mut subscription =

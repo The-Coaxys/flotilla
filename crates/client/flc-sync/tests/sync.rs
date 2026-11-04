@@ -241,7 +241,16 @@ async fn input_survives_a_short_restart_and_exact_state_resumes() {
     })
     .await;
     assert!(state.processes.iter().any(|process| process.pid == pid));
-    assert!(handle.state().resumes >= 1);
+    // The resume counter is published by the mirror task, so under a loaded
+    // test binary it can trail the next live state by a scheduling hop.
+    let deadline = Instant::now() + WAIT;
+    while handle.state().resumes == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the mirror never reported resuming after the restart"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     sync.shutdown().await;
     sup.shutdown().await;
 }

@@ -100,12 +100,21 @@ pub(crate) async fn validate_resume(
         .join("projects")
         .join(encoded)
         .join(format!("{}.jsonl", target.native_id));
-    // A missing/unreadable transcript is an environment failure. Only a
-    // readable transcript that lacks the requested identity is a semantic
-    // resume mismatch that may archive the chat.
-    let file = tokio::fs::File::open(path)
+    // An inaccessible cwd is an environment failure, and so is an I/O error.
+    // A transcript file that no longer exists is a semantic mismatch: that
+    // session is gone, so the caller may archive the chat and start fresh.
+    tokio::fs::metadata(cwd)
         .await
-        .map_err(|e| AdapterError::Protocol(format!("Claude transcript: {e}")))?;
+        .map_err(|e| AdapterError::Protocol(format!("resume cwd: {e}")))?;
+    let file = match tokio::fs::File::open(&path).await {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(AdapterError::InvalidResume(
+                "the Claude transcript for this session no longer exists".into(),
+            ));
+        }
+        Err(e) => return Err(AdapterError::Protocol(format!("Claude transcript: {e}"))),
+    };
     let mut lines = BufReader::new(file.take((MAX_WIRE_LINE * 4) as u64)).lines();
     while let Some(line) = lines.next_line().await? {
         if line.len() > MAX_WIRE_LINE {
@@ -815,7 +824,7 @@ mod tests {
         );
     }
     #[tokio::test]
-    async fn missing_transcript_is_transient_not_an_invalid_resume() {
+    async fn missing_transcript_means_the_session_is_gone_not_an_io_fault() {
         let dir = tempfile::tempdir().unwrap();
         let mut provider = crate::ProviderRegistry::default()
             .get("claude")
@@ -833,16 +842,14 @@ mod tests {
         };
         assert!(matches!(
             validate_resume(&provider, &target, dir.path()).await,
-            Err(AdapterError::Protocol(_))
+            Err(AdapterError::InvalidResume(_))
         ));
     }
     #[test]
     fn failed_turn_keeps_failed_state_until_the_next_send() {
         let (mut machine, mut events) = test_machine(AdapterKind::ClaudeStream);
         machine.active_turn = Some("turn".into());
-        machine
-            .end_turn(None, 1, TurnOutcome::Failed)
-            .unwrap();
+        machine.end_turn(None, 1, TurnOutcome::Failed).unwrap();
         let mut records = Vec::new();
         while let Ok(record) = events.try_recv() {
             records.push(record);
@@ -851,9 +858,11 @@ mod tests {
             records.last().map(|record| &record.event),
             Some(ChatEvent::StateChanged(SessionState::Failed { .. }))
         ));
-        assert!(!records
-            .iter()
-            .any(|record| matches!(&record.event, ChatEvent::StateChanged(SessionState::Idle))));
+        assert!(
+            !records
+                .iter()
+                .any(|record| matches!(&record.event, ChatEvent::StateChanged(SessionState::Idle)))
+        );
         assert!(matches!(
             machine.state.borrow().clone(),
             SessionState::Failed { .. }

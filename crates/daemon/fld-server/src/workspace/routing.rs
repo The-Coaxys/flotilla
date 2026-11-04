@@ -308,7 +308,7 @@ impl WorkspaceService {
     }
 
     /// Cancel every pending dispatch of a removed worktree.
-    fn cancel_dispatches_for(&self, worktree: WorktreeId) {
+    pub(crate) fn cancel_dispatches_for(&self, worktree: WorktreeId) {
         let ids: Vec<_> = self
             .dispatches
             .lock()
@@ -646,6 +646,17 @@ fn prune_dispatch_history(
     }
 }
 
+/// Routed reuse is allowed only for a session configured exactly like the
+/// route: same provider, model, permission mode and thinking setting.
+fn reusable_for_route(session: &ChatSession, route: &RouteSpec) -> bool {
+    session.provider == route.provider
+        && session.status == SessionState::Idle
+        && session.resume.is_some()
+        && session.model == route.model
+        && session.permission_mode == PermissionMode::Ask
+        && session.thinking == route.thinking
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -717,15 +728,4 @@ mod tests {
         assert_eq!(dispatches.len(), MAX_DISPATCH_HISTORY);
         assert!(dispatches.values().all(|item| item.created_ms >= 7));
     }
-}
-
-/// Routed reuse is allowed only for a session configured exactly like the
-/// route: same provider, model, permission mode and thinking setting.
-fn reusable_for_route(session: &ChatSession, route: &RouteSpec) -> bool {
-    session.provider == route.provider
-        && session.status == SessionState::Idle
-        && session.resume.is_some()
-        && session.model == route.model
-        && session.permission_mode == PermissionMode::Ask
-        && session.thinking == route.thinking
 }

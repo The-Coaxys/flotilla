@@ -13,25 +13,23 @@ use std::time::Duration;
 
 use fl_model::WorktreeId;
 use fl_model::chat::{
-    ApprovalDecision, BoundedText, ChatEvent, ChatSession, EventRecord, InboxKind, PermissionMode,
-    QuestionResponse, ResumeTarget, SessionConfig, SessionState, StatusSource, TurnOutcome,
-    CHAT_SCHEMA_VERSION, MAX_CHAT_TEXT,
+    ApprovalDecision, BoundedText, CHAT_SCHEMA_VERSION, ChatEvent, ChatSession, EventRecord,
+    InboxKind, MAX_CHAT_TEXT, PermissionMode, QuestionResponse, ResumeTarget, SessionConfig,
+    SessionState, StatusSource, TurnOutcome,
 };
 use fl_model::routing::GitTask;
 use fl_model::workspace::DaemonEvent;
 use fl_proto::{RpcError, RpcErrorCode};
 use fld_agent::{Adapter, AdapterError, ProviderRegistry};
 use fld_store::StoreError;
-use fld_store::database::{
-    ChatEventEffects, NewInboxItem, PendingKind, PendingRequest,
-};
+use fld_store::database::{ChatEventEffects, NewInboxItem, PendingKind, PendingRequest};
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, Semaphore, broadcast};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::events::EventBus;
-use crate::terminal::{TerminalService, bounded, store_rpc, stopped_rpc};
+use crate::terminal::{TerminalService, bounded, stopped_rpc, store_rpc};
 
 /// Live provider processes the daemon will supervise at once.
 pub(crate) const MAX_LIVE_CHATS: usize = 8;
@@ -124,8 +122,7 @@ fn sanitize_event(event: &mut ChatEvent, depth: usize) {
         ChatEvent::SessionReady(info) => {
             info.resume.provider_id =
                 bounded_with_marker(&info.resume.provider_id, MAX_CHAT_PROVIDER_BYTES);
-            info.resume.native_id =
-                bounded_with_marker(&info.resume.native_id, MAX_CHAT_ID_BYTES);
+            info.resume.native_id = bounded_with_marker(&info.resume.native_id, MAX_CHAT_ID_BYTES);
             if info.resume.cwd.to_str().is_none() {
                 info.resume.cwd = PathBuf::from(info.resume.cwd.to_string_lossy().as_ref());
             }
@@ -165,10 +162,7 @@ fn sanitize_event(event: &mut ChatEvent, depth: usize) {
             *id = bounded_with_marker(id, MAX_CHAT_TEXT);
             sanitize_bounded(delta, MAX_CHAT_TEXT);
         }
-        ChatEvent::FileEdit {
-            path,
-            unified_diff,
-        } => {
+        ChatEvent::FileEdit { path, unified_diff } => {
             let rendered = path.to_string_lossy();
             if rendered.contains('\0') || rendered.len() > MAX_CHAT_PATH_BYTES {
                 *path = PathBuf::from(bounded_with_marker(&rendered, MAX_CHAT_PATH_BYTES));
@@ -202,8 +196,7 @@ fn sanitize_event(event: &mut ChatEvent, depth: usize) {
                 question.options.truncate(MAX_CHAT_QUESTION_OPTIONS);
                 for option in &mut question.options {
                     option.label = bounded_with_marker(&option.label, MAX_CHAT_TEXT);
-                    option.description =
-                        bounded_with_marker(&option.description, MAX_CHAT_TEXT);
+                    option.description = bounded_with_marker(&option.description, MAX_CHAT_TEXT);
                 }
             }
         }
@@ -224,9 +217,7 @@ fn sanitize_event(event: &mut ChatEvent, depth: usize) {
                 }
             }
         }
-        ChatEvent::TurnEnd {
-            model, usage, ..
-        } => {
+        ChatEvent::TurnEnd { model, usage, .. } => {
             if let Some(model) = model {
                 *model = bounded_with_marker(model, MAX_CHAT_MODEL_BYTES);
             }
@@ -265,7 +256,10 @@ fn sanitize_record(record: &mut EventRecord) {
 /// wire events remain the source of truth; this is a supervised turn signal.
 #[derive(Debug, Clone)]
 pub(crate) enum ChatNotice {
-    Event { session: uuid::Uuid, record: EventRecord },
+    Event {
+        session: uuid::Uuid,
+        record: EventRecord,
+    },
     Session(ChatSession),
     Inbox,
 }
@@ -309,10 +303,7 @@ fn adapter_rpc(error: AdapterError) -> RpcError {
 /// `session:kind:hash(key)`; global inbox dedupe identity. Hashing keeps the
 /// key bounded even when a provider request ID is large.
 fn inbox_dedupe(session: uuid::Uuid, kind: &str, key: &str) -> String {
-    format!(
-        "{session}:{kind}:{:x}",
-        Sha256::digest(key.as_bytes())
-    )
+    format!("{session}:{kind}:{:x}", Sha256::digest(key.as_bytes()))
 }
 
 impl ChatService {
@@ -499,9 +490,7 @@ impl ChatService {
             }
         };
         let info = adapter.info.clone();
-        if let Err(error) = self
-            .claim_provider(&spec.id, &info.resume.native_id, id)
-        {
+        if let Err(error) = self.claim_provider(&spec.id, &info.resume.native_id, id) {
             let _ = adapter.shutdown().await;
             self.release_claims_for(id);
             return Err(error);
@@ -552,7 +541,11 @@ impl ChatService {
         Ok(session)
     }
 
-    pub(crate) async fn send(self: &Arc<Self>, id: uuid::Uuid, text: String) -> Result<(), RpcError> {
+    pub(crate) async fn send(
+        self: &Arc<Self>,
+        id: uuid::Uuid,
+        text: String,
+    ) -> Result<(), RpcError> {
         let adapter = self.ensure_live(id).await?;
         let result = tokio::time::timeout(SEND_TIMEOUT, adapter.send(text))
             .await
@@ -560,7 +553,11 @@ impl ChatService {
         result.map_err(adapter_rpc)
     }
 
-    pub(crate) async fn steer(self: &Arc<Self>, id: uuid::Uuid, text: String) -> Result<(), RpcError> {
+    pub(crate) async fn steer(
+        self: &Arc<Self>,
+        id: uuid::Uuid,
+        text: String,
+    ) -> Result<(), RpcError> {
         let adapter = self.ensure_live(id).await?;
         let result = tokio::time::timeout(SEND_TIMEOUT, adapter.steer(text))
             .await
@@ -600,12 +597,10 @@ impl ChatService {
         self.require_pending(id, &request, PendingKind::Approval)
             .await?;
         let adapter = self.ensure_live(id).await?;
-        let result = tokio::time::timeout(
-            CONTROL_TIMEOUT,
-            adapter.approve(request.clone(), decision),
-        )
-        .await
-        .map_err(|_| internal("provider approval timed out"))?;
+        let result =
+            tokio::time::timeout(CONTROL_TIMEOUT, adapter.approve(request.clone(), decision))
+                .await
+                .map_err(|_| internal("provider approval timed out"))?;
         result.map_err(adapter_rpc)?;
         self.resolve_pending(id, &request, PendingKind::Approval)
             .await?;
@@ -712,10 +707,8 @@ impl ChatService {
             request,
         );
         let request = request.to_owned();
-        self.store(move |store| {
-            store.database.resolve_chat_pending(id, &request, &dedupe)
-        })
-        .await?;
+        self.store(move |store| store.database.resolve_chat_pending(id, &request, &dedupe))
+            .await?;
         self.publish_inbox();
         Ok(())
     }
@@ -786,12 +779,16 @@ impl ChatService {
                 format!("{MAX_LIVE_CHATS} chats are already running; close one first"),
             ));
         }
-        let spec = self.registry.get(&session.provider).cloned().ok_or_else(|| {
-            invalid(format!(
-                "provider {:?} is no longer configured",
-                session.provider
-            ))
-        })?;
+        let spec = self
+            .registry
+            .get(&session.provider)
+            .cloned()
+            .ok_or_else(|| {
+                invalid(format!(
+                    "provider {:?} is no longer configured",
+                    session.provider
+                ))
+            })?;
         let Some(resume) = session.resume.clone() else {
             self.archive_unrestorable(
                 id,
@@ -843,31 +840,32 @@ impl ChatService {
             output_schema_json: None,
             resume: Some(resume),
         };
-        let launched = tokio::time::timeout(START_TIMEOUT, Adapter::launch(spec.clone(), config))
-            .await
-            .map_err(|_| internal("provider restore timed out"))
-            .and_then(|result| result.map_err(adapter_rpc));
+        let launched =
+            tokio::time::timeout(START_TIMEOUT, Adapter::launch(spec.clone(), config)).await;
         let mut adapter = match launched {
-            Ok(adapter) => adapter,
-            Err(error) => {
+            Ok(Ok(adapter)) => adapter,
+            Ok(Err(AdapterError::InvalidResume(message))) => {
                 self.release_claims_for(id);
-                if let AdapterError::InvalidResume(message) = error {
-                    self.archive_unrestorable(
-                        id,
-                        &format!("the stored conversation could not be resumed ({message})"),
-                    )
-                    .await;
-                    return Err(invalid(
-                        "the stored provider session is no longer resumable; its transcript is archived",
-                    ));
-                }
-                return Err(error);
+                self.archive_unrestorable(
+                    id,
+                    &format!("the stored conversation could not be resumed ({message})"),
+                )
+                .await;
+                return Err(invalid(
+                    "the stored provider session is no longer resumable; its transcript is archived",
+                ));
+            }
+            Ok(Err(error)) => {
+                self.release_claims_for(id);
+                return Err(adapter_rpc(error));
+            }
+            Err(_) => {
+                self.release_claims_for(id);
+                return Err(internal("provider restore timed out"));
             }
         };
         let info = adapter.info.clone();
-        if let Err(error) = self
-            .claim_provider(&session.provider, &info.resume.native_id, id)
-        {
+        if let Err(error) = self.claim_provider(&session.provider, &info.resume.native_id, id) {
             let _ = adapter.shutdown().await;
             self.release_claims_for(id);
             return Err(error);
@@ -1137,7 +1135,9 @@ impl ChatService {
                 PendingKind::Approval => "approval",
                 PendingKind::Question => "question",
             };
-            effects.dismiss_inbox.push(inbox_dedupe(id, kind, &item.request));
+            effects
+                .dismiss_inbox
+                .push(inbox_dedupe(id, kind, &item.request));
             effects.resolve_pending.push(item.request);
         }
         Ok(())
@@ -1178,18 +1178,17 @@ impl ChatService {
             output_schema_json: Some(schema),
             resume: None,
         };
-        let mut adapter = match tokio::time::timeout(START_TIMEOUT, Adapter::launch(spec.clone(), config))
-            .await
-            .map_err(|_| internal("provider start timed out"))
-            .and_then(|result| result.map_err(adapter_rpc))
-        {
-            Ok(adapter) => adapter,
-            Err(error) => return Err(error),
-        };
+        let mut adapter =
+            match tokio::time::timeout(START_TIMEOUT, Adapter::launch(spec.clone(), config))
+                .await
+                .map_err(|_| internal("provider start timed out"))
+                .and_then(|result| result.map_err(adapter_rpc))
+            {
+                Ok(adapter) => adapter,
+                Err(error) => return Err(error),
+            };
         let info = adapter.info.clone();
-        if let Err(error) = self
-            .claim_provider(&spec.id, &info.resume.native_id, info.id)
-        {
+        if let Err(error) = self.claim_provider(&spec.id, &info.resume.native_id, info.id) {
             let _ = adapter.shutdown().await;
             return Err(error);
         }
@@ -1350,13 +1349,13 @@ fn merge_effects(into: &mut ChatEventEffects, from: ChatEventEffects) {
 
 /// Terminal events clear every unanswerable pending decision.
 fn needs_pending_clear(event: &ChatEvent) -> bool {
-    match event {
-        ChatEvent::StateChanged(SessionState::Closed | SessionState::Failed { .. }) => true,
-        ChatEvent::TurnEnd { .. }
-        | ChatEvent::Error { fatal: true, .. }
-        | ChatEvent::ProcessExited { .. } => true,
-        _ => false,
-    }
+    matches!(
+        event,
+        ChatEvent::StateChanged(SessionState::Closed | SessionState::Failed { .. })
+            | ChatEvent::TurnEnd { .. }
+            | ChatEvent::Error { fatal: true, .. }
+            | ChatEvent::ProcessExited { .. }
+    )
 }
 
 /// Durable effects of one event. Subagent children contribute their own
@@ -1392,8 +1391,7 @@ fn event_effects(
             effects.add_pending.push(PendingRequest {
                 request: request.clone(),
                 kind: PendingKind::Approval,
-                payload: postcard::to_stdvec(event)
-                    .map_err(|error| internal(error.to_string()))?,
+                payload: postcard::to_stdvec(event).map_err(|error| internal(error.to_string()))?,
                 created_ms: timestamp,
             });
             effects.inbox.push(NewInboxItem {
@@ -1415,8 +1413,7 @@ fn event_effects(
             effects.add_pending.push(PendingRequest {
                 request: request.clone(),
                 kind: PendingKind::Question,
-                payload: postcard::to_stdvec(event)
-                    .map_err(|error| internal(error.to_string()))?,
+                payload: postcard::to_stdvec(event).map_err(|error| internal(error.to_string()))?,
                 created_ms: timestamp,
             });
             let prompt = questions
@@ -1485,7 +1482,9 @@ fn event_effects(
             }
         },
         ChatEvent::Error {
-            message, fatal: true, ..
+            message,
+            fatal: true,
+            ..
         } => {
             effects.status = Some((
                 SessionState::Failed {
@@ -1528,8 +1527,8 @@ fn event_effects(
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use crate::default_launch;
     use crate::FlotillaHome;
+    use crate::default_launch;
     use fl_model::ProjectId;
     use fl_model::workspace::{Project, ProjectKind, Worktree};
     use std::path::Path;
@@ -1599,7 +1598,7 @@ mod tests {
                     };
                     let id = primary.id;
                     store.database.add_project(project, &[primary])?;
-                    Ok(id)
+                    Ok::<WorktreeId, fld_store::StoreError>(id)
                 }
             })
             .await
@@ -1723,8 +1722,16 @@ mod tests {
             10,
         )
         .unwrap();
-        assert!(matches!(effects.status, Some((SessionState::Failed { .. }, _))));
-        assert!(effects.inbox.iter().any(|item| item.kind == InboxKind::Error));
+        assert!(matches!(
+            effects.status,
+            Some((SessionState::Failed { .. }, _))
+        ));
+        assert!(
+            effects
+                .inbox
+                .iter()
+                .any(|item| item.kind == InboxKind::Error)
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1771,9 +1778,11 @@ mod tests {
         let inbox = service.inbox().await.unwrap();
         assert!(inbox.iter().any(|item| item.kind == InboxKind::Error));
         // The dead adapter's stale decision must not remain answerable.
-        assert!(!inbox
-            .iter()
-            .any(|item| matches!(item.kind, InboxKind::Approval | InboxKind::Question)));
+        assert!(
+            !inbox
+                .iter()
+                .any(|item| matches!(item.kind, InboxKind::Approval | InboxKind::Question))
+        );
         let session_id = session.id;
         let pending = service
             .terminals
