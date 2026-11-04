@@ -675,3 +675,94 @@ async fn workspaces_status_and_worktree_layouts_follow_the_daemon() {
     sync.shutdown().await;
     sup.shutdown().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sections_publish_replies_follow_events_and_refetch_after_reconnect() {
+    use fl_model::SectionId;
+    use fl_model::sections::{Section, SectionKind, SectionMutation};
+    use fl_proto::{Request, Response, RpcErrorCode};
+
+    let h = Harness::new().await;
+    let sup = Supervisor::spawn(h.spec(false));
+    let mut links = sup.links();
+    let link = wait_link(&mut links, WAIT, "SSH link", |_| true).await;
+    // Control which links the mirror follows, while keeping the real daemon
+    // reachable for a change made while this mirror is disconnected.
+    let (followed, following) = watch::channel(Some(link.clone()));
+    let sync = Sync::new(following, None, Config::default());
+    let initial = wait_workspaces(&sync, "initial sections", |s| {
+        s.live && s.tree.is_some() && s.sections.is_some()
+    })
+    .await;
+    let workspace = initial.tree.as_ref().unwrap().workspaces[0].id;
+    let baseline = initial.sections.as_ref().unwrap().rev;
+    let section = Section {
+        id: SectionId::new(),
+        workspace,
+        name: "My tasks".into(),
+        order: 0,
+        priority: 0,
+        kind: SectionKind::Manual,
+    };
+    let created = sync
+        .mutate_sections(baseline, SectionMutation::Upsert(section.clone()))
+        .await
+        .unwrap();
+    assert_eq!(created.sections, vec![section.clone()]);
+    assert_eq!(sync.workspaces().sections.as_ref(), Some(&created));
+    assert_eq!(sync.list_sections().await.unwrap(), created);
+
+    // A request outside Sync changes the daemon; only the event can update
+    // the mirror with its new revision and name.
+    let mut renamed = section.clone();
+    renamed.name = "Renamed tasks".into();
+    let pushed = match link
+        .rpc(Request::MutateSections {
+            expected_rev: created.rev,
+            mutation: SectionMutation::Upsert(renamed.clone()),
+        })
+        .await
+        .unwrap()
+    {
+        Response::SectionsState(state) => state,
+        other => panic!("unexpected sections response: {other:?}"),
+    };
+    wait_workspaces(&sync, "pushed sections snapshot", |s| {
+        s.sections.as_ref() == Some(&pushed)
+    })
+    .await;
+
+    let error = sync
+        .mutate_sections(created.rev, SectionMutation::Delete(section.id))
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        flc_sync::CallError::Rpc(error)
+            if error.code() == Some(RpcErrorCode::RevisionConflict)
+    ));
+    assert_eq!(sync.workspaces().sections.as_ref(), Some(&pushed));
+
+    followed.send(None).unwrap();
+    wait_workspaces(&sync, "sections mirror offline", |s| !s.live).await;
+    let deleted = match link
+        .rpc(Request::MutateSections {
+            expected_rev: pushed.rev,
+            mutation: SectionMutation::Delete(section.id),
+        })
+        .await
+        .unwrap()
+    {
+        Response::SectionsState(state) => state,
+        other => panic!("unexpected sections response: {other:?}"),
+    };
+    assert_eq!(sync.workspaces().sections.as_ref(), Some(&pushed));
+    followed.send(Some(link)).unwrap();
+    let refreshed = wait_workspaces(&sync, "sections refetched on reconnect", |s| {
+        s.live && s.sections.as_ref() == Some(&deleted)
+    })
+    .await;
+    assert!(refreshed.sections.as_ref().unwrap().sections.is_empty());
+    sync.shutdown().await;
+    sup.shutdown().await;
+}

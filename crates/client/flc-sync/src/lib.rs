@@ -20,6 +20,7 @@ use std::time::Duration;
 
 use fl_model::forge::{ForgeState, MergeMethod};
 use fl_model::layout::LayoutOp;
+use fl_model::sections::{SectionMutation, SectionsState};
 use fl_model::workspace::{
     DirListing, FileContent, FileDiff, LayoutScope, Project, ScriptKind, ScriptState, Worktree,
     WorktreeStatus,
@@ -110,8 +111,8 @@ pub struct Sync {
     layouts: Mutex<HashMap<LayoutScope, LayoutHandle>>,
     registry: workspaces::LayoutRegistry,
     workspaces: watch::Receiver<Arc<WorkspacesState>>,
-    /// Shared with the workspace task, so request results land in the
-    /// mirror at once (an unchanged forge state is never pushed).
+    /// Shared with the workspace task, so forge and sections request
+    /// results land in the mirror immediately.
     workspaces_tx: Arc<watch::Sender<Arc<WorkspacesState>>>,
     events: broadcast::Sender<SyncEvent>,
 }
@@ -245,6 +246,16 @@ impl Sync {
         });
     }
 
+    fn remember_sections(&self, state: &SectionsState) {
+        let links = self.links.borrow();
+        if links
+            .as_ref()
+            .is_some_and(|link| workspaces::supports_sections(link.daemon_proto()))
+        {
+            workspaces::remember_sections(&self.workspaces_tx, state.clone());
+        }
+    }
+
     /// The layout of `scope`; its sync task starts on first use and runs for
     /// the session.
     pub fn layout(&self, scope: LayoutScope) -> LayoutHandle {
@@ -259,7 +270,7 @@ impl Sync {
             .clone()
     }
 
-    /// Projects, worktrees, live status and scripts.
+    /// Projects, worktrees, live status, scripts and sidebar sections.
     pub fn workspaces(&self) -> Arc<WorkspacesState> {
         self.workspaces.borrow().clone()
     }
@@ -277,12 +288,64 @@ impl Sync {
             .clone()
             .filter(|link| !link.is_closed())
             .ok_or(CallError::Offline)?;
+        if matches!(&req, Request::ListSections | Request::MutateSections { .. })
+            && !workspaces::supports_sections(link.daemon_proto())
+        {
+            return Err(CallError::Rpc(RpcCallError::Remote(fl_proto::RpcError {
+                code: fl_proto::RpcErrorCode::Unsupported,
+                message: "sidebar sections require daemon protocol 0.4".into(),
+            })));
+        }
         self.core
             .runtime
             .spawn(async move { link.rpc(req).await })
             .await
             .map_err(|_| CallError::Offline)?
             .map_err(CallError::from)
+    }
+
+    /// Fetch the daemon's section definitions, assignments and pins, and
+    /// immediately publish the snapshot unless the mirror is already newer.
+    pub async fn list_sections(&self) -> Result<SectionsState, CallError> {
+        match self.call(Request::ListSections).await? {
+            Response::SectionsState(state) => {
+                self.remember_sections(&state);
+                Ok(state)
+            }
+            _ => Err(CallError::Unexpected),
+        }
+    }
+
+    /// Apply one revision-checked section mutation. Conflicts refresh the
+    /// mirror before returning the error; the mutation is never retried.
+    pub async fn mutate_sections(
+        &self,
+        expected_rev: u64,
+        mutation: SectionMutation,
+    ) -> Result<SectionsState, CallError> {
+        match self
+            .call(Request::MutateSections {
+                expected_rev,
+                mutation,
+            })
+            .await
+        {
+            Ok(Response::SectionsState(state)) => {
+                self.remember_sections(&state);
+                Ok(state)
+            }
+            Ok(_) => Err(CallError::Unexpected),
+            Err(error) => {
+                if matches!(
+                    &error,
+                    CallError::Rpc(error)
+                        if error.code() == Some(fl_proto::RpcErrorCode::RevisionConflict)
+                ) {
+                    let _ = self.list_sections().await;
+                }
+                Err(error)
+            }
+        }
     }
 
     pub async fn list_dir(&self, path: String) -> Result<DirListing, CallError> {

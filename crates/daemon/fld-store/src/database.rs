@@ -34,7 +34,7 @@ use std::{
     time::Duration,
 };
 
-const SCHEMA_VERSION: u32 = 3;
+const SCHEMA_VERSION: u32 = 5;
 const MAX_LAYOUT_BYTES: usize = 128 * 1024;
 const MAX_ENTRY_BYTES: usize = 512 * 1024;
 const MAX_TEXT_BYTES: usize = 4096;
@@ -518,11 +518,29 @@ fn migrate(connection: &mut Connection, root: &File, path: &Path, existed: bool)
                 [postcard::to_stdvec(&1u64)?],
             )?;
         }
+        if version < 4 {
+            transaction.execute_batch(sections::SCHEMA_V4)?;
+            let initial = fl_model::sections::SectionsState {
+                rev: 1,
+                ..Default::default()
+            };
+            transaction.execute(
+                "INSERT INTO sections(singleton,state) VALUES(1,?1)",
+                [postcard::to_stdvec(&initial)?],
+            )?;
+        }
+        if version < 5 {
+            transaction.execute_batch(review::SCHEMA_V5)?;
+        }
         transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     }
     // Never initialize over a missing/corrupt default or partially valid rows.
     load_state(&transaction)?;
     load_tree(&transaction)?;
+    sections::validate_references(
+        &sections::load_sections(&transaction)?,
+        &load_tree(&transaction)?,
+    )?;
     let invalid_operations: bool = transaction.query_row(
         "SELECT EXISTS(SELECT 1 FROM operations WHERE typeof(operation)!='blob' OR length(operation)!=16 OR typeof(payload_hash)!='blob' OR length(payload_hash)!=32)",
         [], |row| row.get(0),
@@ -1264,7 +1282,9 @@ mod tree;
 use tree::{MAX_WORKTREES, load_tree};
 #[path = "review.rs"]
 mod review;
-pub(crate) use review::SCHEMA_V5;
+
+#[path = "sections.rs"]
+mod sections;
 
 #[cfg(test)]
 #[path = "database_tests.rs"]

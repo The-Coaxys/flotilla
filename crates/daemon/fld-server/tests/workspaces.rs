@@ -850,3 +850,134 @@ async fn git_actions_and_the_pull_request_loop() {
     );
     daemon.shutdown().await;
 }
+
+/// Real socket/store exercise: sections remain separate from M2 snapshots,
+/// concurrent edits conflict, and the 0.3 peer never receives 0.4 events.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sections_mutations_events_restart_and_legacy_peer() {
+    use fl_model::SectionId;
+    use fl_model::sections::{Section, SectionKind, SectionMutation};
+    let fixture = Fixture::new().await;
+    let folder = fixture.dir.path().join("notes");
+    std::fs::create_dir(&folder).unwrap();
+    let daemon = fixture.start().await;
+    let mut control = Control::connect(&daemon.socket_path).await;
+    let mut previous = Control::connect_as(
+        &daemon.socket_path,
+        fl_proto::ProtoVersion { major: 0, minor: 3 },
+    )
+    .await;
+    let Response::WorkspaceTree(tree) = control.ok(Request::GetWorkspaceTree).await else {
+        panic!("tree")
+    };
+    let workspace = tree.workspaces[0].id;
+    let Response::Project(project) = control
+        .ok(Request::AddProject {
+            workspace,
+            path: folder.display().to_string(),
+        })
+        .await
+    else {
+        panic!("project")
+    };
+    let Response::WorkspaceTree(tree) = control.ok(Request::GetWorkspaceTree).await else {
+        panic!("tree")
+    };
+    let worktree = tree
+        .worktrees
+        .iter()
+        .find(|w| w.project == project.id)
+        .unwrap()
+        .id;
+    let Response::SectionsState(initial) = control.ok(Request::ListSections).await else {
+        panic!("sections")
+    };
+    let manual = Section {
+        id: SectionId::new(),
+        workspace,
+        name: "In progress".into(),
+        order: 0,
+        priority: 0,
+        kind: SectionKind::Manual,
+    };
+    let Response::SectionsState(created) = control
+        .ok(Request::MutateSections {
+            expected_rev: initial.rev,
+            mutation: SectionMutation::Upsert(manual.clone()),
+        })
+        .await
+    else {
+        panic!("sections")
+    };
+    let event = control
+        .event("sections changed", |event| match event {
+            DaemonEvent::SectionsChanged(s) if s.rev == created.rev => Some(s.clone()),
+            _ => None,
+        })
+        .await;
+    assert_eq!(event, created);
+    let conflict = control
+        .rpc(Request::MutateSections {
+            expected_rev: initial.rev,
+            mutation: SectionMutation::Delete(manual.id),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(conflict.code, RpcErrorCode::RevisionConflict);
+    let Response::SectionsState(assigned) = control
+        .ok(Request::MutateSections {
+            expected_rev: created.rev,
+            mutation: SectionMutation::Assign {
+                worktree,
+                section: Some(manual.id),
+            },
+        })
+        .await
+    else {
+        panic!("sections")
+    };
+    let Response::SectionsState(pinned) = control
+        .ok(Request::MutateSections {
+            expected_rev: assigned.rev,
+            mutation: SectionMutation::Pin {
+                worktree,
+                pinned: true,
+            },
+        })
+        .await
+    else {
+        panic!("sections")
+    };
+    // Mutating sections does not mutate the M2 tree.
+    assert_eq!(
+        control.ok(Request::GetWorkspaceTree).await,
+        Response::WorkspaceTree(tree)
+    );
+    previous.ok(Request::DaemonInfo).await;
+    assert!(
+        previous
+            .events
+            .iter()
+            .all(|event| !matches!(event, DaemonEvent::SectionsChanged(_)))
+    );
+    drop(control);
+    drop(previous);
+    daemon.shutdown().await;
+    let daemon = fixture.start().await;
+    let mut control = Control::connect(&daemon.socket_path).await;
+    assert_eq!(
+        control.ok(Request::ListSections).await,
+        Response::SectionsState(pinned)
+    );
+    control
+        .ok(Request::RemoveProject {
+            project: project.id,
+        })
+        .await;
+    let Response::SectionsState(pruned) = control.ok(Request::ListSections).await else {
+        panic!("sections")
+    };
+    assert!(pruned.memberships.is_empty());
+    assert_eq!(pruned.sections, vec![manual]);
+    daemon.shutdown().await;
+}

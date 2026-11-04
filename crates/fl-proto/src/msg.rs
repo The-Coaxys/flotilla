@@ -10,6 +10,7 @@ use crate::validation::{self, MAX_PROCESS_COUNT, MAX_TEXT_BYTES, ValidationError
 use crate::{Frame, ProtoVersion};
 use fl_model::forge::{ForgeState, MergeMethod};
 use fl_model::layout::{Layout, LayoutOp};
+use fl_model::sections::{SectionMutation, SectionsState};
 use fl_model::workspace::{
     DaemonEvent, DirListing, FileContent, FileDiff, LayoutScope, Project, ScriptKind, ScriptState,
     WorkspaceTree, Worktree, WorktreeStatus,
@@ -253,9 +254,23 @@ pub enum Request {
         number: u64,
         method: MergeMethod,
     },
-    ListReviews { worktree: WorktreeId },
-    MutateReview { worktree: WorktreeId, base_rev: u64, mutation: fl_model::review::ReviewMutation },
-    PendingReviewBundle { worktree: WorktreeId },
+    ListReviews {
+        worktree: WorktreeId,
+    },
+    MutateReview {
+        worktree: WorktreeId,
+        base_rev: u64,
+        mutation: fl_model::review::ReviewMutation,
+    },
+    PendingReviewBundle {
+        worktree: WorktreeId,
+    },
+    /// Workspace-local sidebar sections (protocol 0.4).
+    ListSections,
+    MutateSections {
+        expected_rev: u64,
+        mutation: SectionMutation,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -288,6 +303,7 @@ pub enum Response {
     },
     Reviews(fl_model::review::ReviewState),
     ReviewBundle(fl_model::review::ReviewBundle),
+    SectionsState(SectionsState),
 }
 
 /// Returned on the authenticated control stream before requesting channels.
@@ -403,7 +419,10 @@ impl Request {
     pub fn validate(&self) -> Result<(), ValidationError> {
         use validation::{bound, path, text};
         match self {
-            Self::MutateReview { worktree, mutation, .. } => mutation.validate(*worktree)
+            Self::MutateReview {
+                worktree, mutation, ..
+            } => mutation
+                .validate(*worktree)
                 .map_err(ValidationError::Invalid),
             Self::ApplyLayout { op, .. } | Self::ApplyScopedLayout { op, .. } => op
                 .validate()
@@ -448,6 +467,7 @@ impl Request {
             Self::MergePullRequest { number, .. } if *number == 0 => {
                 Err(ValidationError::Invalid("zero pull request number"))
             }
+            Self::MutateSections { mutation, .. } => validation::section_mutation(mutation),
             _ => Ok(()),
         }
     }
@@ -458,8 +478,16 @@ impl Response {
         match self {
             Self::Reviews(state) => state.validate().map_err(ValidationError::Invalid),
             Self::ReviewBundle(bundle) => {
-                validation::bound("review bundle threads", bundle.threads.len(), fl_model::review::MAX_THREADS)?;
-                validation::text("review bundle", &bundle.prompt, fl_model::review::MAX_REVIEW_BYTES + 32768)
+                validation::bound(
+                    "review bundle threads",
+                    bundle.threads.len(),
+                    fl_model::review::MAX_THREADS,
+                )?;
+                validation::text(
+                    "review bundle",
+                    &bundle.prompt,
+                    fl_model::review::MAX_REVIEW_BYTES + 32768,
+                )
             }
             Self::Capabilities(value) => value.validate(),
             Self::Layout(value) => value
@@ -502,6 +530,7 @@ impl Response {
             }
             Self::ForgeState(value) => validation::forge_state(value),
             Self::Committed { head } => validation::text("commit", head, MAX_TEXT_BYTES),
+            Self::SectionsState(value) => validation::sections_state(value),
             Self::Written(_) | Self::Done => Ok(()),
             Self::DaemonInfo(value) => {
                 for text in [
@@ -698,5 +727,223 @@ mod tests {
         ] {
             assert!(json.get(key).is_some(), "missing {key}");
         }
+    }
+
+    fn sections_fixture() -> SectionsState {
+        use fl_model::SectionId;
+        use fl_model::sections::{Section, SectionKind, SectionMembership};
+        let section = Section {
+            id: SectionId::from_bytes([1; 16]),
+            workspace: WorkspaceId::from_bytes([2; 16]),
+            name: "In progress".into(),
+            order: 3,
+            priority: 10,
+            kind: SectionKind::Manual,
+        };
+        SectionsState {
+            rev: 17,
+            memberships: vec![SectionMembership {
+                worktree: WorktreeId::from_bytes([3; 16]),
+                manual: Some(section.id),
+                pinned: true,
+            }],
+            sections: vec![section],
+        }
+    }
+
+    #[test]
+    fn sections_requests_snapshots_and_events_roundtrip() {
+        use fl_model::sections::{SectionFilter, SectionKind};
+        let state = sections_fixture();
+        let section = state.sections[0].clone();
+        let worktree = state.memberships[0].worktree;
+        let mut filter = section.clone();
+        filter.kind = SectionKind::Filter(SectionFilter {
+            branch_glob: Some("feature/?*".into()),
+            ..Default::default()
+        });
+        let mutations = [
+            SectionMutation::Upsert(section.clone()),
+            SectionMutation::Upsert(filter),
+            SectionMutation::Delete(section.id),
+            SectionMutation::Assign {
+                worktree,
+                section: Some(section.id),
+            },
+            SectionMutation::Assign {
+                worktree,
+                section: None,
+            },
+            SectionMutation::Pin {
+                worktree,
+                pinned: true,
+            },
+            SectionMutation::Pin {
+                worktree,
+                pinned: false,
+            },
+        ];
+        let list = ClientMsg::Rpc {
+            id: 1,
+            req: Request::ListSections,
+        };
+        assert_eq!(
+            ClientMsg::from_frame(&list.to_frame().unwrap()).unwrap(),
+            list
+        );
+        for mutation in mutations {
+            let request = ClientMsg::Rpc {
+                id: 2,
+                req: Request::MutateSections {
+                    expected_rev: state.rev,
+                    mutation,
+                },
+            };
+            assert_eq!(
+                ClientMsg::from_frame(&request.to_frame().unwrap()).unwrap(),
+                request,
+            );
+        }
+        for message in [
+            ServerMsg::RpcResult {
+                id: 2,
+                result: Ok(Response::SectionsState(state.clone())),
+            },
+            ServerMsg::Event(DaemonEvent::SectionsChanged(state)),
+        ] {
+            assert_eq!(
+                ServerMsg::from_frame(&message.to_frame().unwrap()).unwrap(),
+                message,
+            );
+        }
+        // New variants must not disturb the pre-sections protocol indices.
+        assert_eq!(
+            postcard::to_stdvec(&Request::GetWorkspaceTree).unwrap(),
+            vec![7]
+        );
+        assert_eq!(postcard::to_stdvec(&Response::Done).unwrap(), vec![16]);
+    }
+
+    fn reject_section_request(section: fl_model::sections::Section) {
+        let message = ClientMsg::Rpc {
+            id: 1,
+            req: Request::MutateSections {
+                expected_rev: 0,
+                mutation: SectionMutation::Upsert(section),
+            },
+        };
+        assert!(matches!(message.to_frame(), Err(MsgError::Validation(_))));
+        let frame = Frame {
+            kind: KIND_CLIENT,
+            payload: Bytes::from(postcard::to_stdvec(&message).unwrap()),
+        };
+        assert!(matches!(
+            ClientMsg::from_frame(&frame),
+            Err(MsgError::Validation(_))
+        ));
+    }
+
+    fn reject_sections_snapshot(state: SectionsState) {
+        for message in [
+            ServerMsg::RpcResult {
+                id: 1,
+                result: Ok(Response::SectionsState(state.clone())),
+            },
+            ServerMsg::Event(DaemonEvent::SectionsChanged(state)),
+        ] {
+            assert!(matches!(message.to_frame(), Err(MsgError::Validation(_))));
+            let frame = Frame {
+                kind: KIND_SERVER,
+                payload: Bytes::from(postcard::to_stdvec(&message).unwrap()),
+            };
+            assert!(matches!(
+                ServerMsg::from_frame(&frame),
+                Err(MsgError::Validation(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn section_names_and_filters_are_bounded_at_both_wire_boundaries() {
+        use fl_model::sections::{MAX_BRANCH_GLOB, MAX_SECTION_NAME, SectionFilter, SectionKind};
+        for name in [
+            "".into(),
+            "   ".into(),
+            "bad\nname".into(),
+            "x".repeat(MAX_SECTION_NAME + 1),
+        ] {
+            let mut section = sections_fixture().sections.remove(0);
+            section.name = name;
+            reject_section_request(section.clone());
+            reject_sections_snapshot(SectionsState {
+                sections: vec![section],
+                ..Default::default()
+            });
+        }
+        for glob in [
+            "".into(),
+            "bad\0glob".into(),
+            "*".repeat(MAX_BRANCH_GLOB + 1),
+        ] {
+            let mut section = sections_fixture().sections.remove(0);
+            section.kind = SectionKind::Filter(SectionFilter {
+                branch_glob: Some(glob),
+                ..Default::default()
+            });
+            reject_section_request(section.clone());
+            reject_sections_snapshot(SectionsState {
+                sections: vec![section],
+                ..Default::default()
+            });
+        }
+        let mut section = sections_fixture().sections.remove(0);
+        section.name = "x".repeat(MAX_SECTION_NAME);
+        section.kind = SectionKind::Filter(SectionFilter {
+            branch_glob: Some("*".repeat(MAX_BRANCH_GLOB)),
+            ..Default::default()
+        });
+        assert!(
+            Request::MutateSections {
+                expected_rev: u64::MAX,
+                mutation: SectionMutation::Upsert(section),
+            }
+            .validate()
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn sections_snapshots_bound_identity_counts_and_enforce_model_integrity() {
+        use fl_model::sections::{MAX_MEMBERSHIPS, MAX_SECTIONS};
+        let fixture = sections_fixture();
+        let mut state = fixture.clone();
+        state.sections = vec![state.sections[0].clone(); MAX_SECTIONS + 1];
+        assert!(matches!(
+            validation::sections_state(&state),
+            Err(ValidationError::Limit {
+                field: "sections",
+                ..
+            }),
+        ));
+        reject_sections_snapshot(state);
+        let mut state = fixture.clone();
+        state.memberships = vec![state.memberships[0].clone(); MAX_MEMBERSHIPS + 1];
+        assert!(matches!(
+            validation::sections_state(&state),
+            Err(ValidationError::Limit {
+                field: "section memberships",
+                ..
+            }),
+        ));
+        reject_sections_snapshot(state);
+        let mut state = fixture.clone();
+        state.sections.push(state.sections[0].clone());
+        reject_sections_snapshot(state);
+        let mut state = fixture.clone();
+        state.memberships.push(state.memberships[0].clone());
+        reject_sections_snapshot(state);
+        let mut state = fixture;
+        state.sections.clear();
+        reject_sections_snapshot(state);
     }
 }

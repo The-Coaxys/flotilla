@@ -31,6 +31,9 @@ use gpui::{
 use super::git_actions::{self, GitAction};
 use super::host_view::{primary_button, secondary_button};
 
+#[path = "host_sections.rs"]
+mod sections;
+
 /// Largest file the editor opens (the daemon's read limit).
 const READ_LIMIT: u32 = 8 * 1024 * 1024;
 
@@ -141,6 +144,7 @@ pub struct HostWorkspace {
     script_views: HashMap<(WorktreeId, String), Entity<TerminalView>>,
     dialog: Option<Dialog>,
     review: review::ReviewUi,
+    sections_ui: sections::SectionsUi,
     banner: Option<SharedString>,
     rtt: Option<Duration>,
     /// A just-added project whose primary checkout opens once the daemon's
@@ -271,6 +275,7 @@ impl HostWorkspace {
             script_views: HashMap::new(),
             dialog: None,
             review: review::ReviewUi::default(),
+            sections_ui: sections::SectionsUi::default(),
             banner: None,
             rtt: None,
             pending_select: None,
@@ -811,14 +816,25 @@ impl HostWorkspace {
                 Ok(diff) => {
                     let diff_view = cx.new(|cx| DiffView::new(&diff, DiffLayout::Unified, cx));
                     let review_path = change.path.clone();
-                    let review_events = cx.subscribe(&diff_view, move |view, _, event: &flc_editor::diff_view::DiffEvent, cx| {
-                        let flc_editor::diff_view::DiffEvent::LinesSelected { lines, .. } = event;
-                        view.compose_review(fl_model::review::ReviewAnchor {
-                            worktree,
-                            path: review_path.clone(),
-                            lines: Some(fl_model::review::LineRange { start: lines.start as u32 + 1, end: lines.end as u32 + 1 }),
-                        }, None, cx);
-                    });
+                    let review_events = cx.subscribe(
+                        &diff_view,
+                        move |view, _, event: &flc_editor::diff_view::DiffEvent, cx| {
+                            let flc_editor::diff_view::DiffEvent::LinesSelected { lines, .. } =
+                                event;
+                            view.compose_review(
+                                fl_model::review::ReviewAnchor {
+                                    worktree,
+                                    path: review_path.clone(),
+                                    lines: Some(fl_model::review::LineRange {
+                                        start: lines.start as u32 + 1,
+                                        end: lines.end as u32 + 1,
+                                    }),
+                                },
+                                None,
+                                cx,
+                            );
+                        },
+                    );
                     let documents = view.documents.entry(scope).or_default();
                     documents.open.push(Document {
                         path,
@@ -931,6 +947,10 @@ impl HostWorkspace {
     // ---- dialogs ---------------------------------------------------------------
 
     pub fn open_add_project(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.sections_ui.busy {
+            return;
+        }
+        self.sections_ui.close();
         let path = cx.new(|cx| TextInput::new(cx, "/path/on/the/server"));
         let url = cx.new(|cx| TextInput::new(cx, "https://github.com/owner/repo.git"));
         let home = self.home_dir.clone();
@@ -1081,6 +1101,10 @@ impl HostWorkspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.sections_ui.busy {
+            return;
+        }
+        self.sections_ui.close();
         let branch = cx.new(|cx| TextInput::new(cx, "Branch (empty for a temporary name)"));
         let events = cx.subscribe_in(
             &branch,
@@ -1141,6 +1165,10 @@ impl HostWorkspace {
     }
 
     fn open_delete(&mut self, worktree: WorktreeId, cx: &mut Context<Self>) {
+        if self.sections_ui.busy {
+            return;
+        }
+        self.sections_ui.close();
         let label = self
             .state
             .worktree(worktree)
@@ -1192,6 +1220,10 @@ impl HostWorkspace {
     }
 
     fn close_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.sections_ui.busy {
+            return;
+        }
+        self.sections_ui.close();
         self.dialog = None;
         window.focus(&self.focus);
         cx.notify();
@@ -1232,72 +1264,7 @@ impl HostWorkspace {
                 )
                 .into_any_element();
         };
-        let mut projects = tree.projects.clone();
-        projects.sort_by_key(|p| p.order);
-        for project in projects {
-            let project_id = project.id;
-            let letter: String = project
-                .name
-                .chars()
-                .next()
-                .map(|c| c.to_uppercase().collect())
-                .unwrap_or_default();
-            let hover = t.raised_hover;
-            let mut header = div()
-                .id(SharedString::from(format!("project-{project_id}")))
-                .mt(px(6.))
-                .h(px(28.))
-                .px(px(8.))
-                .flex()
-                .items_center()
-                .gap(px(8.))
-                .rounded(t.radius_sm)
-                .child(
-                    div()
-                        .size(px(18.))
-                        .rounded(px(4.))
-                        .bg(t.control_bg)
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .text_size(px(11.))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .child(SharedString::from(letter)),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w(px(0.))
-                        .truncate()
-                        .font_weight(FontWeight::MEDIUM)
-                        .child(project.name.clone()),
-                );
-            if project.kind == ProjectKind::Git {
-                header = header.child(
-                    div()
-                        .id(SharedString::from(format!("new-worktree-{project_id}")))
-                        .px(px(6.))
-                        .rounded(t.radius_sm)
-                        .text_color(t.text_secondary)
-                        .cursor_pointer()
-                        .hover(move |s| s.bg(hover))
-                        .child("+")
-                        .on_click(cx.listener(move |view, _, window, cx| {
-                            view.open_create_worktree(project_id, window, cx)
-                        })),
-                );
-            }
-            column = column.child(header);
-            let mut worktrees: Vec<&Worktree> = tree
-                .worktrees
-                .iter()
-                .filter(|w| w.project == project_id)
-                .collect();
-            worktrees.sort_by_key(|w| (!w.is_primary, w.label.clone()));
-            for worktree in worktrees {
-                column = column.child(self.worktree_row(worktree, &state, &t, cx));
-            }
-        }
+        column = column.child(self.sections_sidebar(tree, &state, &t, cx));
         let hover = t.raised_hover;
         column
             .child(
@@ -1406,6 +1373,7 @@ impl HostWorkspace {
                 d.child(div().size(px(6.)).rounded_full().bg(t.warning))
             })
             .when(primary, |d| d.child(div().text_color(t.warning).child("★")))
+            .child(self.organize_worktree_button(id, state, t, cx))
             .when(!primary, |d| {
                 d.child(
                     div()
@@ -1690,7 +1658,12 @@ impl HostWorkspace {
                     cx,
                 ))
             })
-            .child(segment("Review".into(), Panel::Review, self.panel == Panel::Review, cx));
+            .child(segment(
+                "Review".into(),
+                Panel::Review,
+                self.panel == Panel::Review,
+                cx,
+            ));
         let body: AnyElement = match self.panel {
             Panel::Files => self
                 .render_file_tree(&worktree.path, &t, cx)
@@ -2188,6 +2161,9 @@ impl HostWorkspace {
     }
 
     fn render_dialog(&self, t: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if let Some(dialog) = self.render_sections_dialog(t, cx) {
+            return Some(dialog);
+        }
         let dialog = self.dialog.as_ref()?;
         let card = div()
             .w(px(520.))

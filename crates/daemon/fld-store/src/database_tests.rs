@@ -1065,7 +1065,7 @@ fn version_two(root: &Path) -> (Layout, Vec<TerminalEntry>) {
     let connection = Connection::open(root.join("state.db")).unwrap();
     connection
         .execute_batch(
-            "DROP TABLE scripts; DROP TABLE worktree_layouts; DROP TABLE worktrees; \
+            "DROP TABLE reviews; DROP TABLE sections; DROP TABLE scripts; DROP TABLE worktree_layouts; DROP TABLE worktrees; \
              DROP TABLE projects; DROP TABLE workspaces; DROP TABLE workspace_meta; \
              PRAGMA user_version=2;",
         )
@@ -1074,11 +1074,14 @@ fn version_two(root: &Path) -> (Layout, Vec<TerminalEntry>) {
 }
 
 #[test]
-fn v2_to_v3_migration_keeps_the_home_layout_and_terminals_and_backs_up_v2() {
+fn v2_migration_keeps_the_home_layout_and_terminals_and_backs_up_v2() {
     let temporary = TempDir::new().unwrap();
     let (layout, terminals) = version_two(temporary.path());
     let database = Database::open(temporary.path()).unwrap();
-    assert_eq!(schema_version(&database.connection).unwrap(), 3);
+    assert_eq!(
+        schema_version(&database.connection).unwrap(),
+        SCHEMA_VERSION
+    );
     assert_eq!(database.default_layout().unwrap(), layout);
     assert_eq!(
         postcard::to_stdvec(&database.list_terminals().unwrap()).unwrap(),
@@ -1097,7 +1100,7 @@ fn v2_to_v3_migration_keeps_the_home_layout_and_terminals_and_backs_up_v2() {
             .file_name()
             .unwrap()
             .to_string_lossy()
-            .starts_with("state.db.before-v2-to-v3-")
+            .starts_with(&format!("state.db.before-v2-to-v{SCHEMA_VERSION}-"))
     );
     let backup = Connection::open_with_flags(&files[0], OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
     assert_eq!(schema_version(&backup).unwrap(), 2);

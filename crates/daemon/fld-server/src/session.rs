@@ -160,9 +160,13 @@ async fn control(
         tokio::select! {
             _ = lease.cancel.cancelled() => return Ok(SessionEnd::Finished),
             Some(event) = next_event(&mut subscription) => {
-                // Forge events arrived with protocol 0.4.
-                let decodable = !matches!(event, fl_model::workspace::DaemonEvent::ForgeChanged(_)
-                    | fl_model::workspace::DaemonEvent::ReviewChanged { .. })
+                // Forge, review and section events arrived with protocol 0.4.
+                let decodable = !matches!(
+                    event,
+                    fl_model::workspace::DaemonEvent::ForgeChanged(_)
+                        | fl_model::workspace::DaemonEvent::ReviewChanged { .. }
+                        | fl_model::workspace::DaemonEvent::SectionsChanged(_)
+                )
                     || hello.proto.major > 0
                     || hello.proto.minor >= 4;
                 if decodable {
@@ -389,9 +393,33 @@ async fn handle_request(
             .merge_pull_request(worktree, number, method)
             .await
             .map(Response::ForgeState),
-        Request::ListReviews { worktree } => workspace.list_reviews(worktree).await.map(Response::Reviews),
-        Request::MutateReview { worktree, base_rev, mutation } => workspace.mutate_review(worktree, base_rev, mutation).await.map(Response::Reviews),
-        Request::PendingReviewBundle { worktree } => workspace.pending_review_bundle(worktree).await.map(Response::ReviewBundle),
+        Request::ListReviews { worktree } => workspace
+            .list_reviews(worktree)
+            .await
+            .map(Response::Reviews),
+        Request::MutateReview {
+            worktree,
+            base_rev,
+            mutation,
+        } => workspace
+            .mutate_review(worktree, base_rev, mutation)
+            .await
+            .map(Response::Reviews),
+        Request::PendingReviewBundle { worktree } => workspace
+            .pending_review_bundle(worktree)
+            .await
+            .map(Response::ReviewBundle),
+        Request::ListSections => workspace
+            .sections_state()
+            .await
+            .map(Response::SectionsState),
+        Request::MutateSections {
+            expected_rev,
+            mutation,
+        } => workspace
+            .mutate_sections(expected_rev, mutation)
+            .await
+            .map(Response::SectionsState),
     }
 }
 

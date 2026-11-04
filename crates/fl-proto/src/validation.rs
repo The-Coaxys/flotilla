@@ -221,7 +221,9 @@ pub fn daemon_event(value: &fl_model::workspace::DaemonEvent) -> Result<(), Vali
         DaemonEvent::WorktreeStatus(status) => worktree_status(status),
         DaemonEvent::ScriptChanged(state) => script_kind(&state.kind),
         DaemonEvent::ForgeChanged(state) => forge_state(state),
-        DaemonEvent::WorkspaceTreeChanged { .. } | DaemonEvent::LayoutChanged { .. }
+        DaemonEvent::SectionsChanged(state) => sections_state(state),
+        DaemonEvent::WorkspaceTreeChanged { .. }
+        | DaemonEvent::LayoutChanged { .. }
         | DaemonEvent::ReviewChanged { .. } => Ok(()),
     }
 }
@@ -247,6 +249,31 @@ pub fn forge_state(value: &fl_model::forge::ForgeState) -> Result<(), Validation
         }
     }
     Ok(())
+}
+
+pub fn section_mutation(
+    value: &fl_model::sections::SectionMutation,
+) -> Result<(), ValidationError> {
+    match value {
+        fl_model::sections::SectionMutation::Upsert(section) => {
+            section.validate().map_err(ValidationError::Invalid)
+        }
+        // Typed identities have a fixed 16-byte representation.
+        fl_model::sections::SectionMutation::Delete(_)
+        | fl_model::sections::SectionMutation::Assign { .. }
+        | fl_model::sections::SectionMutation::Pin { .. } => Ok(()),
+    }
+}
+
+pub fn sections_state(value: &fl_model::sections::SectionsState) -> Result<(), ValidationError> {
+    use fl_model::sections::{MAX_MEMBERSHIPS, MAX_SECTIONS};
+    bound("sections", value.sections.len(), MAX_SECTIONS)?;
+    bound(
+        "section memberships",
+        value.memberships.len(),
+        MAX_MEMBERSHIPS,
+    )?;
+    value.validate().map_err(ValidationError::Invalid)
 }
 
 #[cfg(test)]
