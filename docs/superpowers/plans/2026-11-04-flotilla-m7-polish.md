@@ -59,4 +59,41 @@ release, auto-update, and the performance HUD reporting real numbers.
 
 ## Evidence
 
-Not started.
+### Slice: native command palette, empty-view launcher, hover cards
+
+Native client only (`crates/client/flotilla`). Every source is a mirror the client already
+holds; no new wire calls.
+
+- Palette overlay (`app/palette.rs` model + `app/host_workspace/host_palette.rs` UI): Global,
+  Commands, Files, Worktrees, Tabs and Conversations. Ctrl+Shift+K (spec §8.3) and
+  Ctrl+Shift+P open Global, Ctrl+Shift+O opens Files; inside, Ctrl+1…6 and Tab/Shift+Tab
+  switch modes, ↑/↓ move, Enter runs, Esc closes, and typing re-ranks with a pure fuzzy
+  scorer (prefix/word-start/contiguous bonuses, stable ties). Files is sourced from cached
+  directory listings only and says so in the footer; Conversations lists the mirror's
+  sessions and selects their worktree before opening.
+- Actions reuse existing model methods: add project, create worktree, new terminal and close
+  tab (daemon `LayoutOp`s), panel toggles, scope selection, open file/document, open chat,
+  select terminal tab, run setup/run/teardown scripts and the adaptive Git action.
+- Empty-view launcher shows when the scope has no documents, no chat tab and no terminal
+  tabs: four tool cards and a Recent list merged from worktree `last_active_ms` and session
+  `updated_ms` (bounded, stable on ties).
+- Hover cards for project, worktree and session rows after a 400 ms hover delay (single
+  timer, no polling), rendered at window level: path, branch, target, dirty/ahead/behind,
+  lines, kind; provider, status, seq, permission mode, model for conversations.
+- Also installs `flc_ui::input::bind_keys`, which existed but was never registered, so
+  text-input editing keys (backspace/delete/enter/escape) now work in every dialog and in
+  the palette.
+- Tests: fuzzy ranking, mode order/chords/next/prev, Recent ordering and tie stability,
+  hover field formatting and line bound, launcher card routes. 65 bin tests pass; clippy
+  `-D warnings` and `cargo fmt --check` are clean.
+- Live X11 run under Xvfb against the `flsmoke` daemon: palette (Global 24 rows, Files with
+  the cached-directory note, Worktrees filtered by "fea"), "Open Chat panel" run from
+  Commands, feature-z hover card, launcher after closing the scope's only tab, and New
+  terminal from a launcher card. Screenshots: `m7-02-palette-global.png`,
+  `m7-05-files-panel.png`, `m7-06-palette-files.png`, `m7-07-palette-worktrees.png`,
+  `m7-08-command-typed.png`, `m7-09-command-run.png`, `m7-13-close-tab-command.png`,
+  `m7-15-hover-card.png`, `m7-16-launcher.png`, `m7-17-launcher-new-terminal.png` in
+  `/srv/super-eng/.shots`.
+- Not covered by this slice: theme editor, PiP, browser tabs, Shared Context, custom command
+  CRUD, performance HUD, keymap editor. Ctrl+Shift+P currently opens the palette; it is the
+  documented PiP key and should move when PiP lands.

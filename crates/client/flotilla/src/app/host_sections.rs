@@ -312,8 +312,13 @@ impl HostWorkspace {
             .map(|c| c.to_uppercase().collect())
             .unwrap_or_default();
         let hover = t.raised_hover;
+        let card = super::host_hover::watch(
+            cx.entity().downgrade(),
+            super::host_hover::Target::Project(id),
+        );
         div()
             .id(SharedString::from(format!("project-{id}-{suffix}")))
+            .on_hover(card)
             .mt(px(6.))
             .h(px(28.))
             .px(px(8.))

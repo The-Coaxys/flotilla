@@ -230,6 +230,22 @@ impl ChatUi {
         self.active = None;
     }
 
+    /// Every conversation the mirror holds, newest first.
+    pub(super) fn conversations(&self) -> Vec<ChatSession> {
+        let mut sessions: Vec<_> = self.state.sessions.values().cloned().collect();
+        sessions.sort_by_key(|session| (std::cmp::Reverse(session.updated_ms), session.id));
+        sessions
+    }
+
+    /// Chat tabs currently open in the center strip.
+    pub(super) fn open_tabs(&self) -> Vec<Uuid> {
+        self.tabs.clone()
+    }
+
+    pub(super) fn session(&self, id: Uuid) -> Option<&ChatSession> {
+        self.state.session(id)
+    }
+
     fn tabs_for(&self, scope: LayoutScope) -> Vec<Uuid> {
         let LayoutScope::Worktree(worktree) = scope else {
             return Vec::new();
@@ -2426,6 +2442,10 @@ impl HostWorkspace {
         };
         let row = div()
             .id(SharedString::from(format!("chat-session-{id}")))
+            .on_hover(super::host_hover::watch(
+                cx.entity().downgrade(),
+                super::host_hover::Target::Session(id),
+            ))
             .flex()
             .flex_col()
             .gap(px(2.))
