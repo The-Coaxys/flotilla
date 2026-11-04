@@ -48,6 +48,54 @@ for the SSH transport and on UDP 7443 for QUIC. The client races QUIC and SSH
 and keeps whichever connects first; on an SSH link it re-probes QUIC every
 30 seconds and moves over when UDP gets through.
 
+## What M4 delivers
+
+- **A native chat surface, not a terminal wrapper.** Markdown, code blocks,
+  thinking, tool calls, file edits, approvals, questions, subagent children and
+  turn metadata, each as its own row, rendered from the daemon's durable event
+  stream and searchable read-only.
+- **Send, steer, stop.** Enter sends to an idle session and steers a live turn,
+  Shift+Enter adds a line, and Stop is an explicit RPC. A failed or closed turn
+  stays visible until the next message.
+- **Approvals and questions are cards, not prompts.** The provider's offered
+  decisions become buttons; duplicates in flight are blocked, and resolution
+  comes from durable `RequestResolved` events, so a reconnect or redraw can
+  never answer on your behalf.
+- **Inbox and in-app notifications.** Session lists, unread inbox items and
+  toasts (plus an inbox panel) are derived from the live event stream; opening
+  an item navigates to the exact session and the daemon's records, not UI
+  memory.
+- **Provider setup on the spot.** Discovery reports version and capabilities
+  per provider; model, thinking and permission mode are chosen before the
+  session starts and are stored with it.
+
+## What M5 delivers
+
+- **More providers behind one model.** Claude Code (`stream-json`), Codex
+  (`app-server`), Cursor (`cursor-agent`), Pi and Oh My Pi (`--mode rpc`) are
+  built in, and any ACP v1 agent (OpenCode, Hermes, ...) can be configured with
+  a command and arguments.
+- **Honest discovery.** Each provider is probed for its version, help text and
+  handshake; a missing or unsupported CLI becomes an unavailable reason, never
+  a fake capability. Capabilities (resume, steer, approvals, questions,
+  partial messages) are per provider.
+- **Same guarantees everywhere.** Every adapter is bounded in line and text
+  size, validates resume targets, never auto-approves, refuses read-only mode
+  where the CLI cannot enforce it, and finalizes the turn on child death or
+  protocol errors.
+
+## What M6 delivers
+
+- **`fl`, a scriptable client for the same daemon.** Status, workspaces,
+  sections, worktree state and checks, review threads, project scripts, tabs,
+  layouts, chats, history and agents, all with `--json` and daemon error codes
+  as exit statuses.
+- **Roots in your shell.** Caller resolution uses `FLOTILLA_SESSION_ID` and the
+  canonical cwd; `--worktree` accepts an id, a label or a path. Mutating
+  commands prove the durable effect rather than the printed line.
+- **Refusals instead of guesses.** Terminal-only agent delivery, queued chat
+  while a turn is live, and unknown targets fail with the daemon's reason.
+
 ## What M3 delivers
 
 - **The whole review loop from the bottom bar.** Commit (dialog or all

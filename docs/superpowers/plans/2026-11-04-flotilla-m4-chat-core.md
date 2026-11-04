@@ -113,8 +113,26 @@ cargo test -p flc-sync
 cargo clippy -p fl-model -p fl-proto -p fld-store -p fld-agent -p fld-server -p fld-git -p flc-sync --all-targets -- -D warnings
 ```
 
-Not exercised, and therefore not claimed: a live Claude/Codex turn, a live approval or
-question round-trip, native chat rendering, Windows toast activation, and a real routed
-dispatch against an installed provider. The daemon chat service and routed dispatch have no
-fake-CLI integration fixture yet; their provider interaction is compiled and unit-tested at
-the store/protocol/mirror layer but not proven against a running model.
+## Native UI evidence (X11, this host)
+
+The client was run under Xvfb against the daemon in `flsmoke`'s home, with a scripted
+`claude` stub (stream-json frames and a `can_use_tool` request). Screenshots:
+`m4-setup.png`, `m4-chat.png`, `m4-approval.png`, `m4-approved.png`.
+
+- Worktree `demo/main` -> center `Chat` tab renders the session setup: provider discovery
+  reports the stub's version (`2.1.316`), provider, model, thinking, permission mode, and
+  `Start chat`.
+- Sending `hello from e2e` appends the user bubble, streams the assistant reply, and shows
+  turn metadata (`0.0s · completed · stub-model · in 12 · out 5 · $0.001`); an in-app
+  `Turn completed` toast appears with `Open chat`.
+- Sending `PERMIT` surfaces the approval card (`Approval · Bash`, raw input, `Allow once`,
+  `Deny`, `Cancel`); the footer explains that the composer waits. `Allow once` resolves the
+  card (`resolved`), the stub continues (`Approved, running the command.`), the session
+  returns to `idle`, and the transcript shows `seq 22`.
+- The right panel `Chat` tab lists the durable session, its status/seq and the inbox badge;
+  opening the session from the list restores the same transcript after a client restart.
+
+Not exercised, and therefore not claimed: a real Claude/Codex CLI turn, a real question card
+against a live provider, Windows toast activation (in-app toasts only), and a real routed
+dispatch against an installed provider. The stub proves the daemon <-> client <-> UI path,
+not model behaviour.

@@ -84,3 +84,14 @@ Cursor headless has no client response channel for permission queries, so its ap
 questions capabilities are false and queries are surfaced as diagnostics instead of being
 auto-approved. Pi/OMP read-only mode is rejected explicitly because their built-in tools
 execute without a client permission prompt.
+
+## Integration evidence
+
+- `cargo test -p fld-agent` passes (34 lib + 11 lifecycle tests), including malformed frames,
+  child death, read-only denial, resume mismatch/capability rejection and permission replay.
+- Provider discovery in the native client lists a real codex-cli 0.150.1 alongside the
+  scripted `claude` stub, using the same discovery path the adapters ship with.
+- `ProviderRegistry` built-ins map the `cursor` provider to the real `cursor-agent` binary
+  (the pre-integration code launched `cursor`); a live `cursor-agent create-chat`/help probe
+  was recorded by the adapter slice.
+

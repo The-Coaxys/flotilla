@@ -64,4 +64,32 @@ Exit criterion: a lead agent runs a visible cross-provider team from a prompt.
 
 ## Evidence
 
-Not started.
+Slice 1 delivered (`fl` crate plus append-only protocol 0.4 additions and schema v8
+`cli_meta`): `fl status`, `workspace list|get|select`, `section list`, `worktree status|checks|
+diff-summary|review-*|rename-branch|set-label|set-target-branch`, `project scripts
+check|run|status|stop`, `tab title|split|split-view`, `layout views|set|close|compose`,
+`chat providers|list|new|send|events|cancel|close`, `history list|get`, and `agent
+send|read|interrupt|stop`. Every command supports `--json`; refusals exit non-zero with the
+daemon's reason.
+
+Verified against a live daemon on this host (as the daemon's user):
+
+- `fl status --json` resolves the caller, daemon identity and selected workspace.
+- `fl workspace list --json`, `chat list --worktree <id> --json`, `history list --json` and
+  `chat events <session> --json` read durable state.
+- `fl chat new claude`, `fl chat send --session <id>` and `fl chat events` completed a real
+  turn through the scripted provider (13 events, final `StateChanged(Idle)`).
+- `fl tab title`, `fl tab split`, `fl tab split-view`, `fl layout set <view> --ratio 3500`
+  changed the durable layout (rev 1 -> 6, ratio 3500 in the tree) and refused `--ratio 100`.
+- `fl worktree review-add --path src/main.rs --body ...` appended a review thread (rev 0 -> 1).
+
+Bug found by that run and fixed: `fl chat new` expected `Response::ChatSession` while the
+daemon replies `ChatSessions([session])`; the CLI now accepts the list reply (the same shape
+`flc-sync` reads).
+
+Deferred to the second M6 slice: `team run/report/status/list/cancel`, `instructions`,
+coordination state/locks, browser automation, `hook`, workspace/section/worktree CRUD beyond
+the listed commands, commands CRUD, script set/unset, the remaining `layout` operations
+(`capabilities/insert/move/save/apply/list/run`) and `agent wait/subscribe/should-stop` /
+`agents list|label|group`. Terminal-only agent delivery remains explicitly refused.
+
