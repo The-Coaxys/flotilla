@@ -352,19 +352,21 @@ fn team_cancel_marks_non_terminal_roles_and_a_missing_run_is_not_found() {
 }
 
 #[test]
-fn schema_nine_backs_up_v8_and_creates_the_new_tables() {
+fn schema_nine_backs_up_v9_and_creates_the_new_tables() {
     let (temporary, database, _worktree) = fixture();
     database
         .connection
         .execute_batch(
-            "DROP TABLE IF EXISTS coordination_state; DROP TABLE IF EXISTS coordination_locks; \
-             DROP TABLE IF EXISTS team_roles; DROP TABLE IF EXISTS team_runs; \
-             PRAGMA user_version=8;",
+            "DROP TABLE IF EXISTS worktree_groups; DROP TABLE IF EXISTS worktree_group_members; \
+             DROP TABLE IF EXISTS commands; PRAGMA user_version=9;",
         )
         .unwrap();
     drop(database);
     let mut database = Database::open(temporary.path()).unwrap();
-    assert_eq!(schema_version(&database.connection).unwrap(), 9);
+    assert_eq!(
+        schema_version(&database.connection).unwrap(),
+        SCHEMA_VERSION
+    );
     let backups: Vec<_> = std::fs::read_dir(temporary.path())
         .unwrap()
         .filter_map(|entry| entry.ok())
@@ -372,13 +374,13 @@ fn schema_nine_backs_up_v8_and_creates_the_new_tables() {
             entry
                 .file_name()
                 .to_string_lossy()
-                .starts_with("state.db.before-v8-to-v9-")
+                .starts_with("state.db.before-v9-to-v10-")
         })
         .collect();
-    assert_eq!(backups.len(), 1, "v9 migration must back up v8 once");
+    assert_eq!(backups.len(), 1, "v10 migration must back up v9 once");
     let backup =
         Connection::open_with_flags(backups[0].path(), OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
-    assert_eq!(schema_version(&backup).unwrap(), 8);
+    assert_eq!(schema_version(&backup).unwrap(), 9);
     let mode: String = backup
         .query_row("PRAGMA journal_mode", [], |row| row.get(0))
         .unwrap();
@@ -387,6 +389,8 @@ fn schema_nine_backs_up_v8_and_creates_the_new_tables() {
     database
         .coordination_set(CoordinationScope::Global, "k", "v", Some(0), 1)
         .unwrap();
+    assert_eq!(database.command_state().unwrap().rev, 0);
+    assert!(database.worktree_group(_worktree).unwrap().is_none());
     drop(database);
     assert_eq!(
         std::fs::read_dir(temporary.path())
@@ -396,10 +400,10 @@ fn schema_nine_backs_up_v8_and_creates_the_new_tables() {
                 entry
                     .file_name()
                     .to_string_lossy()
-                    .starts_with("state.db.before-v8-to-v9-")
+                    .starts_with("state.db.before-v9-to-v10-")
             })
             .count(),
         1,
-        "reopening at v9 does not migrate or back up again"
+        "reopening at v10 does not migrate or back up again"
     );
 }

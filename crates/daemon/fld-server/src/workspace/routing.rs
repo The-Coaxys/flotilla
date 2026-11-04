@@ -8,6 +8,7 @@
 use super::{WorkspaceService, blocking, invalid, now_ms, rpc};
 use fl_model::WorktreeId;
 use fl_model::chat::{ChatEvent, ChatSession, PermissionMode, SessionState, TurnOutcome};
+use fl_model::command::{CommandMutation, CommandState};
 use fl_model::routing::{
     DispatchMode, GitTask, RouteSpec, RoutingMutation, RoutingState, TaskDispatch,
     TaskDispatchState, TemplateContext, render_template,
@@ -171,6 +172,20 @@ impl WorkspaceService {
         if prompt.trim().is_empty() {
             return Err(invalid("the routed prompt is empty"));
         }
+        self.dispatch_prepared(id, task, mode, route, worktree.path.clone(), prompt)
+            .await
+    }
+
+    /// Run one already-rendered prompt through the routed dispatch modes.
+    async fn dispatch_prepared(
+        self: &std::sync::Arc<Self>,
+        id: WorktreeId,
+        task: GitTask,
+        mode: DispatchMode,
+        route: RouteSpec,
+        worktree_path: String,
+        prompt: String,
+    ) -> Result<TaskDispatch, RpcError> {
         let mut dispatch = TaskDispatch {
             id: fl_model::TaskRunId::new(),
             worktree: id,
@@ -191,7 +206,7 @@ impl WorkspaceService {
         }
         if ChatService::is_structured(task) {
             self.remember_dispatch(dispatch.clone());
-            self.spawn_structured_dispatch(dispatch.clone(), route, worktree.path.clone(), prompt);
+            self.spawn_structured_dispatch(dispatch.clone(), route, worktree_path, prompt);
             return Ok(dispatch);
         }
         // Interactive task: a real provider session, reused only when it is
@@ -238,6 +253,95 @@ impl WorkspaceService {
                 Ok(dispatch)
             }
         }
+    }
+
+    /// Render a stored custom command and dispatch it through the route for
+    /// custom commands. The command's own body is the prompt.
+    pub(crate) async fn dispatch_command(
+        self: &std::sync::Arc<Self>,
+        id: WorktreeId,
+        name: String,
+        mode: Option<DispatchMode>,
+        alternate: bool,
+        context: String,
+    ) -> Result<TaskDispatch, RpcError> {
+        let (worktree, project) = self.worktree(id).await?;
+        if project.kind != fl_model::workspace::ProjectKind::Git {
+            return Err(invalid("a plain folder has no routed commands"));
+        }
+        let commands = self.command_state().await?;
+        let command = commands
+            .resolve(&name, project.id, project.workspace)
+            .ok_or_else(|| {
+                rpc(
+                    RpcErrorCode::NotFound,
+                    format!(
+                        "command `{name}` is not defined for project {}",
+                        project.name
+                    ),
+                )
+            })?
+            .clone();
+        let routing = self.routing_state().await?;
+        let Some(route) = routing.route(GitTask::Command, project.id, project.workspace) else {
+            return Err(rpc(
+                RpcErrorCode::Unsupported,
+                format!(
+                    "no route for custom commands; configure one for the {:?} group",
+                    GitTask::Command.group()
+                ),
+            ));
+        };
+        let mode = mode.unwrap_or_else(|| route.mode(alternate));
+        let base = worktree.target.clone().or(project.default_branch.clone());
+        let diff_root = std::path::PathBuf::from(&worktree.path);
+        let diff = tokio::task::spawn_blocking(move || {
+            fld_git::cmd::run(&diff_root, &["diff", "--stat", "HEAD"])
+                .ok()
+                .map(|bytes| String::from_utf8_lossy(&bytes).trim().to_owned())
+                .filter(|text| !text.is_empty())
+        })
+        .await
+        .ok()
+        .flatten();
+        let template_context = TemplateContext {
+            branch: worktree.branch.clone(),
+            base,
+            diff,
+            checks: None,
+            reviews: None,
+            task: Some(context).filter(|text| !text.trim().is_empty()),
+        };
+        let prompt = bounded_with_marker(
+            &fl_model::command::render_command(&command, &template_context),
+            MAX_PROMPT_BYTES,
+        );
+        if prompt.trim().is_empty() {
+            return Err(invalid("the rendered command prompt is empty"));
+        }
+        self.dispatch_prepared(
+            id,
+            GitTask::Command,
+            mode,
+            route,
+            worktree.path.clone(),
+            prompt,
+        )
+        .await
+    }
+
+    pub(crate) async fn command_state(&self) -> Result<CommandState, RpcError> {
+        self.store(|store| store.database.command_state()).await
+    }
+
+    /// Compare-and-set a command edit; a stale revision is a conflict.
+    pub(crate) async fn mutate_commands(
+        &self,
+        expected_rev: u64,
+        mutation: CommandMutation,
+    ) -> Result<CommandState, RpcError> {
+        self.store(move |store| store.database.mutate_commands(expected_rev, mutation))
+            .await
     }
 
     fn remember_dispatch(&self, dispatch: TaskDispatch) {

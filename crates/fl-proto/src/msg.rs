@@ -444,6 +444,38 @@ pub enum Request {
         session: uuid::Uuid,
         event: fl_model::coordination::HookEvent,
     },
+    // --- M7 slice: Shared Context, custom commands and prompt templates ---
+    /// Custom commands at every scope, with their revision.
+    ListCommands,
+    /// Create, update or delete one custom command (compare-and-set).
+    MutateCommand {
+        expected_rev: u64,
+        mutation: fl_model::command::CommandMutation,
+    },
+    /// Render a stored command through the routed prompt pipeline and, for
+    /// submit modes, run it.
+    DispatchCommand {
+        worktree: WorktreeId,
+        name: String,
+        /// Overrides the configured click / alternate-click mode.
+        mode: Option<fl_model::routing::DispatchMode>,
+        alternate: bool,
+        /// Extra user context appended through `{{task}}`.
+        context: String,
+    },
+    /// Lazy child creation for a branch group: registers `worktree` as the
+    /// group root when needed and materializes the shared context.
+    EnsureWorktreeChild {
+        worktree: WorktreeId,
+    },
+    /// The branch group `worktree` belongs to (root normalized).
+    GetWorktreeGroup {
+        worktree: WorktreeId,
+    },
+    /// The group's diff against its base, with a repository summary.
+    WorktreeGroupDiff {
+        worktree: WorktreeId,
+    },
 }
 
 /// See `ServerMsg`: wire enums stay unboxed so the bytes remain stable.
@@ -503,6 +535,11 @@ pub enum Response {
         session: uuid::Uuid,
         sequence: u64,
     },
+    // --- M7 slice ---
+    CommandState(fl_model::command::CommandState),
+    WorktreeChild(fl_model::group::WorktreeChild),
+    WorktreeGroup(fl_model::group::BranchGroup),
+    GroupDiff(fl_model::group::GroupDiff),
 }
 
 /// Returned on the authenticated control stream before requesting channels.
@@ -914,6 +951,24 @@ impl Request {
                 validation::non_nil("chat session", *session)?;
                 validation::hook_event(hook)
             }
+            // --- M7 slice ---
+            Self::ListCommands => Ok(()),
+            Self::MutateCommand { mutation, .. } => validation::command_mutation(mutation),
+            Self::DispatchCommand {
+                worktree,
+                name,
+                context,
+                ..
+            } => {
+                validation::non_nil_id("dispatch worktree", worktree.as_bytes())?;
+                validation::command_name(name)?;
+                text("dispatch context", context, validation::MAX_MESSAGE_BYTES)
+            }
+            Self::EnsureWorktreeChild { worktree }
+            | Self::GetWorktreeGroup { worktree }
+            | Self::WorktreeGroupDiff { worktree } => {
+                validation::non_nil_id("branch group worktree", worktree.as_bytes())
+            }
             _ => Ok(()),
         }
     }
@@ -1049,6 +1104,11 @@ impl Response {
             Self::TeamRun(value) => validation::team_run(value),
             Self::TeamRuns(values) => validation::team_runs(values),
             Self::HookRecorded { session, .. } => validation::non_nil("chat session", *session),
+            // --- M7 slice ---
+            Self::CommandState(state) => validation::command_state(state),
+            Self::WorktreeChild(child) => validation::worktree_child(child),
+            Self::WorktreeGroup(group) => validation::branch_group(group),
+            Self::GroupDiff(diff) => validation::group_diff(diff),
             Self::Written(_) | Self::Done => Ok(()),
             Self::DaemonInfo(value) => {
                 for text in [
@@ -2003,6 +2063,182 @@ mod tests {
             .validate()
             .is_err()
         );
+    }
+
+    #[test]
+    fn shared_context_and_commands_round_trip_and_validate() {
+        use fl_model::command::{CommandMutation, CommandState, CustomCommand};
+        use fl_model::group::{
+            BranchGroup, GroupChildDiff, GroupDiff, SharedContext, WorktreeChild,
+        };
+        use fl_model::routing::Scope;
+        use fl_model::workspace::{ChangeKind, FileChange, ProjectKind, Worktree};
+
+        let worktree = Worktree {
+            id: WorktreeId::from_bytes([1; 16]),
+            project: ProjectId::from_bytes([2; 16]),
+            path: "/srv/repo-worktrees/root".into(),
+            branch: Some("feature".into()),
+            target: Some("main".into()),
+            label: "feature".into(),
+            is_primary: false,
+            created_ms: 1,
+            last_active_ms: 2,
+        };
+        let command = CustomCommand {
+            scope: Scope::Global,
+            name: "deploy".into(),
+            description: Some("Ship it".into()),
+            body: "Ship {{branch}} to {{base}}".into(),
+        };
+        let state = CommandState {
+            rev: 3,
+            commands: vec![command.clone()],
+        };
+        let shared = SharedContext {
+            root: "/srv/repo-worktrees/root".into(),
+            present: vec!["FEATURE.md".into(), "context".into()],
+            missing: vec!["AGENTS.md".into()],
+        };
+        let group = BranchGroup {
+            root: worktree.id,
+            project: worktree.project,
+            label: "feature".into(),
+            base: Some("main".into()),
+            members: vec![worktree.id],
+        };
+        let child = WorktreeChild {
+            worktree: worktree.clone(),
+            created: false,
+            shared: shared.clone(),
+        };
+        let diff = GroupDiff {
+            group: group.clone(),
+            added: 2,
+            removed: 1,
+            changed_files: 1,
+            children: vec![GroupChildDiff {
+                worktree: worktree.id,
+                label: "feature".into(),
+                branch: Some("feature".into()),
+                is_root: true,
+                added: 2,
+                removed: 1,
+                dirty: true,
+                conflicted: false,
+                files: vec![FileChange {
+                    path: "FEATURE.md".into(),
+                    old_path: None,
+                    kind: ChangeKind::Modified,
+                    added: Some(2),
+                    removed: Some(1),
+                }],
+            }],
+            at_ms: 5,
+        };
+
+        let requests = [
+            Request::ListCommands,
+            Request::MutateCommand {
+                expected_rev: 3,
+                mutation: CommandMutation::Create(command.clone()),
+            },
+            Request::MutateCommand {
+                expected_rev: 3,
+                mutation: CommandMutation::Delete {
+                    scope: Scope::Global,
+                    name: "deploy".into(),
+                },
+            },
+            Request::DispatchCommand {
+                worktree: worktree.id,
+                name: "deploy".into(),
+                mode: Some(fl_model::routing::DispatchMode::NewPrepare),
+                alternate: false,
+                context: "a note".into(),
+            },
+            Request::EnsureWorktreeChild {
+                worktree: worktree.id,
+            },
+            Request::GetWorktreeGroup {
+                worktree: worktree.id,
+            },
+            Request::WorktreeGroupDiff {
+                worktree: worktree.id,
+            },
+        ];
+        for request in requests {
+            request.validate().unwrap();
+            let message = ClientMsg::Rpc {
+                id: 9,
+                req: request,
+            };
+            assert_eq!(
+                ClientMsg::from_frame(&message.to_frame().unwrap()).unwrap(),
+                message
+            );
+        }
+
+        let responses = [
+            Response::CommandState(state.clone()),
+            Response::WorktreeChild(child),
+            Response::WorktreeGroup(group),
+            Response::GroupDiff(diff),
+        ];
+        for response in responses {
+            response.validate().unwrap();
+            let message = ServerMsg::RpcResult {
+                id: 10,
+                result: Ok(response),
+            };
+            assert_eq!(
+                ServerMsg::from_frame(&message.to_frame().unwrap()).unwrap(),
+                message
+            );
+        }
+
+        // Invalid definitions and out-of-bounds names are refused.
+        assert!(
+            Request::MutateCommand {
+                expected_rev: 0,
+                mutation: CommandMutation::Create(CustomCommand {
+                    scope: Scope::Global,
+                    name: "bad name".into(),
+                    description: None,
+                    body: "body".into(),
+                }),
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            Request::MutateCommand {
+                expected_rev: 0,
+                mutation: CommandMutation::Create(CustomCommand {
+                    scope: Scope::Global,
+                    name: "empty".into(),
+                    description: None,
+                    body: "   ".into(),
+                }),
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            Request::DispatchCommand {
+                worktree: worktree.id,
+                name: "bad name".into(),
+                mode: None,
+                alternate: false,
+                context: String::new(),
+            }
+            .validate()
+            .is_err()
+        );
+        let mut duplicate = state.clone();
+        duplicate.commands.push(command);
+        assert!(Response::CommandState(duplicate).validate().is_err());
+        let _ = ProjectKind::Git;
     }
 
     #[test]

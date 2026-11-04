@@ -756,6 +756,167 @@ pub fn team_runs(values: &[fl_model::team::TeamRun]) -> Result<(), ValidationErr
     Ok(())
 }
 
+// --- M7 slice: Shared Context, custom commands and prompt templates -------
+
+/// A custom command name: ASCII letter/digit first, then `.`, `_`, `-`.
+pub fn command_name(name: &str) -> Result<(), ValidationError> {
+    fl_model::command::validate_name(name).map_err(|_| ValidationError::Invalid("command name"))?;
+    text(
+        "command name",
+        name,
+        fl_model::command::MAX_COMMAND_NAME_BYTES,
+    )
+}
+
+pub fn command_body(body: &str) -> Result<(), ValidationError> {
+    if body.trim().is_empty() {
+        return Err(ValidationError::Invalid("command body"));
+    }
+    text(
+        "command body",
+        body,
+        fl_model::command::MAX_COMMAND_BODY_BYTES,
+    )
+}
+
+fn custom_command(value: &fl_model::command::CustomCommand) -> Result<(), ValidationError> {
+    command_name(&value.name)?;
+    command_body(&value.body)?;
+    if let Some(description) = &value.description {
+        text(
+            "command description",
+            description,
+            fl_model::command::MAX_COMMAND_DESCRIPTION_BYTES,
+        )?;
+        if description.trim().is_empty() {
+            return Err(ValidationError::Invalid("command description"));
+        }
+    }
+    command_scope(value.scope)
+}
+
+fn command_scope(scope: fl_model::routing::Scope) -> Result<(), ValidationError> {
+    match scope {
+        fl_model::routing::Scope::Global => Ok(()),
+        fl_model::routing::Scope::Workspace(id) => non_nil_id("command workspace", id.as_bytes()),
+        fl_model::routing::Scope::Project(id) => non_nil_id("command project", id.as_bytes()),
+    }
+}
+
+pub fn command_mutation(
+    mutation: &fl_model::command::CommandMutation,
+) -> Result<(), ValidationError> {
+    use fl_model::command::CommandMutation;
+    match mutation {
+        CommandMutation::Create(command) | CommandMutation::Update(command) => {
+            custom_command(command)
+        }
+        CommandMutation::Delete { scope, name } => {
+            command_scope(*scope)?;
+            command_name(name)
+        }
+    }
+}
+
+pub fn command_state(state: &fl_model::command::CommandState) -> Result<(), ValidationError> {
+    bound(
+        "commands",
+        state.commands.len(),
+        fl_model::command::MAX_COMMANDS,
+    )?;
+    for (index, command) in state.commands.iter().enumerate() {
+        custom_command(command)?;
+        if state.commands[..index]
+            .iter()
+            .any(|other| other.scope == command.scope && other.name == command.name)
+        {
+            return Err(ValidationError::Invalid("duplicate command"));
+        }
+    }
+    Ok(())
+}
+
+pub fn shared_context(value: &fl_model::group::SharedContext) -> Result<(), ValidationError> {
+    value.validate().map_err(ValidationError::Invalid)?;
+    path(&value.root)?;
+    for entry in value.present.iter().chain(value.missing.iter()) {
+        text(
+            "shared-context path",
+            entry,
+            fl_model::group::MAX_SHARED_PATH_BYTES,
+        )?;
+        if entry.is_empty() {
+            return Err(ValidationError::Invalid("shared-context path"));
+        }
+    }
+    Ok(())
+}
+
+pub fn branch_group(value: &fl_model::group::BranchGroup) -> Result<(), ValidationError> {
+    value.validate().map_err(ValidationError::Invalid)?;
+    non_nil_id("branch group root", value.root.as_bytes())?;
+    non_nil_id("branch group project", value.project.as_bytes())?;
+    text(
+        "branch group label",
+        &value.label,
+        fl_model::group::MAX_GROUP_LABEL_BYTES,
+    )?;
+    if let Some(base) = &value.base {
+        text(
+            "branch group base",
+            base,
+            fl_model::group::MAX_GROUP_BASE_BYTES,
+        )?;
+    }
+    for member in &value.members {
+        non_nil_id("branch group member", member.as_bytes())?;
+    }
+    Ok(())
+}
+
+pub fn worktree_child(value: &fl_model::group::WorktreeChild) -> Result<(), ValidationError> {
+    value.validate().map_err(ValidationError::Invalid)?;
+    worktree(&value.worktree)?;
+    shared_context(&value.shared)
+}
+
+pub fn group_diff(value: &fl_model::group::GroupDiff) -> Result<(), ValidationError> {
+    value.validate().map_err(ValidationError::Invalid)?;
+    branch_group(&value.group)?;
+    bound(
+        "group diff members",
+        value.children.len(),
+        fl_model::group::MAX_GROUP_MEMBERS,
+    )?;
+    for child in &value.children {
+        non_nil_id("group diff worktree", child.worktree.as_bytes())?;
+        text(
+            "group diff label",
+            &child.label,
+            fl_model::group::MAX_GROUP_LABEL_BYTES,
+        )?;
+        if let Some(branch) = &child.branch {
+            text("git ref", branch, MAX_TEXT_BYTES)?;
+        }
+        bound(
+            "group diff files",
+            child.files.len(),
+            fl_model::group::MAX_GROUP_CHILD_FILES,
+        )?;
+        for file in &child.files {
+            text(
+                "changed path",
+                &file.path,
+                fl_model::group::MAX_GROUP_PATH_BYTES,
+            )?;
+            if let Some(old) = &file.old_path {
+                text("changed path", old, fl_model::group::MAX_GROUP_PATH_BYTES)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

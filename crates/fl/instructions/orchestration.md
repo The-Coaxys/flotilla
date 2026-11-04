@@ -73,6 +73,39 @@ and `team list` keep working after a daemon restart. Provider processes are
 daemon-owned and are not reattached, so a restarted run shows its last durable
 state rather than a live process.
 
+## Custom commands and prompt templates
+
+A custom command is a named prompt stored at a scope: `global`, `workspace` or
+`project` (the default when the caller is inside a worktree). Resolution is
+project → workspace → global, so the most specific definition wins. Creating
+a name that already exists at that scope, updating or deleting a missing one,
+and an invalid name or body are all refusals.
+
+```sh
+fl commands list --json
+fl commands create deploy --body "Ship {{branch}} to {{base}}"
+fl commands create audit --body "Audit {{branch}}" --scope global
+fl commands get deploy --json
+fl commands update deploy --body "Ship {{branch}} now"
+fl commands delete deploy --json
+```
+
+Prompt templates for the routed Git actions (`commit`, `create_pr`,
+`fix_ci`, …) live at the same scopes:
+
+```sh
+fl prompt-template list --json
+fl prompt-template set fix_ci --body "Fix {{branch}} checks" --scope global
+fl prompt-template get fix_ci --json   # effective template and its scope
+fl prompt-template remove fix_ci --scope global
+```
+
+A dispatched command renders `{{branch}}`, `{{base}}`, `{{diff}}` and
+`{{task}}` exactly like a routed action; nothing in a body is executed. The
+dispatch uses the route configured for custom commands (the `Thorough` group
+route is the fallback). Every edit is compare-and-set: two writers cannot
+silently overwrite each other, and `fl` retries once on a stale revision.
+
 ## Hooks
 
 Providers that support hooks can call `fl hook <event>` from their hook

@@ -640,6 +640,426 @@ async fn routing_round_trips_and_prepares_a_git_task() {
     assert!(dispatch.prompt.contains("routed"), "{}", dispatch.prompt);
 }
 
+/// A branch group: the root's shared context is materialized and copied into
+/// one lazily created child, an edit in the child appears in the grouped
+/// diff, and the group is durable through the store.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn branch_groups_share_context_and_report_a_grouped_diff() {
+    let fixture = Fixture::new().await;
+    let repo = fixture.repo();
+    let daemon = fixture.start().await;
+    let mut control = Control::connect(&daemon.socket_path).await;
+    let Response::WorkspaceTree(tree) = control.ok(Request::GetWorkspaceTree).await else {
+        panic!("expected tree");
+    };
+    let Response::Project(project) = control
+        .ok(Request::AddProject {
+            workspace: tree.workspaces[0].id,
+            path: repo.display().to_string(),
+        })
+        .await
+    else {
+        panic!("expected project");
+    };
+    let Response::Worktree(root) = control
+        .ok(Request::CreateWorktree {
+            project: project.id,
+            branch: Some("feature-group".into()),
+            base: None,
+        })
+        .await
+    else {
+        panic!("expected worktree");
+    };
+    let root_path = PathBuf::from(&root.path);
+    // The root's own files survive materialization; AGENTS.md is generated
+    // from the guidance template because neither spelling exists yet.
+    std::fs::write(root_path.join("FEATURE.md"), "# Feature\npayments\n").unwrap();
+    std::fs::create_dir(root_path.join("context")).unwrap();
+    std::fs::write(root_path.join("context/plan.md"), "plan\n").unwrap();
+
+    let Response::WorktreeChild(child) = control
+        .ok(Request::EnsureWorktreeChild { worktree: root.id })
+        .await
+    else {
+        panic!("expected child");
+    };
+    assert!(child.created);
+    assert_ne!(child.worktree.id, root.id);
+    assert!(
+        child
+            .worktree
+            .branch
+            .as_deref()
+            .is_some_and(|branch| branch.starts_with("flotilla/")),
+        "a child starts on a temporary branch: {:?}",
+        child.worktree.branch
+    );
+    assert_eq!(
+        child.worktree.target.as_deref(),
+        Some("main"),
+        "a child starts from the group base"
+    );
+    let child_path = PathBuf::from(&child.worktree.path);
+    assert_eq!(
+        std::fs::read_to_string(child_path.join("FEATURE.md")).unwrap(),
+        "# Feature\npayments\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(child_path.join("context/plan.md")).unwrap(),
+        "plan\n"
+    );
+    assert!(root_path.join("AGENTS.md").is_file());
+    assert!(child_path.join("AGENTS.md").is_file());
+    assert!(child.shared.present.iter().any(|path| path == "FEATURE.md"));
+    assert!(
+        child
+            .shared
+            .present
+            .iter()
+            .any(|path| path == "context/plan.md")
+    );
+    assert!(
+        child.shared.missing.is_empty(),
+        "{:?}",
+        child.shared.missing
+    );
+
+    // Lazy and idempotent: the second call returns the same child.
+    let Response::WorktreeChild(again) = control
+        .ok(Request::EnsureWorktreeChild { worktree: root.id })
+        .await
+    else {
+        panic!("expected child");
+    };
+    assert!(!again.created);
+    assert_eq!(again.worktree.id, child.worktree.id);
+
+    // The child resolves to the group's root.
+    let Response::WorktreeGroup(group) = control
+        .ok(Request::GetWorktreeGroup {
+            worktree: child.worktree.id,
+        })
+        .await
+    else {
+        panic!("expected group");
+    };
+    assert_eq!(group.root, root.id);
+    assert_eq!(group.members, vec![root.id, child.worktree.id]);
+    assert_eq!(group.base.as_deref(), Some("main"));
+
+    // A child edit (a shared file and a new one) is in the grouped diff.
+    std::fs::write(
+        child_path.join("FEATURE.md"),
+        "# Feature\npayments v2\nmore\n",
+    )
+    .unwrap();
+    std::fs::write(child_path.join("extra.txt"), "a\nb\n").unwrap();
+    let Response::GroupDiff(diff) = control
+        .ok(Request::WorktreeGroupDiff { worktree: root.id })
+        .await
+    else {
+        panic!("expected group diff");
+    };
+    assert_eq!(diff.children.len(), 2);
+    assert!(diff.children[0].is_root);
+    let child_diff = diff
+        .children
+        .iter()
+        .find(|entry| entry.worktree == child.worktree.id)
+        .expect("child in group diff");
+    assert!(child_diff.files.iter().any(|file| file.path == "extra.txt"));
+    assert!(
+        child_diff
+            .files
+            .iter()
+            .any(|file| file.path == "FEATURE.md")
+    );
+    assert!(child_diff.added >= 3, "{child_diff:?}");
+    assert!(diff.added >= child_diff.added);
+    assert!(diff.changed_files >= 2);
+
+    // A worktree outside any group is refused with the daemon's reason.
+    let Response::Worktree(lonely) = control
+        .ok(Request::CreateWorktree {
+            project: project.id,
+            branch: Some("lonely".into()),
+            base: None,
+        })
+        .await
+    else {
+        panic!("expected worktree");
+    };
+    let refusal = control
+        .rpc(Request::GetWorktreeGroup {
+            worktree: lonely.id,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(refusal.code, RpcErrorCode::NotFound);
+    assert!(refusal.message.contains("not part of a branch group"));
+
+    // Removing the child leaves the group with its root only.
+    control
+        .ok(Request::DeleteWorktree {
+            worktree: child.worktree.id,
+            force: true,
+        })
+        .await;
+    let Response::WorktreeGroup(group) = control
+        .ok(Request::GetWorktreeGroup { worktree: root.id })
+        .await
+    else {
+        panic!("expected group");
+    };
+    assert_eq!(group.members, vec![root.id]);
+}
+
+/// Custom commands are scoped, compare-and-set and dispatchable through the
+/// route for custom commands; invalid and duplicate definitions are refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn custom_commands_are_edited_and_routed() {
+    use fl_model::command::{CommandMutation, CustomCommand};
+    use fl_model::routing::{
+        DispatchMode, GitTask, RouteGroup, RouteKey, RouteOverride, RouteSpec, RoutingMutation,
+        Scope, TaskDispatchState,
+    };
+
+    let fixture = Fixture::new().await;
+    let repo = fixture.repo();
+    let daemon = fixture.start().await;
+    let mut control = Control::connect(&daemon.socket_path).await;
+    let Response::CommandState(empty) = control.ok(Request::ListCommands).await else {
+        panic!("expected commands");
+    };
+    assert_eq!(empty.rev, 0);
+    assert!(empty.commands.is_empty());
+
+    let deploy = CustomCommand {
+        scope: Scope::Global,
+        name: "deploy".into(),
+        description: Some("Ship the branch".into()),
+        body: "Ship {{branch}} to {{base}}".into(),
+    };
+    let Response::CommandState(created) = control
+        .ok(Request::MutateCommand {
+            expected_rev: 0,
+            mutation: CommandMutation::Create(deploy.clone()),
+        })
+        .await
+    else {
+        panic!("expected commands");
+    };
+    assert_eq!(created.rev, 1);
+    assert_eq!(created.commands, vec![deploy.clone()]);
+
+    // A duplicate name at the same scope is refused with the reason.
+    let duplicate = control
+        .rpc(Request::MutateCommand {
+            expected_rev: 1,
+            mutation: CommandMutation::Create(deploy.clone()),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(duplicate.code, RpcErrorCode::InvalidArgument);
+    assert!(
+        duplicate.message.contains("already exists"),
+        "{duplicate:?}"
+    );
+    // An invalid name or an empty body never reaches the store: the wire
+    // contract refuses it first, and the daemon repeats the same bounds.
+    for invalid in [
+        CustomCommand {
+            scope: Scope::Global,
+            name: "bad name".into(),
+            description: None,
+            body: "body".into(),
+        },
+        CustomCommand {
+            scope: Scope::Global,
+            name: "empty".into(),
+            description: None,
+            body: "   ".into(),
+        },
+    ] {
+        assert!(
+            Request::MutateCommand {
+                expected_rev: 1,
+                mutation: CommandMutation::Create(invalid.clone()),
+            }
+            .validate()
+            .is_err(),
+            "{invalid:?} should be refused"
+        );
+        assert!(invalid.validate().is_err());
+    }
+    // A stale revision is a conflict, not a silent overwrite.
+    let stale = control
+        .rpc(Request::MutateCommand {
+            expected_rev: 0,
+            mutation: CommandMutation::Create(CustomCommand {
+                scope: Scope::Global,
+                name: "other".into(),
+                description: None,
+                body: "body".into(),
+            }),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(stale.code, RpcErrorCode::RevisionConflict);
+    // Update replaces the stored definition.
+    let Response::CommandState(updated) = control
+        .ok(Request::MutateCommand {
+            expected_rev: 1,
+            mutation: CommandMutation::Update(CustomCommand {
+                body: "Ship {{branch}} now".into(),
+                ..deploy.clone()
+            }),
+        })
+        .await
+    else {
+        panic!("expected commands");
+    };
+    assert_eq!(updated.rev, 2);
+    assert_eq!(updated.commands[0].body, "Ship {{branch}} now");
+
+    // A routed dispatch uses the stored body as the prompt.
+    let Response::WorkspaceTree(tree) = control.ok(Request::GetWorkspaceTree).await else {
+        panic!("expected tree");
+    };
+    let Response::Project(project) = control
+        .ok(Request::AddProject {
+            workspace: tree.workspaces[0].id,
+            path: repo.display().to_string(),
+        })
+        .await
+    else {
+        panic!("expected project");
+    };
+    let Response::Worktree(task) = control
+        .ok(Request::CreateWorktree {
+            project: project.id,
+            branch: Some("commands".into()),
+            base: None,
+        })
+        .await
+    else {
+        panic!("expected worktree");
+    };
+    let mut route = RouteSpec::new("codex");
+    route.click = DispatchMode::NewPrepare;
+    route.alternate_click = DispatchMode::NewPrepare;
+    control
+        .ok(Request::MutateRouting {
+            expected_rev: 0,
+            mutation: RoutingMutation::SetRoute(RouteOverride {
+                scope: Scope::Global,
+                key: RouteKey::Group(RouteGroup::Thorough),
+                route,
+            }),
+        })
+        .await;
+    let Response::TaskDispatch(dispatch) = control
+        .ok(Request::DispatchCommand {
+            worktree: task.id,
+            name: "deploy".into(),
+            mode: None,
+            alternate: false,
+            context: "a note".into(),
+        })
+        .await
+    else {
+        panic!("expected dispatch");
+    };
+    assert_eq!(dispatch.task, GitTask::Command);
+    assert_eq!(dispatch.state, TaskDispatchState::Prepared);
+    assert!(
+        dispatch.prompt.contains("Ship commands now"),
+        "{}",
+        dispatch.prompt
+    );
+    // An unknown command is a not-found refusal.
+    let unknown = control
+        .rpc(Request::DispatchCommand {
+            worktree: task.id,
+            name: "absent".into(),
+            mode: None,
+            alternate: false,
+            context: String::new(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(unknown.code, RpcErrorCode::NotFound);
+    assert!(unknown.message.contains("not defined"), "{unknown:?}");
+
+    // A project-scope command resolves below a global one of the same name.
+    let Response::CommandState(scoped) = control
+        .ok(Request::MutateCommand {
+            expected_rev: 2,
+            mutation: CommandMutation::Create(CustomCommand {
+                scope: Scope::Project(project.id),
+                name: "deploy".into(),
+                description: None,
+                body: "Project deploy {{branch}}".into(),
+            }),
+        })
+        .await
+    else {
+        panic!("expected commands");
+    };
+    assert_eq!(scoped.rev, 3);
+    let Response::TaskDispatch(scoped_dispatch) = control
+        .ok(Request::DispatchCommand {
+            worktree: task.id,
+            name: "deploy".into(),
+            mode: None,
+            alternate: false,
+            context: String::new(),
+        })
+        .await
+    else {
+        panic!("expected dispatch");
+    };
+    assert!(
+        scoped_dispatch.prompt.contains("Project deploy commands"),
+        "{}",
+        scoped_dispatch.prompt
+    );
+
+    // Deleting is durable and a second delete is refused.
+    let Response::CommandState(deleted) = control
+        .ok(Request::MutateCommand {
+            expected_rev: 3,
+            mutation: CommandMutation::Delete {
+                scope: Scope::Global,
+                name: "deploy".into(),
+            },
+        })
+        .await
+    else {
+        panic!("expected commands");
+    };
+    assert_eq!(deleted.rev, 4);
+    assert!(
+        deleted
+            .commands
+            .iter()
+            .all(|command| command.scope != Scope::Global)
+    );
+    let missing = control
+        .rpc(Request::MutateCommand {
+            expected_rev: 4,
+            mutation: CommandMutation::Delete {
+                scope: Scope::Global,
+                name: "deploy".into(),
+            },
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(missing.code, RpcErrorCode::InvalidArgument);
+    assert!(missing.message.contains("not defined"), "{missing:?}");
+}
+
 /// A stand-in for `gh` that keeps one pull request's state in files: it
 /// answers the PR query, and records `pr create` (title, body from stdin,
 /// draft), `pr ready` and `pr merge`.

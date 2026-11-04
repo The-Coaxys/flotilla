@@ -9,7 +9,8 @@ use fl_model::layout::LayoutOp;
 use fl_model::workspace::{
     EntryKind, LayoutScope, ProjectKind, ScriptKind, ScriptRunState, Worktree,
 };
-use fl_model::{PaneId, Size, TabId, TerminalId};
+use fl_model::{PaneId, Size, TabId, TerminalId, WorkspaceId};
+use flc_sync::WorkspacesState;
 use flc_ui::input::{TextInput, TextInputEvent};
 use flc_ui::theme::Theme;
 use gpui::prelude::*;
@@ -246,6 +247,18 @@ impl HostWorkspace {
             "Files, changes, checks and chat",
             Source::Command,
             Action::TogglePanel,
+        );
+        out.push(
+            "Commands and prompt templates",
+            "Edit scoped commands and routed action prompts",
+            Source::Command,
+            Action::OpenCommands,
+        );
+        out.push(
+            "Branch group diff",
+            "Shared context and per-child changes",
+            Source::Command,
+            Action::OpenGroupDiff,
         );
         for (panel, title, detail) in [
             (
@@ -518,11 +531,40 @@ impl HostWorkspace {
                 self.select(LayoutScope::Worktree(worktree), cx);
                 self.run_script(worktree, kind, false, cx);
             }
+            Action::OpenCommands => {
+                let workspace = self
+                    .selected_worktree()
+                    .and_then(|worktree| {
+                        self.state.tree.as_ref().and_then(|tree| {
+                            tree.projects
+                                .iter()
+                                .find(|project| project.id == worktree.project)
+                                .map(|project| project.workspace)
+                        })
+                    })
+                    .or_else(|| Self::tree_workspace(&self.state));
+                match workspace {
+                    Some(workspace) => self.open_commands(workspace, cx),
+                    None => self.show_error("No workspace is loaded yet.", cx),
+                }
+            }
+            Action::OpenGroupDiff => match self.selected_worktree().map(|worktree| worktree.id) {
+                Some(worktree) => self.open_group_diff(worktree, cx),
+                None => self.show_error("Select a worktree to show its branch group diff.", cx),
+            },
             Action::Git { worktree, action } => {
                 self.select(LayoutScope::Worktree(worktree), cx);
                 self.run_git_action(action, false, window, cx);
             }
         }
+    }
+
+    fn tree_workspace(state: &WorkspacesState) -> Option<WorkspaceId> {
+        state
+            .tree
+            .as_ref()
+            .and_then(|tree| tree.workspaces.iter().min_by_key(|w| w.order))
+            .map(|workspace| workspace.id)
     }
 
     /// Add a terminal tab through the layout model (the same operation the

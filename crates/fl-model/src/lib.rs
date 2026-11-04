@@ -1,7 +1,9 @@
 //! Shared domain values. This crate has no terminal engine, transport or UI dependency.
 pub mod chat;
+pub mod command;
 pub mod coordination;
 pub mod forge;
+pub mod group;
 pub mod layout;
 pub mod review;
 pub mod routing;

@@ -1072,7 +1072,9 @@ fn version_two(root: &Path) -> (Layout, Vec<TerminalEntry>) {
              DROP TABLE IF EXISTS worktrees; DROP TABLE IF EXISTS projects; DROP TABLE IF EXISTS workspaces; \
              DROP TABLE IF EXISTS workspace_meta; DROP TABLE IF EXISTS coordination_state; \
              DROP TABLE IF EXISTS coordination_locks; DROP TABLE IF EXISTS team_roles; \
-             DROP TABLE IF EXISTS team_runs; PRAGMA user_version=2;",
+             DROP TABLE IF EXISTS team_runs; DROP TABLE IF EXISTS worktree_groups; \
+             DROP TABLE IF EXISTS worktree_group_members; DROP TABLE IF EXISTS commands; \
+             PRAGMA user_version=2;",
         )
         .unwrap();
     (layout, terminals)
