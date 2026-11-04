@@ -9,9 +9,9 @@ use gpui::prelude::*;
 use gpui::{
     App, Bounds, ClipboardItem, Context, CursorStyle, Element, ElementId, ElementInputHandler,
     Entity, EntityInputHandler, EventEmitter, FocusHandle, Focusable, KeyDownEvent, LayoutId,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point, Style,
-    SharedString, TextAlign, TextRun, UTF16Selection, UnderlineStyle, WrappedLine, Window, div,
-    fill, point, px, relative, size,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point,
+    SharedString, Style, TextAlign, TextRun, UTF16Selection, UnderlineStyle, Window, WrappedLine,
+    div, fill, point, px, relative, size,
 };
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -156,7 +156,10 @@ impl Composer {
     }
 
     fn line_bounds(&self, offset: usize) -> (usize, usize) {
-        let start = self.text[..offset].rfind('\n').map(|ix| ix + 1).unwrap_or(0);
+        let start = self.text[..offset]
+            .rfind('\n')
+            .map(|ix| ix + 1)
+            .unwrap_or(0);
         let end = self.text[offset..]
             .find('\n')
             .map(|ix| offset + ix)
@@ -164,7 +167,7 @@ impl Composer {
         (start, end)
     }
 
-    fn vertical(&self, offset: usize, down: bool, select: bool, cx: &mut Context<Self>) {
+    fn vertical(&mut self, offset: usize, down: bool, select: bool, cx: &mut Context<Self>) {
         let (start, _) = self.line_bounds(offset);
         let column = self.text[start..offset].chars().count();
         let target = if down {
@@ -446,7 +449,11 @@ impl EntityInputHandler for Composer {
         })
     }
 
-    fn marked_text_range(&self, _window: &mut Window, _cx: &mut Context<Self>) -> Option<Range<usize>> {
+    fn marked_text_range(
+        &self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Range<usize>> {
         self.marked.as_ref().map(|range| self.range_to_utf16(range))
     }
 
@@ -524,7 +531,10 @@ impl EntityInputHandler for Composer {
         let start = caret_point(lines, range.start)?;
         let end = caret_point(lines, range.end)?;
         Some(Bounds::from_corners(
-            point(bounds.left() + PAD_X + start.x, bounds.top() + PAD_Y + start.y),
+            point(
+                bounds.left() + PAD_X + start.x,
+                bounds.top() + PAD_Y + start.y,
+            ),
             point(
                 bounds.left() + PAD_X + end.x,
                 bounds.top() + PAD_Y + end.y + LINE_HEIGHT,
@@ -782,10 +792,7 @@ impl Element for ComposerElement {
         window.with_content_mask(Some(mask), |window| {
             let mut y = px(0.);
             for line in &prepaint.lines {
-                let origin = point(
-                    bounds.left() + PAD_X,
-                    bounds.top() + PAD_Y + y - offset,
-                );
+                let origin = point(bounds.left() + PAD_X, bounds.top() + PAD_Y + y - offset);
                 let _ = line.paint(
                     origin,
                     LINE_HEIGHT,
@@ -836,14 +843,20 @@ impl Render for Composer {
                 composer.key_down(event, window, cx)
             }))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::mouse_down))
-            .on_mouse_up(MouseButton::Left, cx.listener(|this, _: &MouseUpEvent, _window, cx| {
-                this.selecting = false;
-                cx.notify()
-            }))
-            .on_mouse_up_out(MouseButton::Left, cx.listener(|this, _: &MouseUpEvent, _window, cx| {
-                this.selecting = false;
-                cx.notify()
-            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseUpEvent, _window, cx| {
+                    this.selecting = false;
+                    cx.notify()
+                }),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseUpEvent, _window, cx| {
+                    this.selecting = false;
+                    cx.notify()
+                }),
+            )
             .on_mouse_move(cx.listener(Self::mouse_move))
             .w_full()
             .min_h(px(34.))
@@ -851,8 +864,8 @@ impl Render for Composer {
             .border_1()
             .border_color(if focused { theme.accent } else { theme.border })
             .bg(theme.control_bg)
-            .py(px(PAD_Y))
-            .px(px(PAD_X))
+            .py(PAD_Y)
+            .px(PAD_X)
             .text_size(theme.text_size)
             .line_height(LINE_HEIGHT)
             .text_color(theme.text_primary)

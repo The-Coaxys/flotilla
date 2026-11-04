@@ -1523,9 +1523,7 @@ impl HostWorkspace {
                     tab_label,
                     active,
                 )
-                .on_click(cx.listener(move |view, _, _, cx| {
-                    view.select_chat_tab(session, cx)
-                }))
+                .on_click(cx.listener(move |view, _, _, cx| view.select_chat_tab(session, cx)))
                 .child(
                     div()
                         .id(SharedString::from(format!("chat-tab-close-{session}")))
@@ -1576,15 +1574,13 @@ impl HostWorkspace {
             }
         }
         if is_worktree {
-            strip = strip.child(
-                secondary_button("open-chat-panel", "Chat", t).on_click(cx.listener(
-                    |view, _, _, cx| {
-                        view.panel = Panel::Chat;
-                        view.panel_open = true;
-                        cx.notify();
-                    },
-                )),
-            );
+            strip = strip.child(secondary_button("open-chat-panel", "Chat", t).on_click(
+                cx.listener(|view, _, _, cx| {
+                    view.panel = Panel::Chat;
+                    view.panel_open = true;
+                    cx.notify();
+                }),
+            ));
         }
         if has_documents {
             strip = strip.child(
@@ -1796,7 +1792,12 @@ impl HostWorkspace {
                 self.panel == Panel::Review,
                 cx,
             ))
-            .child(segment("Chat".into(), Panel::Chat, self.panel == Panel::Chat, cx));
+            .child(segment(
+                "Chat".into(),
+                Panel::Chat,
+                self.panel == Panel::Chat,
+                cx,
+            ));
         let body: AnyElement = match self.panel {
             Panel::Files => self
                 .render_file_tree(&worktree.path, &t, cx)

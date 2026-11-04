@@ -14,9 +14,8 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use fl_model::chat::{
-    ApprovalDecision, ChatHit, ChatSession, InboxItem, InboxKind, InboxState, PermissionMode,
-    ProviderDiscovery, Question, SessionState, ToolStatus, TurnOutcome,
-    MAX_CHAT_MESSAGES,
+    ApprovalDecision, ChatHit, ChatSession, InboxItem, InboxKind, InboxState, MAX_CHAT_MESSAGES,
+    PermissionMode, ProviderDiscovery, Question, SessionState, ToolStatus, TurnOutcome,
 };
 use flc_sync::ChatState;
 use gpui::{ListAlignment, ListState, list};
@@ -27,15 +26,16 @@ mod composer;
 #[path = "host_chat/model.rs"]
 mod model;
 
-use super::*;
 use self::composer::{Composer, ComposerEvent, ComposerOptions, composer, mono_options};
 use self::model::{
     AnswerDraft, DiffKind, MarkdownBlock, RowKind, SubmitAction, Toast, ToastKind, ToolRow,
-    TranscriptRow, approval_label, build_question_response, build_transcript, can_stop, collect_resolved_ids,
-    composer_action, decision_ready, format_clock, format_duration, inline_spans, is_running,
-    new_toasts, ordered_inbox, outcome_label, parse_markdown, parse_unified_diff, seen_sequences,
-    sessions_newest_first, status_label, tool_icon, tool_kind_label, tool_status_label,
+    TranscriptRow, approval_label, build_question_response, build_transcript, can_stop,
+    collect_resolved_ids, composer_action, decision_ready, format_clock, format_duration,
+    inline_spans, is_running, new_toasts, ordered_inbox, outcome_label, parse_markdown,
+    parse_unified_diff, seen_sequences, sessions_newest_first, status_label, tool_icon,
+    tool_kind_label, tool_status_label,
 };
+use super::*;
 
 /// Toasts kept in memory; only the newest few are drawn.
 const TOAST_LIMIT: usize = 20;
@@ -187,14 +187,19 @@ impl ChatUi {
                 }
             }
             self.seen = seen_sequences(&state.events);
-            self.toasts.sort_by(|a, b| b.seq.cmp(&a.seq));
+            self.toasts
+                .sort_by_key(|toast| std::cmp::Reverse(toast.seq));
             self.toasts.truncate(TOAST_LIMIT);
         }
         // Cards for sessions that the daemon forgot cannot stay actionable.
         self.question_forms
             .retain(|key, _| state.sessions.contains_key(&key.0));
-        self.tabs.retain(|session| state.sessions.contains_key(session));
-        if self.active.is_some_and(|active| !state.sessions.contains_key(&active)) {
+        self.tabs
+            .retain(|session| state.sessions.contains_key(session));
+        if self
+            .active
+            .is_some_and(|active| !state.sessions.contains_key(&active))
+        {
             self.active = None;
         }
         self.state = state;
@@ -329,9 +334,15 @@ fn row_weight(kind: &RowKind) -> usize {
                 + tool.output.as_deref().map_or(0, str::len)
                 + tool.diff.as_deref().map_or(0, str::len)
                 + status_weight(&tool.status)
-                + tool.children.iter().map(|row| row_weight(&row.kind)).sum::<usize>()
+                + tool
+                    .children
+                    .iter()
+                    .map(|row| row_weight(&row.kind))
+                    .sum::<usize>()
         }
-        RowKind::FileEdit { diff, truncated, .. } => diff.len() + usize::from(*truncated),
+        RowKind::FileEdit {
+            diff, truncated, ..
+        } => diff.len() + usize::from(*truncated),
         RowKind::Approval {
             details,
             resolved,
@@ -388,19 +399,22 @@ impl HostWorkspace {
             return binding.input.clone();
         }
         let input = composer(cx, ComposerOptions::default());
-        let events = cx.subscribe(&input, move |view, _, event: &ComposerEvent, cx| match event {
-            ComposerEvent::Submitted(text) => {
-                view.submit_chat_text(session, text.to_string(), cx);
-            }
-            ComposerEvent::Cancelled => {
-                // Escape closes the composer rows: the input, its error and
-                // the selector strip all collapse to one "Write a reply" row.
-                view.chat.collapsed.insert(session);
-                view.chat.errors.remove(&session);
-                cx.notify();
-            }
-            ComposerEvent::Changed => {}
-        });
+        let events = cx.subscribe(
+            &input,
+            move |view, _, event: &ComposerEvent, cx| match event {
+                ComposerEvent::Submitted(text) => {
+                    view.submit_chat_text(session, text.to_string(), cx);
+                }
+                ComposerEvent::Cancelled => {
+                    // Escape closes the composer rows: the input, its error and
+                    // the selector strip all collapse to one "Write a reply" row.
+                    view.chat.collapsed.insert(session);
+                    view.chat.errors.remove(&session);
+                    cx.notify();
+                }
+                ComposerEvent::Changed => {}
+            },
+        );
         self.chat.composers.insert(
             session,
             ComposerBinding {
@@ -411,7 +425,12 @@ impl HostWorkspace {
         input
     }
 
-    pub(super) fn open_chat_tab(&mut self, session: Uuid, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn open_chat_tab(
+        &mut self,
+        session: Uuid,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.chat.state.session(session).is_none() {
             return;
         }
@@ -494,7 +513,10 @@ impl HostWorkspace {
             return;
         }
         if !self.chat_live() {
-            self.show_error("Offline — starting a chat needs a live daemon on protocol 0.4.", cx);
+            self.show_error(
+                "Offline — starting a chat needs a live daemon on protocol 0.4.",
+                cx,
+            );
             return;
         }
         self.dialog = None;
@@ -503,16 +525,15 @@ impl HostWorkspace {
         let thinking = cx.new(|cx| TextInput::new(cx, "Thinking setting (optional)"));
         let mut events = Vec::new();
         for input in [&model, &thinking] {
-            events.push(cx.subscribe(
-                input,
-                |view, _, event: &TextInputEvent, cx| match event {
+            events.push(
+                cx.subscribe(input, |view, _, event: &TextInputEvent, cx| match event {
                     TextInputEvent::Submitted(_) => view.start_chat_from_setup(cx),
                     TextInputEvent::Cancelled => {
                         view.chat.setup = None;
                         cx.notify();
                     }
-                },
-            ));
+                }),
+            );
         }
         let focus = model.read(cx).focus_handle(cx);
         self.chat.setup = Some(SetupForm {
@@ -693,7 +714,11 @@ impl HostWorkspace {
             cx.notify();
             return;
         }
-        let Some(status) = self.chat.state.session(session).map(|known| known.status.clone())
+        let Some(status) = self
+            .chat
+            .state
+            .session(session)
+            .map(|known| known.status.clone())
         else {
             self.chat
                 .errors
@@ -704,8 +729,7 @@ impl HostWorkspace {
         let Some(action) = composer_action(&status) else {
             self.chat.errors.insert(
                 session,
-                "The session is not ready for a message; resolve the pending request first."
-                    .into(),
+                "The session is not ready for a message; resolve the pending request first.".into(),
             );
             cx.notify();
             return;
@@ -756,7 +780,11 @@ impl HostWorkspace {
             cx.notify();
             return;
         }
-        let Some(status) = self.chat.state.session(session).map(|known| known.status.clone())
+        let Some(status) = self
+            .chat
+            .state
+            .session(session)
+            .map(|known| known.status.clone())
         else {
             return;
         };
@@ -930,9 +958,7 @@ impl HostWorkspace {
                 Ok(response) => response,
                 Err(error) => {
                     form.error = Some(error.to_string().into());
-                    drop(form);
-                    self.chat.expansion_revision =
-                        self.chat.expansion_revision.wrapping_add(1);
+                    self.chat.expansion_revision = self.chat.expansion_revision.wrapping_add(1);
                     cx.notify();
                     return;
                 }
@@ -1053,7 +1079,12 @@ impl HostWorkspace {
         cx.notify();
     }
 
-    fn open_chat_inbox_item(&mut self, item: InboxItem, window: &mut Window, cx: &mut Context<Self>) {
+    fn open_chat_inbox_item(
+        &mut self,
+        item: InboxItem,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.chat.inbox_open = false;
         self.select(LayoutScope::Worktree(item.worktree), cx);
         self.open_chat_tab(item.session, window, cx);
@@ -1373,18 +1404,24 @@ impl HostWorkspace {
                         },
                     ),
                 )
-                .child(ui_button("chat-close-cancel", "Keep", true, t).on_click(
-                    cx.listener(|view, _, _, cx| {
-                        view.chat.confirm_close = None;
-                        cx.notify();
-                    }),
-                ));
+                .child(
+                    ui_button("chat-close-cancel", "Keep", true, t).on_click(cx.listener(
+                        |view, _, _, cx| {
+                            view.chat.confirm_close = None;
+                            cx.notify();
+                        },
+                    )),
+                );
         } else {
             let enabled = self.chat_live() && !close_pending;
             row = row.child(
                 ui_button(
                     "chat-close",
-                    if close_pending { "Closing…" } else { "Close session" },
+                    if close_pending {
+                        "Closing…"
+                    } else {
+                        "Close session"
+                    },
                     enabled,
                     t,
                 )
@@ -1411,7 +1448,6 @@ fn non_empty(text: &str) -> Option<String> {
     let text = text.trim();
     (!text.is_empty()).then(|| text.to_owned())
 }
-
 
 // ---- transcript rows -------------------------------------------------------
 
@@ -1635,7 +1671,8 @@ impl HostWorkspace {
                 .text_color(t.text_tertiary)
                 .child(SharedString::from(format!(
                     "Provider process exited{}{}.",
-                    code.map(|code| format!(" with code {code}")).unwrap_or_default(),
+                    code.map(|code| format!(" with code {code}"))
+                        .unwrap_or_default(),
                     if *expected { " (expected)" } else { "" }
                 )))
                 .into_any_element(),
@@ -1796,9 +1833,15 @@ impl HostWorkspace {
                             .gap(px(6.))
                             .text_size(t.text_size_sm)
                             .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(if resolved { t.text_secondary } else { t.warning })
+                            .text_color(if resolved {
+                                t.text_secondary
+                            } else {
+                                t.warning
+                            })
                             .child(SharedString::from(format!("Approval · {tool}")))
-                            .when(resolved, |d| d.child(ui_chip("resolved", t.text_tertiary, t)))
+                            .when(resolved, |d| {
+                                d.child(ui_chip("resolved", t.text_tertiary, t))
+                            })
                             .when(pending && !resolved, |d| {
                                 d.child(ui_chip("submitting…", t.text_secondary, t))
                             }),
@@ -1831,20 +1874,12 @@ impl HostWorkspace {
                 let request = id.to_owned();
                 let label = approval_label(decision);
                 let button_id = format!("approve-{id}-{decision:?}");
-                buttons = buttons.child(
-                    ui_button(button_id, label, enabled, t).when(enabled, |d| {
-                        d.on_click(cx.listener(
-                            move |view, _, _, cx| {
-                                view.approve_chat_request(
-                                    session,
-                                    request.clone(),
-                                    decision,
-                                    cx,
-                                )
-                            },
-                        ))
-                    }),
-                );
+                buttons =
+                    buttons.child(ui_button(button_id, label, enabled, t).when(enabled, |d| {
+                        d.on_click(cx.listener(move |view, _, _, cx| {
+                            view.approve_chat_request(session, request.clone(), decision, cx)
+                        }))
+                    }));
             }
             card = card.child(div().px(px(10.)).child(buttons));
         }
@@ -1871,12 +1906,7 @@ impl HostWorkspace {
             self.chat.question_forms.remove(&(session, id.to_owned()));
         }
         let (choices, free, structured, error) = if resolved {
-            (
-                BTreeMap::new(),
-                HashMap::new(),
-                None,
-                None,
-            )
+            (BTreeMap::new(), HashMap::new(), None, None)
         } else {
             let form = self.ensure_question_form(session, id, questions, schema_json, cx);
             (
@@ -1886,35 +1916,33 @@ impl HostWorkspace {
                 form.error.clone(),
             )
         };
-        let mut card = div()
-            .w_full()
-            .px(px(16.))
-            .py(px(6.))
-            .child(
-                div()
-                    .p(px(10.))
-                    .flex()
-                    .flex_col()
-                    .gap(px(8.))
-                    .rounded(t.radius_md)
-                    .bg(t.surface_raised)
-                    .border_1()
-                    .border_color(if resolved { t.border } else { t.accent })
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(6.))
-                            .text_size(t.text_size_sm)
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(if resolved { t.text_secondary } else { t.accent })
-                            .child("Question from the provider")
-                            .when(resolved, |d| d.child(ui_chip("resolved", t.text_tertiary, t)))
-                            .when(pending && !resolved, |d| {
-                                d.child(ui_chip("submitting…", t.text_secondary, t))
-                            }),
-                    ),
-            );
+        let mut card = div().w_full().px(px(16.)).py(px(6.)).child(
+            div()
+                .p(px(10.))
+                .flex()
+                .flex_col()
+                .gap(px(8.))
+                .rounded(t.radius_md)
+                .bg(t.surface_raised)
+                .border_1()
+                .border_color(if resolved { t.border } else { t.accent })
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(6.))
+                        .text_size(t.text_size_sm)
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(if resolved { t.text_secondary } else { t.accent })
+                        .child("Question from the provider")
+                        .when(resolved, |d| {
+                            d.child(ui_chip("resolved", t.text_tertiary, t))
+                        })
+                        .when(pending && !resolved, |d| {
+                            d.child(ui_chip("submitting…", t.text_secondary, t))
+                        }),
+                ),
+        );
         let mut body = div().flex().flex_col().gap(px(8.)).px(px(10.));
         for question in questions {
             let mut group = div()
@@ -1968,7 +1996,10 @@ impl HostWorkspace {
                 let label_text = option.label.clone();
                 let multi = question.multi;
                 let mut row = div()
-                    .id(SharedString::from(format!("q-{id}-{}-{index}", question.id)))
+                    .id(SharedString::from(format!(
+                        "q-{id}-{}-{index}",
+                        question.id
+                    )))
                     .flex()
                     .items_center()
                     .gap(px(6.))
@@ -2059,8 +2090,9 @@ impl HostWorkspace {
             let request = id.to_owned();
             let questions = questions.to_vec();
             let schema = schema_json.map(str::to_owned);
-            body = body.child(
-                ui_button("answer-question", "Answer", enabled, t).when(enabled, |d| {
+            body = body.child(ui_button("answer-question", "Answer", enabled, t).when(
+                enabled,
+                |d| {
                     d.on_click(cx.listener(move |view, _, _, cx| {
                         view.submit_question_answer(
                             session,
@@ -2070,8 +2102,8 @@ impl HostWorkspace {
                             cx,
                         )
                     }))
-                }),
-            );
+                },
+            ));
         }
         card = card.child(body);
         card.into_any_element()
@@ -2184,9 +2216,9 @@ impl HostWorkspace {
                             t,
                         )
                         .when(enabled, |d| {
-                            d.on_click(cx.listener(move |view, _, _, cx| {
-                                view.stop_chat(session, cx)
-                            }))
+                            d.on_click(
+                                cx.listener(move |view, _, _, cx| view.stop_chat(session, cx)),
+                            )
                         }),
                     )
                 }),
@@ -2248,9 +2280,7 @@ impl HostWorkspace {
                     t,
                 )
                 .when(!offline, |d| {
-                    d.on_click(
-                        cx.listener(|view, _, window, cx| view.open_chat_setup(window, cx)),
-                    )
+                    d.on_click(cx.listener(|view, _, window, cx| view.open_chat_setup(window, cx)))
                 }),
             )
             .child(
@@ -2273,14 +2303,12 @@ impl HostWorkspace {
         } else {
             "Sessions come from the daemon. Click a session to open its tab."
         };
-        body = body
-            .child(actions)
-            .child(
-                div()
-                    .text_size(t.text_size_sm)
-                    .text_color(if offline { t.danger } else { t.text_secondary })
-                    .child(live_note),
-            );
+        body = body.child(actions).child(
+            div()
+                .text_size(t.text_size_sm)
+                .text_color(if offline { t.danger } else { t.text_secondary })
+                .child(live_note),
+        );
         if setup_open {
             body = body.child(self.render_chat_setup(t, cx));
         }
@@ -2358,15 +2386,9 @@ impl HostWorkspace {
                                 .text_color(t.text_primary)
                                 .child(SharedString::from(snippet)),
                         )
-                        .child(
-                            div()
-                                .text_color(t.text_tertiary)
-                                .child(SharedString::from(format!(
-                            "{} · event {}",
-                            self.chat.session_label(session),
-                            seq
-                        ))),
-                        )
+                        .child(div().text_color(t.text_tertiary).child(SharedString::from(
+                            format!("{} · event {}", self.chat.session_label(session), seq),
+                        )))
                         .on_click(cx.listener(move |view, _, window, cx| {
                             view.open_chat_hit(hit.clone(), window, cx)
                         })),
@@ -2402,7 +2424,7 @@ impl HostWorkspace {
             SessionState::Failed { .. } => t.danger,
             _ => t.text_secondary,
         };
-        let mut row = div()
+        let row = div()
             .id(SharedString::from(format!("chat-session-{id}")))
             .flex()
             .flex_col()
@@ -2441,29 +2463,28 @@ impl HostWorkspace {
                     .gap(px(6.))
                     .text_color(t.text_tertiary)
                     .child(status_label(&session.status))
-                    .child(SharedString::from(format!(
-                        "seq {}",
-                        session.seq
-                    ))),
+                    .child(SharedString::from(format!("seq {}", session.seq))),
             )
-            .on_click(cx.listener(move |view, _, window, cx| {
-                view.open_chat_tab(id, window, cx)
-            }));
+            .on_click(cx.listener(move |view, _, window, cx| view.open_chat_tab(id, window, cx)));
         let mut controls = div().flex().items_center().gap(px(4.));
         if confirm {
             controls = controls
-                .child(ui_button("session-close-yes", "Close", !offline, t).when(!offline, |d| {
-                    d.on_click(cx.listener(move |view, _, _, cx| {
-                        cx.stop_propagation();
-                        view.close_chat_session(id, cx)
-                    }))
-                }))
-                .child(ui_button("session-close-no", "Keep", true, t).on_click(
-                    cx.listener(|view, _, _, cx| {
-                        view.chat.confirm_close = None;
-                        cx.notify();
+                .child(
+                    ui_button("session-close-yes", "Close", !offline, t).when(!offline, |d| {
+                        d.on_click(cx.listener(move |view, _, _, cx| {
+                            cx.stop_propagation();
+                            view.close_chat_session(id, cx)
+                        }))
                     }),
-                ));
+                )
+                .child(
+                    ui_button("session-close-no", "Keep", true, t).on_click(cx.listener(
+                        |view, _, _, cx| {
+                            view.chat.confirm_close = None;
+                            cx.notify();
+                        },
+                    )),
+                );
         } else {
             controls = controls.child(
                 ui_button(
@@ -2518,9 +2539,9 @@ impl HostWorkspace {
                     .child(ui_button("chat-providers-retry", "Retry", enabled, t).when(
                         enabled,
                         |d| {
-                            d.on_click(cx.listener(|view, _, _, cx| {
-                                view.refresh_chat_providers(cx)
-                            }))
+                            d.on_click(
+                                cx.listener(|view, _, _, cx| view.refresh_chat_providers(cx)),
+                            )
                         },
                     )),
             );
@@ -2535,10 +2556,9 @@ impl HostWorkspace {
             for (index, provider) in providers.iter().enumerate() {
                 let id = provider.provider.id.clone();
                 let selected = form.provider.as_deref() == Some(id.as_str());
-                let unavailable = provider
-                    .unavailable_reason
-                    .clone()
-                    .or_else(|| (!provider.capabilities.chat).then(|| "no chat capability".to_owned()));
+                let unavailable = provider.unavailable_reason.clone().or_else(|| {
+                    (!provider.capabilities.chat).then(|| "no chat capability".to_owned())
+                });
                 let version = provider
                     .version
                     .as_ref()
@@ -2583,9 +2603,10 @@ impl HostWorkspace {
                     None => row,
                 };
                 if unavailable.is_none() && enabled {
-                    row = row.on_click(cx.listener(move |view, _, _, cx| {
-                        view.choose_chat_provider(id.clone(), cx)
-                    }));
+                    row =
+                        row.on_click(cx.listener(move |view, _, _, cx| {
+                            view.choose_chat_provider(id.clone(), cx)
+                        }));
                 }
                 card = card.child(row);
             }
@@ -2609,9 +2630,7 @@ impl HostWorkspace {
                             t,
                         )
                         .when(enabled, |d| {
-                            d.on_click(
-                                cx.listener(|view, _, _, cx| view.cycle_chat_permission(cx)),
-                            )
+                            d.on_click(cx.listener(|view, _, _, cx| view.cycle_chat_permission(cx)))
                         }),
                     ),
             );
@@ -2641,7 +2660,11 @@ impl HostWorkspace {
 // ---- inbox dialog and toasts ---------------------------------------------
 
 impl HostWorkspace {
-    pub(super) fn render_chat_dialog(&self, t: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
+    pub(super) fn render_chat_dialog(
+        &self,
+        t: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
         if !self.chat.inbox_open {
             return None;
         }
@@ -2685,7 +2708,11 @@ impl HostWorkspace {
                     .border_1()
                     .border_color(t.border)
                     .text_size(t.text_size_sm)
-                    .child(ui_chip(inbox_kind_label(item.kind), inbox_kind_color(item.kind, t), t))
+                    .child(ui_chip(
+                        inbox_kind_label(item.kind),
+                        inbox_kind_color(item.kind, t),
+                        t,
+                    ))
                     .child(
                         div()
                             .flex()
@@ -2696,16 +2723,14 @@ impl HostWorkspace {
                                     .text_color(t.text_primary)
                                     .child(SharedString::from(item.title.clone())),
                             )
-                            .child(
-                                div()
-                                    .text_color(t.text_tertiary)
-                                    .child(SharedString::from(format!(
-                                        "{} · {} · {}",
-                                        self.chat.session_label(session),
-                                        inbox_state_label(item.state),
-                                        format_clock(item.created_ms)
-                                    ))),
-                            ),
+                            .child(div().text_color(t.text_tertiary).child(SharedString::from(
+                                format!(
+                                    "{} · {} · {}",
+                                    self.chat.session_label(session),
+                                    inbox_state_label(item.state),
+                                    format_clock(item.created_ms)
+                                ),
+                            ))),
                     )
                     .child(div().flex_1())
                     .child(ui_chip(short_uuid(worktree), t.text_tertiary, t))
@@ -2719,14 +2744,18 @@ impl HostWorkspace {
                     .child(
                         ui_button(
                             "inbox-dismiss",
-                            if dismiss_pending { "Dismissing…" } else { "Dismiss" },
+                            if dismiss_pending {
+                                "Dismissing…"
+                            } else {
+                                "Dismiss"
+                            },
                             dismissable,
                             t,
                         )
                         .when(dismissable, |d| {
-                            d.on_click(cx.listener(move |view, _, _, cx| {
-                                view.dismiss_chat_inbox(id, cx)
-                            }))
+                            d.on_click(
+                                cx.listener(move |view, _, _, cx| view.dismiss_chat_inbox(id, cx)),
+                            )
                         }),
                     ),
             );
@@ -2790,7 +2819,11 @@ impl HostWorkspace {
         )
     }
 
-    pub(super) fn render_chat_toasts(&self, t: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
+    pub(super) fn render_chat_toasts(
+        &self,
+        t: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
         if self.chat.toasts.is_empty() {
             return None;
         }
@@ -2807,78 +2840,70 @@ impl HostWorkspace {
             let session = toast.session;
             let seq = toast.seq;
             let color = toast_color(toast.kind, t);
-            stack = stack.child(
-                div()
-                    .id(SharedString::from(format!("toast-{session}-{seq}")))
-                    .flex()
-                    .flex_col()
-                    .gap(px(2.))
-                    .p(px(8.))
-                    .rounded(t.radius_md)
-                    .bg(t.surface_raised)
-                    .border_1()
-                    .border_color(color)
-                    .shadow_lg()
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(6.))
-                            .child(ui_chip("in-app", t.text_tertiary, t))
-                            .child(
-                                div()
-                                    .text_color(color)
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .child(SharedString::from(toast.title.clone())),
-                            )
-                            .child(div().flex_1())
-                            .child(
-                                div()
-                                    .id(SharedString::from(format!("toast-close-{session}-{seq}")))
-                                    .px(px(3.))
-                                    .cursor_pointer()
-                                    .text_color(t.text_tertiary)
-                                    .child("×")
-                                    .on_click(cx.listener(move |view, _, _, cx| {
-                                        view.dismiss_toast(session, seq, cx)
-                                    })),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .text_color(t.text_secondary)
-                            .child(SharedString::from(format!(
-                                "{} · event {}",
-                                self.chat.session_label(session),
-                                seq
-                            ))),
-                    )
-                    .child(
-                        div()
-                            .id(SharedString::from(format!("toast-open-{session}-{seq}")))
-                            .cursor_pointer()
-                            .text_color(t.accent)
-                            .child("Open chat")
-                            .on_click(cx.listener(move |view, _, window, cx| {
-                                view.open_toast(session, seq, window, cx)
-                            })),
-                    ),
-            );
+            stack =
+                stack.child(
+                    div()
+                        .id(SharedString::from(format!("toast-{session}-{seq}")))
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.))
+                        .p(px(8.))
+                        .rounded(t.radius_md)
+                        .bg(t.surface_raised)
+                        .border_1()
+                        .border_color(color)
+                        .shadow_lg()
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(6.))
+                                .child(ui_chip("in-app", t.text_tertiary, t))
+                                .child(
+                                    div()
+                                        .text_color(color)
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .child(SharedString::from(toast.title.clone())),
+                                )
+                                .child(div().flex_1())
+                                .child(
+                                    div()
+                                        .id(SharedString::from(format!(
+                                            "toast-close-{session}-{seq}"
+                                        )))
+                                        .px(px(3.))
+                                        .cursor_pointer()
+                                        .text_color(t.text_tertiary)
+                                        .child("×")
+                                        .on_click(cx.listener(move |view, _, _, cx| {
+                                            view.dismiss_toast(session, seq, cx)
+                                        })),
+                                ),
+                        )
+                        .child(div().text_color(t.text_secondary).child(SharedString::from(
+                            format!("{} · event {}", self.chat.session_label(session), seq),
+                        )))
+                        .child(
+                            div()
+                                .id(SharedString::from(format!("toast-open-{session}-{seq}")))
+                                .cursor_pointer()
+                                .text_color(t.accent)
+                                .child("Open chat")
+                                .on_click(cx.listener(move |view, _, window, cx| {
+                                    view.open_toast(session, seq, window, cx)
+                                })),
+                        ),
+                );
         }
         if self.chat.toasts.len() > 1 {
-            stack = stack.child(
-                div()
-                    .flex()
-                    .justify_end()
-                    .child(
-                        ui_button("toasts-clear", "Clear all", true, t).on_click(
-                            cx.listener(|view, _, _, cx| {
-                                view.chat.toasts.clear();
-                                cx.notify();
-                            }),
-                        ),
-                    ),
-            );
+            stack = stack.child(div().flex().justify_end().child(
+                ui_button("toasts-clear", "Clear all", true, t).on_click(cx.listener(
+                    |view, _, _, cx| {
+                        view.chat.toasts.clear();
+                        cx.notify();
+                    },
+                )),
+            ));
         }
         Some(stack.into_any_element())
     }
@@ -2991,14 +3016,11 @@ fn render_markdown(text: &str, t: &Theme) -> Vec<AnyElement> {
                     );
                 }
                 for line in text.split('\n') {
-                    block = block.child(
-                        div()
-                            .child(if line.is_empty() {
-                                SharedString::from(" ")
-                            } else {
-                                SharedString::from(line.to_owned())
-                            }),
-                    );
+                    block = block.child(div().child(if line.is_empty() {
+                        SharedString::from(" ")
+                    } else {
+                        SharedString::from(line.to_owned())
+                    }));
                 }
                 block.into_any_element()
             }
@@ -3058,13 +3080,11 @@ fn mono_block(text: &str, t: &Theme) -> AnyElement {
         .line_height(px(17.))
         .text_color(t.text_primary);
     for line in text.split('\n') {
-        block = block.child(
-            div().child(if line.is_empty() {
-                SharedString::from(" ")
-            } else {
-                SharedString::from(line.to_owned())
-            }),
-        );
+        block = block.child(div().child(if line.is_empty() {
+            SharedString::from(" ")
+        } else {
+            SharedString::from(line.to_owned())
+        }));
     }
     block.into_any_element()
 }
@@ -3176,7 +3196,11 @@ fn ui_button(
         .rounded(t.radius_sm)
         .bg(if enabled { t.control_bg } else { t.surface_bg })
         .text_size(t.text_size_sm)
-        .text_color(if enabled { t.text_primary } else { t.text_tertiary })
+        .text_color(if enabled {
+            t.text_primary
+        } else {
+            t.text_tertiary
+        })
         .when(enabled, |d| d.cursor_pointer().hover(move |s| s.bg(hover)))
         .child(label)
 }

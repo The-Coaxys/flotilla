@@ -152,9 +152,10 @@ fn build_rows(events: &[EventRecord], resolved: &HashSet<String>) -> Vec<Transcr
                 kind: RowKind::User { text: text.clone() },
             }),
             ChatEvent::AssistantText { id, update, text } => {
-                let index = last_index(&rows, |kind| {
-                    matches!(kind, RowKind::Assistant { id: known, .. } if known == id)
-                });
+                let index = last_index(
+                    &rows,
+                    |kind| matches!(kind, RowKind::Assistant { id: known, .. } if known == id),
+                );
                 match index {
                     Some(index) => {
                         if let RowKind::Assistant {
@@ -184,9 +185,10 @@ fn build_rows(events: &[EventRecord], resolved: &HashSet<String>) -> Vec<Transcr
                 }
             }
             ChatEvent::Thinking { id, delta } => {
-                let index = last_index(&rows, |kind| {
-                    matches!(kind, RowKind::Thinking { id: known, .. } if known == id)
-                });
+                let index = last_index(
+                    &rows,
+                    |kind| matches!(kind, RowKind::Thinking { id: known, .. } if known == id),
+                );
                 match index {
                     Some(index) => {
                         if let RowKind::Thinking { text, .. } = &mut rows[index].kind {
@@ -204,9 +206,10 @@ fn build_rows(events: &[EventRecord], resolved: &HashSet<String>) -> Vec<Transcr
                 }
             }
             ChatEvent::ToolCall(call) => {
-                let index = last_index(&rows, |kind| {
-                    matches!(kind, RowKind::Tool(tool) if tool.id == call.id)
-                });
+                let index = last_index(
+                    &rows,
+                    |kind| matches!(kind, RowKind::Tool(tool) if tool.id == call.id),
+                );
                 match index {
                     Some(index) => {
                         if let RowKind::Tool(tool) = &mut rows[index].kind {
@@ -221,9 +224,10 @@ fn build_rows(events: &[EventRecord], resolved: &HashSet<String>) -> Vec<Transcr
                 }
             }
             ChatEvent::ToolOutput { id, delta } => {
-                let index = last_index(&rows, |kind| {
-                    matches!(kind, RowKind::Tool(tool) if &tool.id == id)
-                });
+                let index = last_index(
+                    &rows,
+                    |kind| matches!(kind, RowKind::Tool(tool) if &tool.id == id),
+                );
                 if let Some(index) = index
                     && let RowKind::Tool(tool) = &mut rows[index].kind
                 {
@@ -246,9 +250,10 @@ fn build_rows(events: &[EventRecord], resolved: &HashSet<String>) -> Vec<Transcr
                 details,
                 options,
             } => {
-                let index = last_index(&rows, |kind| {
-                    matches!(kind, RowKind::Approval { id: known, .. } if known == id)
-                });
+                let index = last_index(
+                    &rows,
+                    |kind| matches!(kind, RowKind::Approval { id: known, .. } if known == id),
+                );
                 match index {
                     Some(index) => {
                         if let RowKind::Approval {
@@ -284,9 +289,10 @@ fn build_rows(events: &[EventRecord], resolved: &HashSet<String>) -> Vec<Transcr
                 questions,
                 schema_json,
             } => {
-                let index = last_index(&rows, |kind| {
-                    matches!(kind, RowKind::Question { id: known, .. } if known == id)
-                });
+                let index = last_index(
+                    &rows,
+                    |kind| matches!(kind, RowKind::Question { id: known, .. } if known == id),
+                );
                 match index {
                     Some(index) => {
                         if let RowKind::Question {
@@ -319,9 +325,10 @@ fn build_rows(events: &[EventRecord], resolved: &HashSet<String>) -> Vec<Transcr
                 if children.is_empty() {
                     continue;
                 }
-                let index = last_index(&rows, |kind| {
-                    matches!(kind, RowKind::Tool(tool) if &tool.id == parent_tool_id)
-                });
+                let index = last_index(
+                    &rows,
+                    |kind| matches!(kind, RowKind::Tool(tool) if &tool.id == parent_tool_id),
+                );
                 match index {
                     Some(index) => {
                         if let RowKind::Tool(tool) = &mut rows[index].kind {
@@ -1067,20 +1074,24 @@ pub fn seen_sequences(events: &HashMap<uuid::Uuid, Vec<EventRecord>>) -> HashMap
 }
 
 /// Sessions of one worktree, newest first, for the Chat panel.
-pub fn sessions_newest_first(sessions: &[&ChatSession]) -> Vec<&ChatSession> {
+pub fn sessions_newest_first<'a>(sessions: &[&'a ChatSession]) -> Vec<&'a ChatSession> {
     let mut sorted = sessions.to_vec();
-    sorted.sort_by(|a, b| b.created_ms.cmp(&a.created_ms).then_with(|| a.id.cmp(&b.id)));
+    sorted.sort_by(|a, b| {
+        b.created_ms
+            .cmp(&a.created_ms)
+            .then_with(|| a.id.cmp(&b.id))
+    });
     sorted
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fl_model::WorktreeId;
     use fl_model::chat::{
         ApprovalDecision, BoundedText, ChatEvent, EventRecord, InboxKind, PermissionMode, Question,
         QuestionOption, ResumeTarget, StatusSource, TextUpdate, ToolStatus,
     };
-    use fl_model::WorktreeId;
 
     fn record(sequence: u64, event: ChatEvent) -> EventRecord {
         EventRecord {
@@ -1172,11 +1183,7 @@ mod tests {
         let rows = build_transcript(&events);
         assert_eq!(rows.len(), 2);
         match &rows[0].kind {
-            RowKind::Assistant {
-                id,
-                text,
-                complete,
-            } => {
+            RowKind::Assistant { id, text, complete } => {
                 assert_eq!(id, "m1");
                 assert_eq!(text, "Hello, world.");
                 assert!(complete);
@@ -1225,7 +1232,10 @@ mod tests {
                     },
                 },
             ),
-            record(4, ChatEvent::ToolCall(call(ToolStatus::Completed, Some("running 2 tests")))),
+            record(
+                4,
+                ChatEvent::ToolCall(call(ToolStatus::Completed, Some("running 2 tests"))),
+            ),
         ];
         let rows = build_transcript(&events);
         assert_eq!(rows.len(), 1);
@@ -1343,7 +1353,8 @@ mod tests {
 
     #[test]
     fn unified_diff_numbers_lines_and_marks_truncation() {
-        let source = "diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1,2 +1,3 @@\n context\n-old\n+new\n+extra\n";
+        let source =
+            "diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1,2 +1,3 @@\n context\n-old\n+new\n+extra\n";
         let parsed = parse_unified_diff(source);
         assert!(!parsed.truncated);
         assert_eq!(parsed.rows[0].kind, DiffKind::File);
@@ -1397,7 +1408,9 @@ mod tests {
         ];
         let mut draft = AnswerDraft::default();
         draft.choices.insert("q1".into(), vec!["One".into()]);
-        draft.choices.insert("q2".into(), vec!["A".into(), "B".into()]);
+        draft
+            .choices
+            .insert("q2".into(), vec!["A".into(), "B".into()]);
         draft.free.insert("q3".into(), "typed".into());
         let response = build_question_response(&questions, None, &draft).unwrap();
         assert_eq!(response.answers["q1"], vec!["One"]);
@@ -1413,14 +1426,18 @@ mod tests {
         );
 
         let mut wrong = draft.clone();
-        wrong.choices.insert("q1".into(), vec!["One".into(), "Two".into()]);
+        wrong
+            .choices
+            .insert("q1".into(), vec!["One".into(), "Two".into()]);
         assert_eq!(
             build_question_response(&questions, None, &wrong),
             Err(AnswerError::TooManyChoices("q1".into()))
         );
 
         let mut not_offered = draft.clone();
-        not_offered.choices.insert("q1".into(), vec!["Three".into()]);
+        not_offered
+            .choices
+            .insert("q1".into(), vec!["Three".into()]);
         assert!(matches!(
             build_question_response(&questions, None, &not_offered),
             Err(AnswerError::NotOffered { .. })
@@ -1457,10 +1474,7 @@ mod tests {
             inbox(5, InboxState::Read, 3_000),
         ];
         let ordered = ordered_inbox(&items);
-        let ids: Vec<u128> = ordered
-            .iter()
-            .map(|item| item.id.as_u128())
-            .collect();
+        let ids: Vec<u128> = ordered.iter().map(|item| item.id.as_u128()).collect();
         assert_eq!(ids, vec![3, 2, 5, 1]);
     }
 
