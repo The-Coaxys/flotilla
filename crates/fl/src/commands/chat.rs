@@ -130,6 +130,9 @@ async fn new(
         })
         .await?
     {
+        Response::ChatSessions(sessions) if sessions.len() == 1 => {
+            sessions.into_iter().next().expect("length checked")
+        }
         Response::ChatSession(session) => session,
         other => return Err(unexpected("chat session", &other)),
     };
