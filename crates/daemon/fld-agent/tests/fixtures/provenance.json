@@ -37,13 +37,51 @@
     "codex-contract.recorded.json": {
       "invocation": "codex app-server generate-json-schema --out <temporary directory>",
       "projection": "Required field lists and property names for adapter-used request/notification methods, projected from generated method unions."
+    },
+    "cursor-create-chat.recorded.txt": {
+      "invocation": "cursor-agent create-chat",
+      "projection": "The returned chat UUID is retained; no prompt, model request or tool run occurred.",
+      "source": "installed cursor-agent 2026.07.01-41b2de7"
+    },
+    "acp-opencode-initialize.recorded.jsonl": {
+      "invocation": "opencode acp (ACP initialize, protocolVersion 1)",
+      "projection": "Only jsonrpc/id/result protocolVersion, agentCapabilities and agentInfo retained; auth method descriptions omitted.",
+      "source": "installed opencode 1.18.30"
+    },
+    "acp-hermes-initialize.recorded.jsonl": {
+      "invocation": "hermes acp (ACP initialize, protocolVersion 1)",
+      "projection": "Only jsonrpc/id/result protocolVersion, agentCapabilities and agentInfo retained; auth method descriptions omitted.",
+      "source": "installed hermes-agent 0.22.5"
+    },
+    "acp-opencode-session-new.recorded.jsonl": {
+      "invocation": "opencode acp session/new {cwd:/tmp, mcpServers:[]}",
+      "projection": "Only sessionId retained; configOptions/models omitted because they reflect account state.",
+      "source": "installed opencode 1.18.30"
+    },
+    "pi-handshake.recorded.jsonl": {
+      "invocation": "pi --mode rpc --no-session; stdin {id:init,type:get_state}",
+      "projection": "Only id/type/command/success and data sessionId,isStreaming,model.id retained; system prompt and account settings omitted.",
+      "source": "installed pi 1.4.0"
+    },
+    "omp-handshake.recorded.jsonl": {
+      "invocation": "omp --mode rpc --no-session; stdin {id:init,type:get_state}",
+      "projection": "ready frame reduced to protocol facts; get_state response reduced to sessionId,isStreaming,model.id. Notices and command catalogs omitted.",
+      "source": "installed omp 18.16.0"
     }
   },
   "synthetic": [
     "claude-turn.synthetic.jsonl",
-    "codex-turn.synthetic.jsonl"
+    "codex-turn.synthetic.jsonl",
+    "acp-turn.synthetic.jsonl",
+    "cursor-turn.synthetic.jsonl",
+    "pi-turn.synthetic.jsonl"
   ],
   "claude_control_source": "https://github.com/anthropics/claude-agent-sdk-python/blob/main/src/claude_agent_sdk/_internal/query.py",
   "claude_permission_routing_source": "https://github.com/anthropics/claude-agent-sdk-python/blob/main/src/claude_agent_sdk/types.py",
-  "notes": "SDK stdio permission control is used instead of an MCP approval server; both route human decisions without auto-approval. Synthetic turns test protocol normalization, not live model responses."
+  "notes": "SDK stdio permission control is used instead of an MCP approval server; both route human decisions without auto-approval. Synthetic turns test protocol normalization, not live model responses. M5 fixtures were recorded from the installed CLIs above with initialize/get_state/create-chat only; no prompt or model request was sent. Synthetic turns exercise normalization, permission denial and malformed/oversized handling.",
+  "cursor_version": "2026.07.01-41b2de7",
+  "pi_version": "1.4.0",
+  "omp_version": "18.16.0",
+  "opencode_version": "1.18.30",
+  "hermes_version": "0.22.5"
 }

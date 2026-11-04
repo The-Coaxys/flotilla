@@ -10,12 +10,24 @@ pub const CHAT_SCHEMA_VERSION: u16 = 1;
 pub enum AdapterKind {
     ClaudeStream,
     CodexAppServer,
+    /// Generic Agent Client Protocol (ACP) JSON-RPC over stdio.
+    Acp,
+    /// Cursor headless `--output-format stream-json` one process per turn.
+    CursorStreamJson,
+    /// Pi / Oh My Pi `--mode rpc` JSONL protocol.
+    PiRpc,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ResumeStrategy {
     ClaudeSession,
     CodexThread,
+    /// ACP `session/load` or the unstable `session/resume` capability.
+    AcpSession,
+    /// Cursor chat ID created by `create-chat` and reread via `--resume`.
+    CursorChat,
+    /// Pi / OMP session ID from `get_state`.
+    PiSession,
 }
 
 /// Trusted, user-owned launch configuration; never populated from provider output.
@@ -271,6 +283,38 @@ pub enum ChatEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn every_adapter_and_resume_strategy_round_trips_on_wire_and_postcard() {
+        let pairs = [
+            (AdapterKind::ClaudeStream, ResumeStrategy::ClaudeSession),
+            (AdapterKind::CodexAppServer, ResumeStrategy::CodexThread),
+            (AdapterKind::Acp, ResumeStrategy::AcpSession),
+            (AdapterKind::CursorStreamJson, ResumeStrategy::CursorChat),
+            (AdapterKind::PiRpc, ResumeStrategy::PiSession),
+        ];
+        for (adapter, resume) in pairs {
+            let json = serde_json::to_string(&adapter).unwrap();
+            assert_eq!(serde_json::from_str::<AdapterKind>(&json).unwrap(), adapter);
+            let bytes = postcard::to_stdvec(&adapter).unwrap();
+            assert_eq!(postcard::from_bytes::<AdapterKind>(&bytes).unwrap(), adapter);
+            let json = serde_json::to_string(&resume).unwrap();
+            assert_eq!(
+                serde_json::from_str::<ResumeStrategy>(&json).unwrap(),
+                resume
+            );
+            let bytes = postcard::to_stdvec(&resume).unwrap();
+            assert_eq!(
+                postcard::from_bytes::<ResumeStrategy>(&bytes).unwrap(),
+                resume
+            );
+        }
+        // Wire names are part of the persisted route contract.
+        assert_eq!(
+            serde_json::to_string(&AdapterKind::CursorStreamJson).unwrap(),
+            "\"CursorStreamJson\""
+        );
+    }
+
     #[test]
     fn nested_events_and_configs_are_binary_durable() {
         let record = EventRecord {

@@ -1,4 +1,5 @@
-//! Concrete subprocess adapters for Claude Code stream-json and Codex app-server.
+//! Concrete subprocess adapters: Claude Code stream-json, Codex app-server,
+//! generic ACP, Cursor stream-json and Pi/OMP rpc.
 //!
 //! # Contract
 //! `ProviderRegistry::discover` probes bounded CLI help/version output and a real
@@ -33,8 +34,12 @@
 //! This example never approves by default. Adapter protocol fixtures contain
 //! recorded local initialize responses plus explicitly labeled synthetic turn
 //! transcripts; no live model response is claimed by those fixtures.
+mod acp;
 mod claude;
 mod codex;
+mod cursor;
+mod host;
+mod pi;
 mod process;
 mod registry;
 
@@ -99,7 +104,14 @@ struct Command {
 impl Adapter {
     pub async fn launch(provider: ProviderSpec, config: SessionConfig) -> Result<Self> {
         registry::validate_provider(&provider)?;
-        process::launch(provider, config).await
+        match provider.adapter {
+            AdapterKind::ClaudeStream | AdapterKind::CodexAppServer => {
+                process::launch(provider, config).await
+            }
+            AdapterKind::Acp => acp::launch(provider, config).await,
+            AdapterKind::CursorStreamJson => cursor::launch(provider, config).await,
+            AdapterKind::PiRpc => pi::launch(provider, config).await,
+        }
     }
     pub fn state(&self) -> SessionState {
         self.state.borrow().clone()

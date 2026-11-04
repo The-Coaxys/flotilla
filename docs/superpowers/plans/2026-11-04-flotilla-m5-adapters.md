@@ -54,4 +54,33 @@ exists, terminal otherwise — and a chat can switch to a terminal and back.
 
 ## Evidence
 
-Not started. Nothing here is claimed verified until its live smoke is recorded in this file.
+Recorded 2026-11-04 on the integration host. Fixtures and their provenance live in
+`crates/daemon/fld-agent/tests/fixtures/`; every recorded handshake below was performed by
+the adapter/discovery code with bound timeouts and no prompt or model request.
+
+| Surface | Installed version | Verified |
+|---|---|---|
+| ACP initialize (`opencode acp`) | opencode 1.18.30 | `initialize` returned protocolVersion 1 with `loadSession`; `session/new` returned a session ID; `session/set_model` returned an empty result |
+| ACP initialize (`hermes acp`) | hermes-agent 0.22.5 | `initialize` returned protocolVersion 1 with `loadSession` and `sessionCapabilities.resume` |
+| Cursor `create-chat` + flag set | cursor-agent 2026.07.01-41b2de7 | `--help` exposes `-p`, `--output-format stream-json`, `--stream-partial-output`, `--resume`, `--mode`, `create-chat`; `create-chat` returned a UUID |
+| Pi `--mode rpc` `get_state` | pi 1.4.0 | Response returned a UUID session ID and model; JSONL framing matched `docs/rpc.md` |
+| OMP `--mode rpc` `get_state` | omp 18.16.0 | `ready` announced protocol 1 (supports 1/2); `get_state` returned a UUID session ID |
+
+Adapter IDs and capabilities (`ProviderRegistry::discover`; ACP rows require a configured
+override such as command `opencode`, args `["acp"]`):
+
+| id | adapter | chat | resume | steer | approvals | questions | partial |
+|---|---|---|---|---|---|---|---|
+| `cursor` | CursorStreamJson | yes | yes | no | no | no | yes |
+| `pi` | PiRpc | yes | yes | yes | no | yes | yes |
+| `omp` | PiRpc | yes | yes | yes | no | yes | yes |
+| configured ACP | Acp | yes | if advertised | no | yes | no | yes |
+
+Unverified without credentials/model use: live streaming turns for any provider, real ACP
+`session/request_permission` traffic, Cursor `interaction_query` decisions, Pi extension UI
+dialogs, and ACP `session/load`/`session/resume` against a stored session. These paths are
+covered by synthetic protocol fixtures and unit tests; they are not claimed as live-verified.
+Cursor headless has no client response channel for permission queries, so its approvals and
+questions capabilities are false and queries are surfaced as diagnostics instead of being
+auto-approved. Pi/OMP read-only mode is rejected explicitly because their built-in tools
+execute without a client permission prompt.
