@@ -33,6 +33,8 @@ use super::host_view::{primary_button, secondary_button};
 
 #[path = "host_sections.rs"]
 mod sections;
+#[path = "host_routes.rs"]
+mod routes;
 
 /// Largest file the editor opens (the daemon's read limit).
 const READ_LIMIT: u32 = 8 * 1024 * 1024;
@@ -145,6 +147,7 @@ pub struct HostWorkspace {
     dialog: Option<Dialog>,
     review: review::ReviewUi,
     sections_ui: sections::SectionsUi,
+    routes_ui: routes::RoutesUi,
     banner: Option<SharedString>,
     rtt: Option<Duration>,
     /// A just-added project whose primary checkout opens once the daemon's
@@ -276,6 +279,7 @@ impl HostWorkspace {
             dialog: None,
             review: review::ReviewUi::default(),
             sections_ui: sections::SectionsUi::default(),
+            routes_ui: routes::RoutesUi::default(),
             banner: None,
             rtt: None,
             pending_select: None,
@@ -390,7 +394,13 @@ impl HostWorkspace {
         })
     }
 
-    fn run_git_action(&mut self, action: GitAction, window: &mut Window, cx: &mut Context<Self>) {
+    fn run_git_action(
+        &mut self,
+        action: GitAction,
+        alternate: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.git_menu = false;
         let Some(worktree) = self.selected_worktree().cloned() else {
             return;
@@ -416,6 +426,7 @@ impl HostWorkspace {
                 self.panel_open = true;
                 self.panel = Panel::Checks;
             }
+            GitAction::RefreshChecks => self.refresh_checks(id, cx),
             GitAction::DeleteWorktree => self.open_delete(id, cx),
             GitAction::Push => self.git_call("Pushing…", cx, move |sync| async move {
                 sync.git_push(id).await
@@ -426,8 +437,40 @@ impl HostWorkspace {
             GitAction::MarkReady => self.git_call("Marking ready…", cx, move |sync| async move {
                 sync.mark_ready(id).await.map(|_| ())
             }),
+            GitAction::CommitPush
+            | GitAction::Resolve
+            | GitAction::FixCi
+            | GitAction::FixChanges
+            | GitAction::FixComments
+            | GitAction::Investigate => {
+                let Some(task) = action.task() else {
+                    return;
+                };
+                self.dispatch_routed(id, task, alternate, cx);
+            }
             GitAction::AwaitingReview | GitAction::UpToDate => {}
         }
+        cx.notify();
+    }
+
+    /// Ask the forge for fresh checks and review state now.
+    fn refresh_checks(&mut self, worktree: WorktreeId, cx: &mut Context<Self>) {
+        if self.git_busy.is_some() {
+            return;
+        }
+        self.git_busy = Some("Refreshing checks…");
+        let sync = self.sync.clone();
+        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let result = sync.forge_status(worktree).await;
+            let _ = this.update(cx, |view, cx| {
+                view.git_busy = None;
+                if let Err(error) = result {
+                    view.show_error(error_text(&error), cx);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
         cx.notify();
     }
 
@@ -1220,10 +1263,11 @@ impl HostWorkspace {
     }
 
     fn close_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.sections_ui.busy {
+        if self.sections_ui.busy || self.routes_ui.busy {
             return;
         }
         self.sections_ui.close();
+        self.routes_ui.close();
         self.dialog = None;
         window.focus(&self.focus);
         cx.notify();
@@ -1493,13 +1537,20 @@ impl HostWorkspace {
             .map(|s| s.summary.clone());
         let panel_open = self.panel_open;
         let hover = t.raised_hover;
+        let worktree_id = worktree.map(|w| w.id);
         let git_button = worktree
             .filter(|w| !self.is_folder(w))
             .and_then(|w| self.git_context(w))
             .map(|context| {
                 let action = git_actions::primary(context);
-                let label: SharedString = self.git_busy.unwrap_or(action.label()).into();
-                let actionable = action.actionable() && self.git_busy.is_none();
+                let dispatching =
+                    worktree_id.is_some_and(|id| self.dispatch_pending(id));
+                let label: SharedString = if dispatching {
+                    "Dispatching…".into()
+                } else {
+                    self.git_busy.unwrap_or(action.label()).into()
+                };
+                let actionable = action.actionable() && self.git_busy.is_none() && !dispatching;
                 div()
                     .flex()
                     .items_center()
@@ -1517,9 +1568,17 @@ impl HostWorkspace {
                             .px(px(10.))
                             .cursor_pointer()
                             .child(label)
-                            .on_click(cx.listener(move |view, _, window, cx| {
-                                if view.git_busy.is_none() {
-                                    view.run_git_action(action, window, cx)
+                            .on_click(cx.listener(move |view, event, window, cx| {
+                                if view.git_busy.is_none()
+                                    && !worktree_id
+                                        .is_some_and(|id| view.dispatch_pending(id))
+                                {
+                                    view.run_git_action(
+                                        action,
+                                        event.modifiers().control,
+                                        window,
+                                        cx,
+                                    )
                                 }
                             })),
                     )
@@ -1801,7 +1860,7 @@ impl HostWorkspace {
             .occlude()
             .bottom(px(32.))
             .right(px(if self.panel_open { 330. } else { 10. }))
-            .w(px(220.))
+            .w(px(320.))
             .py(px(4.))
             .flex()
             .flex_col()
@@ -1811,6 +1870,15 @@ impl HostWorkspace {
             .border_color(t.border)
             .shadow_lg();
         for (index, action) in actions.into_iter().enumerate() {
+            // A routed entry states the click mode it will use; Ctrl+click
+            // uses the route's alternate mode instead.
+            let hint = action
+                .task()
+                .and_then(|task| self.route_click_hint(worktree, task));
+            let label: SharedString = match hint {
+                Some(mode) => format!("{} · {}", action.label(), mode.label()).into(),
+                None => action.label().into(),
+            };
             menu = menu.child(
                 div()
                     .id(("git-action", index))
@@ -1821,9 +1889,9 @@ impl HostWorkspace {
                     .cursor_pointer()
                     .hover(move |s| s.bg(hover))
                     .when(!action.actionable(), |d| d.text_color(t.text_tertiary))
-                    .child(action.label())
-                    .on_click(cx.listener(move |view, _, window, cx| {
-                        view.run_git_action(action, window, cx)
+                    .child(label)
+                    .on_click(cx.listener(move |view, event, window, cx| {
+                        view.run_git_action(action, event.modifiers().control, window, cx)
                     })),
             );
         }
@@ -2162,6 +2230,9 @@ impl HostWorkspace {
 
     fn render_dialog(&self, t: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
         if let Some(dialog) = self.render_sections_dialog(t, cx) {
+            return Some(dialog);
+        }
+        if let Some(dialog) = self.render_routes_dialog(t, cx) {
             return Some(dialog);
         }
         let dialog = self.dialog.as_ref()?;
@@ -2541,6 +2612,7 @@ impl Render for HostWorkspace {
         let banner = self.banner.clone();
         let dialog = self.render_dialog(&t, cx);
         let git_menu = self.render_git_menu(&t, cx);
+        let dispatches = self.render_dispatch_strip(&t, cx);
         div()
             .track_focus(&self.focus)
             .relative()
@@ -2571,6 +2643,7 @@ impl Render for HostWorkspace {
                     })
                     .children(strip)
                     .child(div().flex_1().min_h(px(0.)).child(content))
+                    .when_some(dispatches, |d, strip| d.child(strip))
                     .child(bottom),
             )
             .children(panel)

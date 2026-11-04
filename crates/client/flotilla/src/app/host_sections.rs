@@ -372,6 +372,9 @@ impl HostWorkspace {
         for workspace in workspaces {
             let workspace_id = workspace.id;
             let enabled = self.sections_enabled();
+            let routes_enabled = self.state.live
+                && self.routing().is_some()
+                && !self.routes_ui.busy;
             column = column.child(
                 div()
                     .mt(px(8.))
@@ -397,6 +400,19 @@ impl HostWorkspace {
                                 }))
                             },
                         ),
+                    )
+                    .child(
+                        action(
+                            format!("routes-{workspace_id}"),
+                            "Routes",
+                            routes_enabled,
+                            t,
+                        )
+                        .when(routes_enabled, |d| {
+                            d.on_click(cx.listener(move |view, _, _, cx| {
+                                view.open_routes(workspace_id, cx)
+                            }))
+                        }),
                     ),
             );
             let mut projects: Vec<_> = tree
