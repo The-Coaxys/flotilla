@@ -5,11 +5,13 @@
 use std::time::{Duration, Instant};
 
 use fl_model::layout::LayoutOp;
+use fl_model::workspace::LayoutScope;
 use fl_model::{PaneId, Size, TabId, TerminalId, ViewId};
 use fl_proto::{ClipboardTarget, TerminalNotice};
 use flc_conn::supervisor::{Supervisor, TransportKind};
 use flc_sync::{
     Config, DiscardReason, MirrorEvent, MirrorHandle, MirrorStatus, Sync, WorkspaceState,
+    WorkspacesState,
 };
 use tokio::sync::watch;
 
@@ -519,6 +521,148 @@ async fn titles_follow_state_and_live_notices_arrive_once() {
             "replayed {event:?}"
         );
     }
+    sync.shutdown().await;
+    sup.shutdown().await;
+}
+
+fn git(dir: &std::path::Path, args: &[&str]) {
+    let status = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .env("GIT_AUTHOR_NAME", "t")
+        .env("GIT_AUTHOR_EMAIL", "t@example.com")
+        .env("GIT_COMMITTER_NAME", "t")
+        .env("GIT_COMMITTER_EMAIL", "t@example.com")
+        .status()
+        .unwrap();
+    assert!(status.success(), "git {args:?}");
+}
+
+async fn wait_workspaces(
+    sync: &Sync,
+    what: &str,
+    pred: impl Fn(&WorkspacesState) -> bool,
+) -> std::sync::Arc<WorkspacesState> {
+    let mut changes = sync.workspaces_changes();
+    let deadline = Instant::now() + WAIT;
+    loop {
+        if pred(&changes.borrow()) {
+            return changes.borrow().clone();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "workspaces never satisfied: {what}"
+        );
+        let _ = tokio::time::timeout(Duration::from_millis(200), changes.changed()).await;
+    }
+}
+
+/// The client follows the daemon's workspaces: the tree and live +/- counts
+/// arrive as pushed events, and a worktree's own layout spawns shells in
+/// that worktree. A reconnect refetches everything.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn workspaces_status_and_worktree_layouts_follow_the_daemon() {
+    let mut h = Harness::new().await;
+    let repo = h.dir.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    std::fs::write(repo.join("a.txt"), "one\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-q", "-m", "init"]);
+
+    let sup = Supervisor::spawn(h.spec(true));
+    let mut links = sup.links();
+    let _ = wait_link(&mut links, WAIT, "QUIC link", |link| {
+        link.kind() == TransportKind::Quic
+    })
+    .await;
+    let sync = Sync::new(links.clone(), None, Config::default());
+    let state = wait_workspaces(&sync, "initial tree", |s| s.live && s.tree.is_some()).await;
+    let workspace = state.tree.as_ref().unwrap().workspaces[0].id;
+
+    let project = sync
+        .add_project(workspace, repo.display().to_string())
+        .await
+        .unwrap();
+    let worktree = sync
+        .create_worktree(project.id, Some("task".into()), None)
+        .await
+        .unwrap();
+    wait_workspaces(&sync, "worktree in tree", |s| {
+        s.worktree(worktree.id).is_some()
+    })
+    .await;
+
+    // Live counts: a pushed status event reflects an edit.
+    std::fs::write(std::path::Path::new(&worktree.path).join("b.txt"), "x\ny\n").unwrap();
+    let state = wait_workspaces(&sync, "status with b.txt", |s| {
+        s.statuses
+            .get(&worktree.id)
+            .is_some_and(|status| status.summary.added == 2)
+    })
+    .await;
+    assert!(state.statuses[&worktree.id].summary.dirty);
+
+    // The worktree's own layout: a new tab starts a shell in the worktree.
+    let layout = sync.layout(LayoutScope::Worktree(worktree.id));
+    let mut changes = layout.workspace_changes();
+    let current = wait_workspace(&mut changes, WAIT, "worktree layout", |s| {
+        s.layout.is_some()
+    })
+    .await
+    .layout
+    .clone()
+    .unwrap();
+    let terminal = TerminalId::new();
+    layout
+        .apply(LayoutOp::NewTab {
+            view: current.active,
+            tab: TabId::new(),
+            pane: PaneId::new(),
+            terminal,
+            name: None,
+            size: Size::new(80, 24),
+        })
+        .wait()
+        .await
+        .expect("worktree layout op acknowledged");
+    let state = wait_workspace(&mut changes, WAIT, "worktree shell", |s| {
+        s.processes.iter().any(|p| p.terminal == terminal)
+    })
+    .await;
+    let incarnation = state
+        .processes
+        .iter()
+        .find(|p| p.terminal == terminal)
+        .unwrap()
+        .incarnation;
+    // The home layout does not contain the worktree's terminal.
+    assert!(sync.workspace().layout.as_ref().is_none_or(|home| {
+        home.views
+            .iter()
+            .flat_map(|v| &v.tabs)
+            .flat_map(|t| &t.panes)
+            .all(|p| p.terminal != terminal)
+    }));
+    let handle = sync.attach(terminal, incarnation, ViewId::new());
+    wait_live(&handle, WAIT).await;
+    handle.send_input(b"printf 'WT=%s\\n' \"$FLOTILLA_WORKTREE_NAME\"\n".to_vec());
+    wait_text(&handle, &format!("WT={}", worktree.label), WAIT).await;
+
+    // After a daemon restart the client refetches tree and status.
+    h.stop_daemon().await;
+    wait_workspaces(&sync, "offline", |s| !s.live).await;
+    std::fs::write(std::path::Path::new(&worktree.path).join("c.txt"), "z\n").unwrap();
+    h.daemon = Some(support::start_daemon(h.dir.path(), h.quic_port).await);
+    let state = wait_workspaces(&sync, "refetched after restart", |s| {
+        s.live
+            && s.statuses
+                .get(&worktree.id)
+                .is_some_and(|status| status.summary.added == 3)
+    })
+    .await;
+    assert!(state.worktree(worktree.id).is_some());
     sync.shutdown().await;
     sup.shutdown().await;
 }

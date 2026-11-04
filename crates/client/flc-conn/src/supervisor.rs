@@ -461,8 +461,16 @@ async fn run(
                         },
                     );
                     links.send_replace(Some(control.clone()));
-                    let end =
-                        drive(&shared, &mut link, &mut calls, &phase, &cancel, &mut warmup).await;
+                    let end = drive(
+                        &shared,
+                        &mut link,
+                        &control,
+                        &mut calls,
+                        &phase,
+                        &cancel,
+                        &mut warmup,
+                    )
+                    .await;
                     control.close();
                     match end {
                         LinkEnd::Cancelled => {
@@ -829,6 +837,7 @@ async fn handshake(
 async fn drive(
     shared: &Arc<Shared>,
     link: &mut Link,
+    control: &ControlLink,
     calls: &mut mpsc::Receiver<RpcCall>,
     phase: &watch::Sender<ConnPhase>,
     cancel: &CancellationToken,
@@ -908,6 +917,10 @@ async fn drive(
                     if let Some(reply) = pending.remove(&id) {
                         let _ = reply.send(result);
                     }
+                }
+                Ok(ServerMsg::Event(event)) => {
+                    last_rx = Instant::now();
+                    control.publish_event(event);
                 }
                 Ok(_) => last_rx = Instant::now(),
                 Err(e) => break LinkEnd::Dead(format!("link lost: {e}")),

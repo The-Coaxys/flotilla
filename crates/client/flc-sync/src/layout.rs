@@ -13,6 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use fl_model::layout::{Layout, LayoutOp};
+use fl_model::workspace::LayoutScope;
 use fl_model::{OperationId, ProcessInfo};
 use fl_proto::{Request, Response, RpcErrorCode};
 use flc_conn::broker::{ControlLink, RpcCallError};
@@ -85,6 +86,7 @@ enum Interrupted {
 }
 
 struct LayoutTask {
+    scope: LayoutScope,
     layout: Option<Layout>,
     stale: bool,
     queue: VecDeque<Queued>,
@@ -95,9 +97,12 @@ struct LayoutTask {
     shutdown: CancellationToken,
 }
 
-pub(crate) fn initial_state(cache: Option<&Cache>) -> (WorkspaceState, Vec<PersistedOp>) {
+pub(crate) fn initial_state(
+    cache: Option<&Cache>,
+    scope: LayoutScope,
+) -> (WorkspaceState, Vec<PersistedOp>) {
     let (layout, pending) = cache
-        .and_then(Cache::load_workspace)
+        .and_then(|cache| cache.load_workspace(scope))
         .unwrap_or((None, Vec::new()));
     let state = WorkspaceState {
         projected: project(layout.as_ref(), pending.iter().map(|p| &p.op)),
@@ -130,6 +135,7 @@ fn project<'a>(layout: Option<&Layout>, ops: impl Iterator<Item = &'a LayoutOp>)
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run(
+    scope: LayoutScope,
     mut links: watch::Receiver<Option<ControlLink>>,
     mut commands: mpsc::UnboundedReceiver<LayoutCommand>,
     state: watch::Sender<Arc<WorkspaceState>>,
@@ -141,6 +147,7 @@ pub(crate) async fn run(
     shutdown: CancellationToken,
 ) {
     let mut task = LayoutTask {
+        scope,
         layout: initial.layout,
         stale: initial.stale,
         queue: pending
@@ -231,27 +238,29 @@ impl LayoutTask {
     }
 
     async fn refresh(&mut self, link: &ControlLink) -> Result<(), Interrupted> {
-        let layout = match self.rpc(link, Request::GetLayout).await {
+        let request = match self.scope {
+            LayoutScope::Home => Request::GetLayout,
+            scope => Request::GetScopedLayout { scope },
+        };
+        let layout = match self.rpc(link, request).await {
             Ok(Response::Layout(layout)) => layout,
             Ok(_) => return Err(Interrupted::LinkLost),
             Err(_) => return Err(self.interrupted(link)),
         };
-        if let Ok(Response::Processes(processes)) = self.rpc(link, Request::ListProcesses).await {
-            self.processes = processes;
-        }
+        let listed = match self.rpc(link, Request::ListProcesses).await {
+            Ok(Response::Processes(processes)) => {
+                self.processes = processes;
+                true
+            }
+            _ => false,
+        };
         self.accept(layout);
-        if let Some(cache) = self.cache.clone()
-            && let Some(layout) = self.layout.clone()
-        {
+        // Every scope shares one mirror cache: keep the mirrors of terminals
+        // the daemon still runs, whichever layout they belong to.
+        if listed && let Some(cache) = self.cache.clone() {
+            let live: Vec<_> = self.processes.iter().map(|p| p.terminal).collect();
             let _ = tokio::task::spawn_blocking(move || {
-                cache.retain_mirrors(|terminal| {
-                    layout
-                        .views
-                        .iter()
-                        .flat_map(|view| &view.tabs)
-                        .flat_map(|tab| &tab.panes)
-                        .any(|pane| pane.terminal == terminal)
-                })
+                cache.retain_mirrors(|terminal| live.contains(&terminal))
             })
             .await;
         }
@@ -285,10 +294,19 @@ impl LayoutTask {
                 }
             };
             let front = self.queue.front().expect("checked above");
-            let request = Request::ApplyLayout {
-                operation: front.persisted.operation,
-                base_rev,
-                op: front.persisted.op.clone(),
+            let (operation, op) = (front.persisted.operation, front.persisted.op.clone());
+            let request = match self.scope {
+                LayoutScope::Home => Request::ApplyLayout {
+                    operation,
+                    base_rev,
+                    op,
+                },
+                scope => Request::ApplyScopedLayout {
+                    scope,
+                    operation,
+                    base_rev,
+                    op,
+                },
             };
             match self.rpc(link, request).await {
                 Ok(Response::Layout(layout)) => {
@@ -379,9 +397,11 @@ impl LayoutTask {
         };
         let layout = self.layout.clone();
         let pending: Vec<PersistedOp> = self.queue.iter().map(|q| q.persisted.clone()).collect();
-        let saved =
-            tokio::task::spawn_blocking(move || cache.save_workspace(layout.as_ref(), &pending))
-                .await;
+        let scope = self.scope;
+        let saved = tokio::task::spawn_blocking(move || {
+            cache.save_workspace(scope, layout.as_ref(), &pending)
+        })
+        .await;
         if let Ok(Err(error)) = saved {
             tracing::warn!("writing the workspace cache failed: {error}");
         }

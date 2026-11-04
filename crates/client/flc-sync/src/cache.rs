@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use fl_model::layout::{Layout, LayoutOp};
+use fl_model::workspace::LayoutScope;
 use fl_model::{IncarnationId, LogCursor, OperationId, TerminalId};
 use fl_term::{ENGINE_ID, EffectMode, Engine};
 use serde::de::DeserializeOwned;
@@ -63,8 +64,12 @@ impl Cache {
         Self { dir }
     }
 
-    fn workspace_path(&self) -> PathBuf {
-        self.dir.join("workspace.bin")
+    /// The home layout keeps its M1 file name; worktree layouts have their own.
+    fn workspace_path(&self, scope: LayoutScope) -> PathBuf {
+        match scope {
+            LayoutScope::Home => self.dir.join("workspace.bin"),
+            LayoutScope::Worktree(id) => self.dir.join("layouts").join(format!("{id}.bin")),
+        }
     }
 
     fn mirrors(&self) -> PathBuf {
@@ -75,13 +80,14 @@ impl Cache {
         self.mirrors().join(format!("{terminal}.bin"))
     }
 
-    pub fn load_workspace(&self) -> Option<(Option<Layout>, Vec<PersistedOp>)> {
-        let file: WorkspaceFile = read(&self.workspace_path(), KIND_WORKSPACE)?;
+    pub fn load_workspace(&self, scope: LayoutScope) -> Option<(Option<Layout>, Vec<PersistedOp>)> {
+        let file: WorkspaceFile = read(&self.workspace_path(scope), KIND_WORKSPACE)?;
         Some((file.layout, file.pending))
     }
 
     pub fn save_workspace(
         &self,
+        scope: LayoutScope,
         layout: Option<&Layout>,
         pending: &[PersistedOp],
     ) -> std::io::Result<()> {
@@ -91,7 +97,7 @@ impl Cache {
             pending: &'a [PersistedOp],
         }
         write(
-            &self.workspace_path(),
+            &self.workspace_path(scope),
             KIND_WORKSPACE,
             &Borrowed { layout, pending },
         )
@@ -238,7 +244,7 @@ mod tests {
     fn workspace_and_mirror_round_trip_and_reject_corruption() {
         let dir = scratch();
         let cache = Cache::new(dir.clone());
-        assert!(cache.load_workspace().is_none());
+        assert!(cache.load_workspace(LayoutScope::Home).is_none());
         let view = ViewId::new();
         let mut layout = Layout::new(WorkspaceId::new(), view);
         let op = LayoutOp::NewTab {
@@ -255,8 +261,22 @@ mod tests {
             base_rev: Some(1),
             op,
         }];
-        cache.save_workspace(Some(&layout), &pending).unwrap();
-        assert_eq!(cache.load_workspace(), Some((Some(layout), pending)));
+        cache
+            .save_workspace(LayoutScope::Home, Some(&layout), &pending)
+            .unwrap();
+        assert_eq!(
+            cache.load_workspace(LayoutScope::Home),
+            Some((Some(layout.clone()), pending.clone()))
+        );
+        // Worktree layouts are stored apart from the home layout.
+        let scope = LayoutScope::Worktree(fl_model::WorktreeId::new());
+        assert!(cache.load_workspace(scope).is_none());
+        cache.save_workspace(scope, None, &[]).unwrap();
+        assert_eq!(cache.load_workspace(scope), Some((None, Vec::new())));
+        assert_eq!(
+            cache.load_workspace(LayoutScope::Home),
+            Some((Some(layout), pending))
+        );
 
         let terminal = TerminalId::new();
         let incarnation = IncarnationId::new();

@@ -17,12 +17,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use fl_model::ClientSessionId;
+use fl_model::workspace::DaemonEvent;
 use fl_proto::{
     ChannelRole, ClientMsg, ProtoVersion, RejectReason, Request, Response, RpcError, ServerMsg,
 };
 use fl_transport::conn::{ConnError, FrameReader, FrameWriter, framed};
 use fl_transport::ssh::{SshError, SshSession};
-use tokio::sync::{Semaphore, mpsc, oneshot};
+use tokio::sync::{Semaphore, broadcast, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use crate::supervisor::{ATTACH_COMMAND, TransportKind};
@@ -30,6 +31,9 @@ use crate::supervisor::{ATTACH_COMMAND, TransportKind};
 /// Concurrent RPCs per link. The daemon stops reading a control stream (and
 /// therefore its heartbeats) at 32 in-flight requests; stay well below.
 pub const MAX_INFLIGHT_RPCS: usize = 16;
+/// Pushed daemon events buffered per subscriber before the oldest are lost
+/// (a lagging subscriber should refetch).
+pub const EVENT_BUFFER: usize = 256;
 
 pub(crate) type RpcReply = oneshot::Sender<Result<Response, RpcError>>;
 
@@ -106,6 +110,7 @@ struct Inner {
     permits: Semaphore,
     opener: Opener,
     closed: CancellationToken,
+    events: broadcast::Sender<DaemonEvent>,
 }
 
 /// A cheap, cloneable handle to the current control link. See the module docs.
@@ -142,6 +147,7 @@ impl ControlLink {
                 permits: Semaphore::new(MAX_INFLIGHT_RPCS),
                 opener,
                 closed: CancellationToken::new(),
+                events: broadcast::channel(EVENT_BUFFER).0,
             }),
         }
     }
@@ -173,6 +179,17 @@ impl ControlLink {
 
     pub fn daemon_proto(&self) -> ProtoVersion {
         self.inner.info.daemon_proto
+    }
+
+    /// Daemon events pushed on this generation (protocol 0.3 and later).
+    /// Events are hints: subscribe before fetching, and refetch on a new
+    /// link or after `RecvError::Lagged`.
+    pub fn events(&self) -> broadcast::Receiver<DaemonEvent> {
+        self.inner.events.subscribe()
+    }
+
+    pub(crate) fn publish_event(&self, event: DaemonEvent) {
+        let _ = self.inner.events.send(event);
     }
 
     pub fn is_closed(&self) -> bool {
