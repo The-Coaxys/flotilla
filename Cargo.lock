@@ -2620,6 +2620,7 @@ dependencies = [
  "fl-proto",
  "fl-term",
  "fl-transport",
+ "fld-agent",
  "fld-forge",
  "fld-git",
  "fld-prochost",

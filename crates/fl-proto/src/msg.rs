@@ -271,6 +271,24 @@ pub enum Request {
         expected_rev: u64,
         mutation: SectionMutation,
     },
+    /// Fast/Thorough routes and prompt templates (protocol 0.4).
+    GetRouting,
+    MutateRouting {
+        expected_rev: u64,
+        mutation: fl_model::routing::RoutingMutation,
+    },
+    /// Providers the daemon can actually drive through a chat adapter.
+    ListChatProviders,
+    /// Render and (for submit modes) run a routed Git action.
+    DispatchGitTask {
+        worktree: WorktreeId,
+        task: fl_model::routing::GitTask,
+        /// Overrides the configured click / alternate-click mode.
+        mode: Option<fl_model::routing::DispatchMode>,
+        alternate: bool,
+        /// Extra user context appended through `{{task}}`.
+        context: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -304,6 +322,9 @@ pub enum Response {
     Reviews(fl_model::review::ReviewState),
     ReviewBundle(fl_model::review::ReviewBundle),
     SectionsState(SectionsState),
+    RoutingState(fl_model::routing::RoutingState),
+    ChatProviders(Vec<fl_model::chat::ProviderDiscovery>),
+    TaskDispatch(fl_model::routing::TaskDispatch),
 }
 
 /// Returned on the authenticated control stream before requesting channels.
@@ -468,6 +489,9 @@ impl Request {
                 Err(ValidationError::Invalid("zero pull request number"))
             }
             Self::MutateSections { mutation, .. } => validation::section_mutation(mutation),
+            Self::MutateRouting { mutation, .. } => {
+                mutation.validate().map_err(ValidationError::Invalid)
+            }
             _ => Ok(()),
         }
     }
@@ -531,6 +555,19 @@ impl Response {
             Self::ForgeState(value) => validation::forge_state(value),
             Self::Committed { head } => validation::text("commit", head, MAX_TEXT_BYTES),
             Self::SectionsState(value) => validation::sections_state(value),
+            Self::RoutingState(value) => value.validate().map_err(ValidationError::Invalid),
+            Self::ChatProviders(values) => {
+                validation::bound("chat providers", values.len(), 64)?;
+                for value in values {
+                    validation::text("provider id", &value.provider.id, MAX_TEXT_BYTES)?;
+                    validation::text("provider name", &value.provider.name, MAX_TEXT_BYTES)?;
+                    if let Some(reason) = &value.unavailable_reason {
+                        validation::text("provider reason", reason, MAX_TEXT_BYTES)?;
+                    }
+                }
+                Ok(())
+            }
+            Self::TaskDispatch(value) => validation::task_dispatch(value),
             Self::Written(_) | Self::Done => Ok(()),
             Self::DaemonInfo(value) => {
                 for text in [

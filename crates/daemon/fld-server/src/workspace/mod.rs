@@ -5,6 +5,7 @@
 //! are serialized and each one publishes `WorkspaceTreeChanged`.
 mod forge;
 mod review;
+mod routing;
 mod scripts;
 mod sections;
 mod status;

@@ -33,6 +33,11 @@ pub struct WorkspacesState {
     /// Last sections snapshot; `None` until a supporting daemon answers.
     /// Older daemons never receive section requests or imply support.
     pub sections: Option<SectionsState>,
+    /// Fast/Thorough routes and prompt templates; `None` until a supporting
+    /// daemon answers.
+    pub routing: Option<fl_model::routing::RoutingState>,
+    /// Routed Git dispatches the daemon has reported.
+    pub dispatches: HashMap<fl_model::TaskRunId, fl_model::routing::TaskDispatch>,
     /// Connected and following daemon events.
     pub live: bool,
 }
@@ -152,6 +157,17 @@ async fn follow(
                 }
             }
             Ok(DaemonEvent::SectionsChanged(sections)) => remember_sections(state, sections),
+            Ok(DaemonEvent::RoutingChanged(routing)) => update(state, |s| {
+                if s.routing
+                    .as_ref()
+                    .is_none_or(|known| known.rev <= routing.rev)
+                {
+                    s.routing = Some(routing);
+                }
+            }),
+            Ok(DaemonEvent::TaskDispatchChanged(dispatch)) => update(state, |s| {
+                s.dispatches.insert(dispatch.id, dispatch);
+            }),
             Ok(DaemonEvent::LayoutChanged { scope, .. }) => {
                 if let Some(commands) = layouts
                     .lock()
@@ -173,6 +189,20 @@ async fn fetch_tree(link: &ControlLink) -> Option<WorkspaceTree> {
     match link.rpc(Request::GetWorkspaceTree).await {
         Ok(Response::WorkspaceTree(tree)) => Some(tree),
         _ => None,
+    }
+}
+
+async fn refetch_routing(link: &ControlLink, state: &watch::Sender<Arc<WorkspacesState>>) {
+    if !supports_sections(link.daemon_proto()) {
+        update(state, |s| s.routing = None);
+        return;
+    }
+    match link.rpc(Request::GetRouting).await {
+        Ok(Response::RoutingState(routing)) => update(state, |s| s.routing = Some(routing)),
+        Err(error) if error.code() == Some(fl_proto::RpcErrorCode::Unsupported) => {
+            update(state, |s| s.routing = None);
+        }
+        _ => {}
     }
 }
 
@@ -199,9 +229,10 @@ async fn resync(link: &ControlLink, state: &watch::Sender<Arc<WorkspacesState>>)
         return false;
     };
     let ids: Vec<WorktreeId> = tree.worktrees.iter().map(|w| w.id).collect();
-    let ((statuses, scripts), (), ()) = tokio::join!(
+    let ((statuses, scripts), (), (), ()) = tokio::join!(
         fetch_details(link, &ids),
         refetch_sections(link, state),
+        refetch_routing(link, state),
         crate::review::fetch_all(link, state, &ids),
     );
     update(state, |s| {

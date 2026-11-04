@@ -576,6 +576,64 @@ impl Sync {
         }
     }
 
+    /// The configured routes and templates (asks the daemon when unknown).
+    pub async fn routing(&self) -> Result<fl_model::routing::RoutingState, CallError> {
+        match self.call(Request::GetRouting).await? {
+            Response::RoutingState(state) => Ok(state),
+            _ => Err(CallError::Unexpected),
+        }
+    }
+
+    pub async fn mutate_routing(
+        &self,
+        expected_rev: u64,
+        mutation: fl_model::routing::RoutingMutation,
+    ) -> Result<fl_model::routing::RoutingState, CallError> {
+        match self
+            .call(Request::MutateRouting {
+                expected_rev,
+                mutation,
+            })
+            .await?
+        {
+            Response::RoutingState(state) => Ok(state),
+            _ => Err(CallError::Unexpected),
+        }
+    }
+
+    pub async fn chat_providers(
+        &self,
+    ) -> Result<Vec<fl_model::chat::ProviderDiscovery>, CallError> {
+        match self.call(Request::ListChatProviders).await? {
+            Response::ChatProviders(providers) => Ok(providers),
+            _ => Err(CallError::Unexpected),
+        }
+    }
+
+    /// Render (and, once the chat runtime exists, run) a routed Git action.
+    pub async fn dispatch_git_task(
+        &self,
+        worktree: WorktreeId,
+        task: fl_model::routing::GitTask,
+        mode: Option<fl_model::routing::DispatchMode>,
+        alternate: bool,
+        context: String,
+    ) -> Result<fl_model::routing::TaskDispatch, CallError> {
+        match self
+            .call(Request::DispatchGitTask {
+                worktree,
+                task,
+                mode,
+                alternate,
+                context,
+            })
+            .await?
+        {
+            Response::TaskDispatch(dispatch) => Ok(dispatch),
+            _ => Err(CallError::Unexpected),
+        }
+    }
+
     pub async fn run_script(
         &self,
         worktree: WorktreeId,

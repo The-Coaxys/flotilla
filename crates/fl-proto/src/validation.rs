@@ -222,10 +222,24 @@ pub fn daemon_event(value: &fl_model::workspace::DaemonEvent) -> Result<(), Vali
         DaemonEvent::ScriptChanged(state) => script_kind(&state.kind),
         DaemonEvent::ForgeChanged(state) => forge_state(state),
         DaemonEvent::SectionsChanged(state) => sections_state(state),
+        DaemonEvent::RoutingChanged(state) => {
+            state.validate().map_err(ValidationError::Invalid)?;
+            Ok(())
+        }
+        DaemonEvent::TaskDispatchChanged(dispatch) => task_dispatch(dispatch),
         DaemonEvent::WorkspaceTreeChanged { .. }
         | DaemonEvent::LayoutChanged { .. }
         | DaemonEvent::ReviewChanged { .. } => Ok(()),
     }
+}
+
+/// A routed dispatch carries its rendered prompt; bound it like a message.
+pub fn task_dispatch(value: &fl_model::routing::TaskDispatch) -> Result<(), ValidationError> {
+    text("dispatch prompt", &value.prompt, MAX_MESSAGE_BYTES)?;
+    if let fl_model::routing::TaskDispatchState::Failed { message } = &value.state {
+        text("dispatch failure", message, MAX_TEXT_BYTES)?;
+    }
+    Ok(())
 }
 
 /// Commit messages and pull request bodies.

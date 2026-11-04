@@ -1,0 +1,103 @@
+//! Fast/Thorough routes, provider discovery and routed action preparation.
+use super::{WorkspaceService, invalid, now_ms, rpc};
+use fl_model::WorktreeId;
+use fl_model::routing::{
+    DispatchMode, GitTask, RoutingMutation, RoutingState, TaskDispatch, TaskDispatchState,
+    TemplateContext, render_template,
+};
+use fl_model::workspace::DaemonEvent;
+use fl_proto::{RpcError, RpcErrorCode};
+use fld_agent::{ProviderDiscovery, ProviderRegistry};
+use tokio::time::{Duration, timeout};
+
+/// Provider discovery runs real CLI handshakes; keep it bounded.
+const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(20);
+
+impl WorkspaceService {
+    pub(crate) async fn routing_state(&self) -> Result<RoutingState, RpcError> {
+        self.store(|store| store.database.routing_state()).await
+    }
+
+    pub(crate) async fn mutate_routing(
+        &self,
+        expected_rev: u64,
+        mutation: RoutingMutation,
+    ) -> Result<RoutingState, RpcError> {
+        let _structure = self.structure.lock().await;
+        let state = self
+            .store(move |store| store.database.mutate_routing(expected_rev, mutation))
+            .await?;
+        self.publish(DaemonEvent::RoutingChanged(state.clone()));
+        Ok(state)
+    }
+
+    /// Providers the daemon can actually drive, with the reason when it cannot.
+    pub(crate) async fn chat_providers(&self) -> Result<Vec<ProviderDiscovery>, RpcError> {
+        let discovered = timeout(DISCOVERY_TIMEOUT, ProviderRegistry::default().discover())
+            .await
+            .map_err(|_| {
+                rpc(
+                    RpcErrorCode::Internal,
+                    "provider discovery timed out; a provider CLI did not answer its handshake",
+                )
+            })?;
+        Ok(discovered)
+    }
+
+    /// Render a routed action. Submit modes need the chat runtime; until it
+    /// exists they report exactly that instead of pretending to have run.
+    pub(crate) async fn dispatch_git_task(
+        self: &std::sync::Arc<Self>,
+        id: WorktreeId,
+        task: GitTask,
+        mode: Option<DispatchMode>,
+        alternate: bool,
+        context: String,
+    ) -> Result<TaskDispatch, RpcError> {
+        let (worktree, project) = self.worktree(id).await?;
+        let routing = self.routing_state().await?;
+        let Some(route) = routing.route(task, project.id, project.workspace) else {
+            return Err(rpc(
+                RpcErrorCode::Unsupported,
+                format!(
+                    "no route for {}; configure one for the {:?} group",
+                    task.label(),
+                    task.group()
+                ),
+            ));
+        };
+        let mode = mode.unwrap_or_else(|| route.mode(alternate));
+        let base = worktree.target.clone().or(project.default_branch.clone());
+        let template_context = TemplateContext {
+            branch: worktree.branch.clone(),
+            base,
+            diff: None,
+            checks: None,
+            reviews: None,
+            task: Some(context).filter(|text| !text.trim().is_empty()),
+        };
+        let template = routing.template(task, project.id, project.workspace);
+        let prompt = render_template(&template, &template_context);
+        if prompt.trim().is_empty() {
+            return Err(invalid("the routed prompt is empty"));
+        }
+        let dispatch = TaskDispatch {
+            id: fl_model::TaskRunId::new(),
+            worktree: id,
+            task,
+            mode,
+            session: None,
+            prompt,
+            state: if mode.prepares_only() {
+                TaskDispatchState::Prepared
+            } else {
+                return Err(rpc(
+                    RpcErrorCode::Unsupported,
+                    "sending a routed action needs the chat runtime, which this build does not include yet; use a prepare mode or the manual dialog",
+                ));
+            },
+            created_ms: now_ms(),
+        };
+        Ok(dispatch)
+    }
+}

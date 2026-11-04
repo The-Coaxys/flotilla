@@ -218,4 +218,8 @@ pub enum DaemonEvent {
     },
     /// Section definitions, assignments or pins changed (protocol 0.4).
     SectionsChanged(crate::sections::SectionsState),
+    /// Fast/Thorough routes or prompt templates changed (protocol 0.4).
+    RoutingChanged(crate::routing::RoutingState),
+    /// A routed Git task started, advanced or finished (protocol 0.4).
+    TaskDispatchChanged(crate::routing::TaskDispatch),
 }

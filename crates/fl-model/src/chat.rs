@@ -299,3 +299,81 @@ mod tests {
         assert_eq!(postcard::from_bytes::<EventRecord>(&bytes).unwrap(), record);
     }
 }
+
+// --- Daemon-owned chat records (M4 wire contract) -------------------------
+
+pub const MAX_CHAT_MESSAGES: usize = 256;
+pub const MAX_CHAT_TEXT: usize = 64 * 1024;
+pub const MAX_CHAT_HISTORY: usize = 512;
+
+/// One chat the daemon owns: a provider process, its transcript cursor and
+/// its surface. `seq` is the last durable event sequence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatSession {
+    pub id: Uuid,
+    pub worktree: crate::WorktreeId,
+    pub provider: String,
+    pub label: String,
+    pub status: SessionState,
+    pub status_source: StatusSource,
+    pub model: Option<String>,
+    pub thinking: Option<String>,
+    pub permission_mode: PermissionMode,
+    pub resume: Option<ResumeTarget>,
+    pub seq: u64,
+    pub created_ms: u64,
+    pub updated_ms: u64,
+}
+
+/// Where a session status came from. Heuristics never approve anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StatusSource {
+    Structured,
+    Hook,
+    Heuristic,
+}
+
+/// Durable events from `from` (inclusive) onward.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatEventPage {
+    pub session: Uuid,
+    pub incarnation: Uuid,
+    pub events: Vec<EventRecord>,
+    /// More events exist after this page.
+    pub more: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum InboxKind {
+    Approval,
+    Question,
+    Completed,
+    Error,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum InboxState {
+    Unread,
+    Read,
+    Dismissed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InboxItem {
+    pub id: Uuid,
+    pub session: Uuid,
+    pub worktree: crate::WorktreeId,
+    pub kind: InboxKind,
+    pub state: InboxState,
+    pub title: String,
+    pub created_ms: u64,
+}
+
+/// One archived transcript hit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatHit {
+    pub session: Uuid,
+    pub worktree: crate::WorktreeId,
+    pub sequence: u64,
+    pub snippet: String,
+}

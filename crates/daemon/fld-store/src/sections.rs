@@ -410,7 +410,7 @@ mod tests {
         let (db, _, _) = setup(root.path());
         let tree = db.workspace_tree().unwrap();
         db.connection
-            .execute_batch("DROP TABLE reviews; DROP TABLE sections; PRAGMA user_version=3;")
+            .execute_batch("DROP TABLE routing; DROP TABLE reviews; DROP TABLE sections; PRAGMA user_version=3;")
             .unwrap();
         drop(db);
         let db = Database::open(root.path()).unwrap();

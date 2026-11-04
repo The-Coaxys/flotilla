@@ -1,8 +1,9 @@
 //! Shared domain values. This crate has no terminal engine, transport or UI dependency.
-pub mod forge;
 pub mod chat;
+pub mod forge;
 pub mod layout;
 pub mod review;
+pub mod routing;
 pub mod sections;
 pub mod workspace;
 
@@ -47,7 +48,8 @@ identity!(
     TransferId,
     ReviewThreadId,
     ReviewCommentId,
-    SubscriptionId
+    SubscriptionId,
+    TaskRunId
 );
 
 pub const MAX_COLUMNS: u16 = 1024;

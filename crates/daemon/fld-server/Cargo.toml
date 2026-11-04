@@ -15,6 +15,7 @@ fl-proto.workspace = true
 fl-term.workspace = true
 fl-transport.workspace = true
 fld-forge.workspace = true
+fld-agent.workspace = true
 fld-git.workspace = true
 fld-prochost.workspace = true
 fld-store.workspace = true

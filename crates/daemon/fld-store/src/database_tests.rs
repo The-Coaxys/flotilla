@@ -1065,7 +1065,7 @@ fn version_two(root: &Path) -> (Layout, Vec<TerminalEntry>) {
     let connection = Connection::open(root.join("state.db")).unwrap();
     connection
         .execute_batch(
-            "DROP TABLE reviews; DROP TABLE sections; DROP TABLE scripts; DROP TABLE worktree_layouts; DROP TABLE worktrees; \
+            "DROP TABLE routing; DROP TABLE reviews; DROP TABLE sections; DROP TABLE scripts; DROP TABLE worktree_layouts; DROP TABLE worktrees; \
              DROP TABLE projects; DROP TABLE workspaces; DROP TABLE workspace_meta; \
              PRAGMA user_version=2;",
         )

@@ -166,6 +166,8 @@ async fn control(
                     fl_model::workspace::DaemonEvent::ForgeChanged(_)
                         | fl_model::workspace::DaemonEvent::ReviewChanged { .. }
                         | fl_model::workspace::DaemonEvent::SectionsChanged(_)
+                        | fl_model::workspace::DaemonEvent::RoutingChanged(_)
+                        | fl_model::workspace::DaemonEvent::TaskDispatchChanged(_)
                 )
                     || hello.proto.major > 0
                     || hello.proto.minor >= 4;
@@ -420,6 +422,28 @@ async fn handle_request(
             .mutate_sections(expected_rev, mutation)
             .await
             .map(Response::SectionsState),
+        Request::GetRouting => workspace.routing_state().await.map(Response::RoutingState),
+        Request::MutateRouting {
+            expected_rev,
+            mutation,
+        } => workspace
+            .mutate_routing(expected_rev, mutation)
+            .await
+            .map(Response::RoutingState),
+        Request::ListChatProviders => workspace
+            .chat_providers()
+            .await
+            .map(Response::ChatProviders),
+        Request::DispatchGitTask {
+            worktree,
+            task,
+            mode,
+            alternate,
+            context,
+        } => workspace
+            .dispatch_git_task(worktree, task, mode, alternate, context)
+            .await
+            .map(Response::TaskDispatch),
     }
 }
 
