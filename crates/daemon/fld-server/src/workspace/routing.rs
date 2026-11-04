@@ -76,7 +76,22 @@ impl WorkspaceService {
             reviews: None,
             task: Some(context).filter(|text| !text.trim().is_empty()),
         };
-        let template = routing.template(task, project.id, project.workspace);
+        // A repository's own templates apply below the stored scopes.
+        let root = std::path::PathBuf::from(&worktree.path);
+        let repo_prompt = tokio::task::spawn_blocking(move || {
+            fld_git::config::load_config(&root)
+                .map(|config| config.and_then(|config| config.prompts.get(task.id()).cloned()))
+        })
+        .await
+        .map_err(|error| {
+            rpc(
+                RpcErrorCode::Internal,
+                format!("background task failed: {error}"),
+            )
+        })?
+        .map_err(|error| invalid(format!("invalid .flotilla/config.json: {error}")))?;
+        let template =
+            routing.template_with_repo(task, project.id, project.workspace, repo_prompt.as_deref());
         let prompt = render_template(&template, &template_context);
         if prompt.trim().is_empty() {
             return Err(invalid("the routed prompt is empty"));

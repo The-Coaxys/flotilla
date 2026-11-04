@@ -73,6 +73,26 @@ impl GitTask {
         }
     }
 
+    /// Stable identifier used by `.flotilla/config.json` and the CLI.
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::NameWorktree => "name_worktree",
+            Self::Commit => "commit",
+            Self::CommitPush => "commit_push",
+            Self::CreatePr => "create_pr",
+            Self::EnhancePrompt => "enhance_prompt",
+            Self::Resolve => "resolve",
+            Self::FixCi => "fix_ci",
+            Self::FixChanges => "fix_changes",
+            Self::FixComments => "fix_comments",
+            Self::Investigate => "investigate",
+        }
+    }
+
+    pub fn from_id(id: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|task| task.id() == id)
+    }
+
     /// Every task, in menu order.
     pub const ALL: [Self; 10] = [
         Self::NameWorktree,
@@ -435,6 +455,29 @@ impl RoutingState {
         None
     }
 
+    /// The prompt template for `action`: a stored project, workspace or global
+    /// template wins, then the repository's own `.flotilla/config.json`, then
+    /// the built-in default.
+    pub fn template_with_repo(
+        &self,
+        action: GitTask,
+        project: ProjectId,
+        workspace: WorkspaceId,
+        repo_prompt: Option<&str>,
+    ) -> String {
+        self.scopes(project, workspace)
+            .into_iter()
+            .flatten()
+            .find_map(|scope| {
+                self.templates
+                    .iter()
+                    .find(|template| template.scope == scope && template.action == action)
+                    .map(|template| template.body.clone())
+            })
+            .or_else(|| repo_prompt.map(str::to_owned))
+            .unwrap_or_else(|| default_template(action).to_owned())
+    }
+
     /// The prompt template for `action`, most specific first.
     pub fn template(&self, action: GitTask, project: ProjectId, workspace: WorkspaceId) -> String {
         self.scopes(project, workspace)
@@ -520,6 +563,36 @@ mod tests {
             MAX_CONTEXT_BYTES
         );
         assert!(default_template(GitTask::FixCi).contains("{{checks}}"));
+        assert_eq!(GitTask::from_id("fix_ci"), Some(GitTask::FixCi));
+        assert_eq!(GitTask::from_id("nope"), None);
+    }
+
+    #[test]
+    fn repository_templates_fill_in_below_configured_scopes() {
+        let project = ProjectId::new();
+        let workspace = WorkspaceId::new();
+        let mut state = RoutingState::default();
+        let repo = "Repo template for {{branch}}";
+        assert_eq!(
+            state.template_with_repo(GitTask::FixCi, project, workspace, Some(repo)),
+            repo
+        );
+        state
+            .apply(RoutingMutation::SetTemplate(PromptTemplate {
+                scope: Scope::Workspace(workspace),
+                action: GitTask::FixCi,
+                body: "Workspace template".into(),
+            }))
+            .unwrap();
+        assert_eq!(
+            state.template_with_repo(GitTask::FixCi, project, workspace, Some(repo)),
+            "Workspace template"
+        );
+        // A repository template never leaks into another action.
+        assert_eq!(
+            state.template_with_repo(GitTask::Investigate, project, workspace, None),
+            default_template(GitTask::Investigate)
+        );
     }
 
     #[test]

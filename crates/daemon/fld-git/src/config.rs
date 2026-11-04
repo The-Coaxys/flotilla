@@ -10,7 +10,8 @@
 //!     "web": { "command": "npm run dev", "default": true, "stop_commands": ["pkill vite"] },
 //!     "test": ["cargo test"]                 // target: string | [string] | object
 //!   },
-//!   "teardown": ["docker compose down"]      // string | [string]
+//!   "teardown": ["docker compose down"],     // string | [string]
+//!   "prompts": { "fix_ci": "Fix {{branch}}" } // agent prompt templates
 //! }
 //! ```
 use std::collections::BTreeMap;
@@ -40,7 +41,14 @@ pub struct RepoConfig {
     pub setup: Vec<String>,
     pub run: BTreeMap<String, RunTarget>,
     pub teardown: Vec<String>,
+    /// Agent prompt templates shared with everyone who checks the repository
+    /// out, keyed by action (`fix_ci`, `create_pr`, …). See
+    /// [`fl_model::routing::GitTask::id`].
+    pub prompts: BTreeMap<String, String>,
 }
+
+/// Largest prompt template accepted from a repository.
+pub const MAX_PROMPT_BYTES: usize = 32 * 1024;
 
 impl RepoConfig {
     /// The run target called `name`. With `None`: the target flagged
@@ -180,10 +188,30 @@ pub fn parse_config(text: &str) -> Result<RepoConfig, ConfigError> {
             ));
         }
     }
+    let mut prompts = BTreeMap::new();
+    match root.get("prompts") {
+        None | Some(Value::Null) => {}
+        Some(Value::Object(entries)) => {
+            for (action, body) in entries {
+                let Value::String(body) = body else {
+                    return Err(shape(format!("prompts.{action}"), "a string"));
+                };
+                if body.trim().is_empty() || body.len() > MAX_PROMPT_BYTES {
+                    return Err(shape(
+                        format!("prompts.{action}"),
+                        "1–32768 bytes of nonempty text",
+                    ));
+                }
+                prompts.insert(action.clone(), body.clone());
+            }
+        }
+        Some(_) => return Err(shape("prompts", "an object of action → template")),
+    }
     Ok(RepoConfig {
         setup: commands(root.get("setup"), "setup")?,
         run,
         teardown: commands(root.get("teardown"), "teardown")?,
+        prompts,
     })
 }
 
@@ -208,6 +236,26 @@ pub fn load_config(root: &Path) -> Result<Option<RepoConfig>, ConfigError> {
         message: format!("not valid UTF-8: {e}"),
     })?;
     parse_config(&text).map(Some)
+}
+
+#[test]
+fn repo_prompt_templates_are_bounded_and_typed() {
+    let config =
+        parse_config(r#"{"prompts":{"fix_ci":"Fix {{branch}}","create_pr":"PR"}}"#).unwrap();
+    assert_eq!(config.prompts.get("fix_ci").unwrap(), "Fix {{branch}}");
+    assert_eq!(config.prompts.len(), 2);
+    assert!(matches!(
+        parse_config(r#"{"prompts":{"fix_ci":42}}"#),
+        Err(ConfigError::Shape { .. })
+    ));
+    assert!(matches!(
+        parse_config(r#"{"prompts":{"fix_ci":"   "}}"#),
+        Err(ConfigError::Shape { .. })
+    ));
+    assert!(matches!(
+        parse_config(r#"{"prompts":[]}"#),
+        Err(ConfigError::Shape { .. })
+    ));
 }
 
 #[cfg(test)]
