@@ -183,6 +183,21 @@ impl ChatUi {
                     .iter()
                     .any(|known| known.session == toast.session && known.seq == toast.seq)
                 {
+                    // The in-app toast is unconditional; the host decides
+                    // whether a desktop notification is also allowed.
+                    let class = match toast.kind {
+                        ToastKind::Approval | ToastKind::Question => {
+                            flc_ui::notify::EventClass::Input
+                        }
+                        ToastKind::Completed | ToastKind::Failed => {
+                            flc_ui::notify::EventClass::Completion
+                        }
+                    };
+                    cx.emit(HostWorkspaceEvent::Notify {
+                        class,
+                        title: toast.title.clone(),
+                        session: toast.session,
+                    });
                     self.toasts.push(toast);
                 }
             }
@@ -213,6 +228,21 @@ impl ChatUi {
             LayoutScope::Worktree(id) if id == worktree => Some(active),
             _ => None,
         }
+    }
+
+    /// The active chat tab and the mirror snapshot a PiP window would show.
+    pub(super) fn pip_chat(&self) -> Option<(Uuid, Arc<ChatState>)> {
+        Some((self.active?, self.state.clone()))
+    }
+
+    /// The worktree owning a session, for opening a notification's source.
+    pub(super) fn worktree_of(&self, session: Uuid) -> Option<fl_model::WorktreeId> {
+        self.state.session(session).map(|session| session.worktree)
+    }
+
+    /// Open a session once the next render has a window.
+    pub(super) fn pending_chat(&mut self, session: Uuid) {
+        self.pending_open = Some(session);
     }
 
     /// Tabs shown in the center strip for this scope: (session, label, active).
@@ -1070,7 +1100,7 @@ impl HostWorkspace {
 
     // ---- inbox, search, toasts -------------------------------------------
 
-    fn open_chat_inbox(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn open_chat_inbox(&mut self, cx: &mut Context<Self>) {
         self.dialog = None;
         self.sections_ui.close();
         self.routes_ui.close();

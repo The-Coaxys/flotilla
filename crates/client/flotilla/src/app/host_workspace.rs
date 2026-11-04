@@ -61,6 +61,15 @@ pub enum HostWorkspaceEvent {
     OpenSettings,
     /// The palette asked to toggle the performance HUD.
     ToggleHud,
+    /// A new in-app toast; the app decides whether it also deserves a
+    /// desktop notification under the per-class policy.
+    Notify {
+        class: flc_ui::notify::EventClass,
+        title: String,
+        session: uuid::Uuid,
+    },
+    /// The user pinned the current surface; the app opens the PiP window.
+    PinRequest,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -479,6 +488,191 @@ impl HostWorkspace {
                 }
             }
         }
+        cx.notify();
+    }
+
+    // ---- picture-in-picture, shortcuts and notifications -----------------
+
+    pub(crate) fn scope(&self) -> LayoutScope {
+        self.scope
+    }
+
+    fn surface_scope_label(&self) -> String {
+        match self.scope {
+            LayoutScope::Home => "Home".to_string(),
+            LayoutScope::Worktree(id) => self
+                .state
+                .worktree(id)
+                .map(|worktree| worktree.label.clone())
+                .unwrap_or_else(|| "Worktree".to_string()),
+        }
+    }
+
+    /// The surface the Pin control would put in the PiP window right now.
+    /// `None` when there is no terminal, chat, run or review surface showing.
+    pub(crate) fn pin_surface(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<super::pip::PipContent> {
+        use super::pip::{PipContent, PipKind};
+        let scope = self.scope;
+        let scope_label = self.surface_scope_label();
+        if let Some((session, state)) = self.chat.pip_chat() {
+            let title = state.session(session)?.label.clone();
+            let provider = state.session(session)?.provider.clone();
+            return Some(PipContent::Chat {
+                title,
+                subtitle: format!("{scope_label} · {provider}"),
+                session,
+                state,
+                changes: self.sync.chats_changes(),
+            });
+        }
+        if self.panel_open
+            && self.panel == Panel::Review
+            && let LayoutScope::Worktree(id) = scope
+        {
+            let title = self
+                .state
+                .forges
+                .get(&id)
+                .and_then(|forge| forge.pr.as_ref())
+                .map(|pr| format!("#{} {}", pr.number, pr.title))
+                .unwrap_or_else(|| "Review".to_string());
+            let lines = super::pip::review_lines(
+                self.state.forges.get(&id),
+                self.state.reviews.get(&id),
+                64,
+            );
+            return Some(PipContent::Review {
+                title,
+                subtitle: scope_label,
+                lines,
+            });
+        }
+        if self.panel_open
+            && let LayoutScope::Worktree(id) = scope
+            && matches!(self.script_tab, ScriptKind::Run(_))
+        {
+            let kind = self.script_tab.clone();
+            if let Some(state) = self.script_state(id, &kind).cloned()
+                && let Some(view) = self.script_view(id, &state, window, cx)
+            {
+                let source = view.read(cx).source().clone();
+                let title = script_label(&kind).to_string();
+                return Some(PipContent::Terminal {
+                    kind: PipKind::Run,
+                    title,
+                    subtitle: scope_label,
+                    source,
+                    options: self.script_options(cx),
+                });
+            }
+        }
+        let has_terminal = self
+            .sync
+            .layout(scope)
+            .workspace()
+            .layout
+            .as_ref()
+            .is_some_and(|layout| {
+                layout
+                    .views
+                    .iter()
+                    .any(|view| view.tabs.iter().any(|tab| !tab.panes.is_empty()))
+            });
+        if !has_terminal {
+            return None;
+        }
+        let shell = self.shell(window, cx);
+        let (title, source) = shell.read(cx).pip_surface()?;
+        let options = self.shell_options(cx);
+        Some(PipContent::Terminal {
+            kind: PipKind::Terminal,
+            title,
+            subtitle: scope_label,
+            source,
+            options: TerminalViewOptions {
+                echo_policy: options.echo_policy,
+                font_family: options.font_family,
+                font_size: options.font_size,
+                palette: options.palette,
+                ..Default::default()
+            },
+        })
+    }
+
+    /// Run the adaptive Git action from the keyboard. `alternate` selects the
+    /// route's alternate dispatch mode, exactly like Ctrl+click on the button.
+    pub(crate) fn run_primary_git(
+        &mut self,
+        alternate: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(worktree) = self.selected_worktree().cloned() else {
+            self.show_error("Select a worktree before running a Git action", cx);
+            return;
+        };
+        if self.git_busy.is_some() || self.dispatch_pending(worktree.id) {
+            return;
+        }
+        let Some(context) = self.git_context(&worktree) else {
+            self.show_error("Git status is not available yet", cx);
+            return;
+        };
+        let action = git_actions::primary(context);
+        if action.actionable() {
+            self.run_git_action(action, alternate, window, cx);
+        }
+    }
+
+    /// Open the inbox (Ctrl+Shift+I).
+    pub(crate) fn open_inbox(&mut self, cx: &mut Context<Self>) {
+        self.open_chat_inbox(cx);
+    }
+
+    /// Focus the current scope's terminal and open the scrollback find bar.
+    pub(crate) fn find_scrollback(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let shell = self.shell(window, cx);
+        shell.update(cx, |shell, cx| shell.open_find(window, cx));
+        shell.read(cx).focus_handle().focus(window);
+    }
+
+    /// Start or stop the selected worktree's current run target.
+    pub(crate) fn run_target(&mut self, cx: &mut Context<Self>) {
+        let Some(worktree) = self.selected_worktree().cloned() else {
+            self.show_error("Select a worktree before running a target", cx);
+            return;
+        };
+        let kind = match &self.script_tab {
+            kind @ ScriptKind::Run(_) => kind.clone(),
+            _ => ScriptKind::Run(None),
+        };
+        let running = self
+            .script_state(worktree.id, &kind)
+            .is_some_and(|state| state.state == ScriptRunState::Running);
+        self.run_script(worktree.id, kind, running, cx);
+        cx.notify();
+    }
+
+    /// Ctrl+Tab / Ctrl+Shift+Tab while focus is outside the shell.
+    pub(crate) fn cycle_tab(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let scope = self.scope;
+        if let Some((shell, _)) = self.shells.get(&scope) {
+            shell.update(cx, |shell, cx| shell.cycle_tab(forward, cx));
+        }
+    }
+
+    /// Open a conversation from a desktop notification: select its worktree
+    /// and queue the tab for the next render, where a window is available.
+    pub(crate) fn activate_session(&mut self, session: uuid::Uuid, cx: &mut Context<Self>) {
+        let Some(worktree) = self.chat.worktree_of(session) else {
+            return;
+        };
+        self.select(LayoutScope::Worktree(worktree), cx);
+        self.chat.pending_chat(session);
         cx.notify();
     }
 
@@ -1807,6 +2001,19 @@ impl HostWorkspace {
             })
             .child(div().flex_1())
             .children(git_button)
+            .child(
+                div()
+                    .id("pin-surface")
+                    .px(px(8.))
+                    .rounded(t.radius_sm)
+                    .cursor_pointer()
+                    .hover(move |s| s.bg(hover))
+                    .child("Pin surface")
+                    .on_click(cx.listener(|_view, _, _, cx| {
+                        cx.emit(HostWorkspaceEvent::PinRequest);
+                        cx.notify();
+                    })),
+            )
             .when(worktree.is_some(), |d| {
                 d.child(
                     div()

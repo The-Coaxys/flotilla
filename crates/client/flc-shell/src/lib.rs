@@ -6,6 +6,7 @@
 //! visible marker while an operation is still unacknowledged. Terminal state
 //! comes from `flc-sync` mirrors through [`MirrorSource`], so nothing here
 //! parses bytes or blocks the UI thread.
+pub mod dnd;
 pub mod model;
 pub mod source;
 mod view;
