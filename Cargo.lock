@@ -2366,6 +2366,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.21",
  "tokio-util",
+ "uuid",
  "zstd",
 ]
 
@@ -2523,6 +2524,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -2627,6 +2629,7 @@ dependencies = [
  "fld-store",
  "getrandom 0.3.4",
  "hex",
+ "postcard",
  "quinn",
  "serde",
  "serde_json",
@@ -2656,6 +2659,7 @@ dependencies = [
  "smallvec",
  "tempfile",
  "thiserror 2.0.21",
+ "uuid",
 ]
 
 [[package]]

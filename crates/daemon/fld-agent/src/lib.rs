@@ -104,6 +104,13 @@ impl Adapter {
     pub fn state(&self) -> SessionState {
         self.state.borrow().clone()
     }
+    /// Move the event receiver out so a supervisor task can drain it while
+    /// this adapter stays shared for commands. The replacement receiver is
+    /// already closed and must never be drained.
+    pub fn take_events(&mut self) -> mpsc::Receiver<EventRecord> {
+        let (_sender, receiver) = mpsc::channel(1);
+        std::mem::replace(&mut self.events, receiver)
+    }
     pub fn watch_state(&self) -> watch::Receiver<SessionState> {
         self.state.clone()
     }

@@ -298,6 +298,42 @@ mod tests {
         let bytes = postcard::to_stdvec(&record).unwrap();
         assert_eq!(postcard::from_bytes::<EventRecord>(&bytes).unwrap(), record);
     }
+
+    #[test]
+    fn search_text_collects_messages_tools_and_questions_with_a_hard_bound() {
+        let event = ChatEvent::UserMessage {
+            id: "m1".into(),
+            text: "fix the build".into(),
+        };
+        assert!(search_text(&event).contains("fix the build"));
+        let huge = ChatEvent::AssistantText {
+            id: "m2".into(),
+            update: TextUpdate::Final,
+            text: "x".repeat(MAX_CHAT_TEXT + 4096),
+        };
+        assert_eq!(search_text(&huge).len(), MAX_CHAT_TEXT);
+        let nested = ChatEvent::Subagent {
+            parent_tool_id: "tool".into(),
+            events: vec![ChatEvent::QuestionRequest {
+                id: "q".into(),
+                questions: vec![Question {
+                    id: "q1".into(),
+                    text: "Which target?".into(),
+                    options: vec![QuestionOption {
+                        label: "release".into(),
+                        description: "production".into(),
+                    }],
+                    multi: false,
+                    free_text: true,
+                    secret: false,
+                }],
+                schema_json: None,
+            }],
+        };
+        let text = search_text(&nested);
+        assert!(text.contains("Which target?"));
+        assert!(text.contains("release"));
+    }
 }
 
 // --- Daemon-owned chat records (M4 wire contract) -------------------------
@@ -377,3 +413,96 @@ pub struct ChatHit {
     pub sequence: u64,
     pub snippet: String,
 }
+
+/// Plain text a durable event contributes to full-text search. It is bounded
+/// by [`MAX_CHAT_TEXT`] so a pathological event cannot inflate the index.
+pub fn search_text(event: &ChatEvent) -> String {
+    struct Text(String);
+    impl Text {
+        fn push(&mut self, value: &str) {
+            if self.0.len() >= MAX_CHAT_TEXT {
+                return;
+            }
+            let separator = !self.0.is_empty();
+            let mut remaining = MAX_CHAT_TEXT - self.0.len();
+            if separator {
+                self.0.push('\n');
+                remaining -= 1;
+            }
+            let mut end = value.len().min(remaining);
+            while !value.is_char_boundary(end) {
+                end -= 1;
+            }
+            self.0.push_str(&value[..end]);
+        }
+        fn bounded(&mut self, value: &BoundedText) {
+            self.push(&value.text);
+        }
+    }
+    fn walk(text: &mut Text, event: &ChatEvent, depth: usize) {
+        if depth > 8 {
+            return;
+        }
+        match event {
+            ChatEvent::SessionReady(info) => {
+                text.push(&info.resume.native_id);
+                if let Some(model) = &info.model {
+                    text.push(model);
+                }
+            }
+            ChatEvent::StateChanged(_) => {}
+            ChatEvent::UserMessage { text: value, .. }
+            | ChatEvent::AssistantText { text: value, .. } => text.push(value),
+            ChatEvent::StructuredOutput { json } => text.push(json),
+            ChatEvent::Thinking { delta, .. } => text.push(delta),
+            ChatEvent::ToolCall(call) => {
+                text.push(&call.title);
+                text.bounded(&call.input_summary);
+                if let Some(output) = &call.output {
+                    text.bounded(output);
+                }
+                if let Some(diff) = &call.diff {
+                    text.bounded(diff);
+                }
+            }
+            ChatEvent::ToolOutput { delta, .. } => text.bounded(delta),
+            ChatEvent::FileEdit { path, unified_diff } => {
+                text.push(&path.to_string_lossy());
+                text.bounded(unified_diff);
+            }
+            ChatEvent::ApprovalRequest {
+                tool, details, ..
+            } => {
+                text.push(tool);
+                text.bounded(details);
+            }
+            ChatEvent::QuestionRequest { questions, .. } => {
+                for question in questions {
+                    text.push(&question.text);
+                    for option in &question.options {
+                        text.push(&option.label);
+                        text.push(&option.description);
+                    }
+                }
+            }
+            ChatEvent::RequestResolved { .. } => {}
+            ChatEvent::Subagent { events, .. } => {
+                for event in events {
+                    walk(text, event, depth + 1);
+                }
+            }
+            ChatEvent::TurnEnd { model, .. } => {
+                if let Some(model) = model {
+                    text.push(model);
+                }
+            }
+            ChatEvent::Error { message, .. } => text.push(message),
+            ChatEvent::Diagnostic { output, .. } => text.bounded(output),
+            ChatEvent::ProcessExited { .. } => {}
+        }
+    }
+    let mut text = Text(String::new());
+    walk(&mut text, event, 0);
+    text.0
+}
+

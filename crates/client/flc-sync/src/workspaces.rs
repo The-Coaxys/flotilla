@@ -168,6 +168,13 @@ async fn follow(
             Ok(DaemonEvent::TaskDispatchChanged(dispatch)) => update(state, |s| {
                 s.dispatches.insert(dispatch.id, dispatch);
             }),
+            // Chat sessions, transcripts and the inbox are followed by the
+            // dedicated chat mirror, not the workspace mirror.
+            Ok(
+                DaemonEvent::ChatSessionChanged(_)
+                | DaemonEvent::ChatEventAppended { .. }
+                | DaemonEvent::InboxChanged,
+            ) => {}
             Ok(DaemonEvent::LayoutChanged { scope, .. }) => {
                 if let Some(commands) = layouts
                     .lock()

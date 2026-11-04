@@ -34,6 +34,19 @@ pub fn commit(worktree: &Path, message: &str, all: bool) -> Result<String> {
     Ok(line(&cmd::run(worktree, &["rev-parse", "HEAD"])?))
 }
 
+/// Rename the worktree's current branch. The caller validates the name
+/// against the repository first; this rechecks the basic shape.
+pub fn rename_branch(worktree: &Path, name: &str) -> Result<()> {
+    if name.trim().is_empty() || name.len() > 200 || name.starts_with('-') || name.contains('\0') {
+        return Err(GitError::Invalid("invalid branch name".into()));
+    }
+    let out = cmd::output(worktree, &["branch", "-m", name])?;
+    if !out.status.success() {
+        return Err(cmd::command_error(&["branch", "-m"], &out));
+    }
+    Ok(())
+}
+
 /// The branch's upstream (`origin/feature`), if any.
 pub fn upstream(worktree: &Path) -> Result<Option<String>> {
     let out = cmd::output(

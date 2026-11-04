@@ -222,4 +222,19 @@ pub enum DaemonEvent {
     RoutingChanged(crate::routing::RoutingState),
     /// A routed Git task started, advanced or finished (protocol 0.4).
     TaskDispatchChanged(crate::routing::TaskDispatch),
+    /// A chat session was created, reconnected, or changed status
+    /// (protocol 0.4).
+    ChatSessionChanged(crate::chat::ChatSession),
+    /// Durable chat events were appended; fetch them with `GetChatEvents`
+    /// from `sequence` (protocol 0.4). Events are hints: a reconnect pages
+    /// from the last durable sequence instead of trusting this.
+    ChatEventAppended {
+        session: uuid::Uuid,
+        worktree: WorktreeId,
+        incarnation: uuid::Uuid,
+        /// The newest durable sequence in this append batch.
+        sequence: u64,
+    },
+    /// Inbox items were added, read, or dismissed (protocol 0.4).
+    InboxChanged,
 }

@@ -27,6 +27,7 @@ use fld_store::{LaunchDefaults, RemovedWorktrees, Store, StoreError};
 use tokio_util::sync::CancellationToken;
 
 use crate::FlotillaHome;
+use crate::chat::ChatService;
 use crate::events::EventBus;
 use crate::terminal::{TerminalService, bounded, stopped_rpc, store_rpc};
 
@@ -36,6 +37,7 @@ const MAX_DIFF_SIDE_BYTES: usize = MAX_FILE_BYTES - 1024 * 1024;
 pub(crate) struct WorkspaceService {
     terminals: Arc<TerminalService>,
     events: Arc<EventBus>,
+    chat: Arc<ChatService>,
     home: FlotillaHome,
     /// Serializes structural changes (projects and worktrees) end to end,
     /// including their git operations.
@@ -45,6 +47,8 @@ pub(crate) struct WorkspaceService {
     /// Last published status per worktree (only changes are published).
     statuses: Mutex<HashMap<WorktreeId, WorktreeStatus>>,
     forge: Mutex<forge::ForgeCache>,
+    /// Routed dispatches of this daemon lifetime.
+    dispatches: Mutex<HashMap<fl_model::TaskRunId, fl_model::routing::TaskDispatch>>,
     cancel: CancellationToken,
 }
 
@@ -113,16 +117,19 @@ impl WorkspaceService {
         home: FlotillaHome,
         terminals: Arc<TerminalService>,
         events: Arc<EventBus>,
+        chat: Arc<ChatService>,
         cancel: CancellationToken,
     ) -> Result<Arc<Self>, RpcError> {
         let service = Arc::new(Self {
             terminals,
             events,
+            chat,
             home,
             structure: tokio::sync::Mutex::new(()),
             watchers: Mutex::default(),
             statuses: Mutex::default(),
             forge: Mutex::default(),
+            dispatches: Mutex::default(),
             cancel,
         });
         service.reconcile().await?;

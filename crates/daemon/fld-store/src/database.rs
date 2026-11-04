@@ -36,7 +36,7 @@ use std::{
     time::Duration,
 };
 
-const SCHEMA_VERSION: u32 = 6;
+const SCHEMA_VERSION: u32 = 7;
 const MAX_LAYOUT_BYTES: usize = 128 * 1024;
 const MAX_ENTRY_BYTES: usize = 512 * 1024;
 const MAX_TEXT_BYTES: usize = 4096;
@@ -541,6 +541,23 @@ fn migrate(connection: &mut Connection, root: &File, path: &Path, existed: bool)
                 [routing::initial_routing()?],
             )?;
         }
+        if version < 7 {
+            transaction.execute_batch(chat::SCHEMA_V7)?;
+            let fts5: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_module_list WHERE name='fts5')",
+                [],
+                |row| row.get(0),
+            )?;
+            if fts5 {
+                transaction.execute_batch(chat::FTS_V7)?;
+            } else {
+                transaction.execute_batch(chat::FALLBACK_V7)?;
+            }
+            transaction.execute(
+                "INSERT INTO chat_meta(singleton,fts5) VALUES(1,?1)",
+                [chat::initial_chat_meta(fts5)],
+            )?;
+        }
         transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     }
     // Never initialize over a missing/corrupt default or partially valid rows.
@@ -557,6 +574,7 @@ fn migrate(connection: &mut Connection, root: &File, path: &Path, existed: bool)
     if invalid_operations {
         return Err(corrupt("invalid persisted operation identity or hash"));
     }
+    chat::validate_chat_integrity(&transaction)?;
     transaction.commit()?;
     Ok(())
 }
@@ -1294,6 +1312,11 @@ mod review;
 
 #[path = "routing.rs"]
 mod routing;
+
+#[path = "chat.rs"]
+pub mod chat;
+
+pub use chat::{ChatAppend, ChatEventEffects, NewInboxItem, PendingKind, PendingRequest};
 
 #[path = "sections.rs"]
 mod sections;
