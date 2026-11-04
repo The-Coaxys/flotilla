@@ -18,6 +18,7 @@ use gpui::{
 
 use crate::hosts::HostStore;
 use crate::secrets::SecretStore;
+use crate::updater::{UpdateState, Updater};
 
 actions!(flotilla, [Quit, AddHost]);
 
@@ -91,6 +92,11 @@ pub struct Workspace {
     pub(crate) selected: Option<usize>,
     pub(crate) center: Center,
     banner: Option<SharedString>,
+    /// Signed update channel and the state it last published.
+    updater: Updater,
+    update: UpdateState,
+    /// Banner the user dismissed for this session, as [`update_key`] names it.
+    update_dismissed: Option<String>,
     focus: FocusHandle,
     // Keep onboarding alive even when the center pane displays another host.
     add_host: Option<Entity<add_host::AddHostForm>>,
@@ -108,6 +114,10 @@ impl Workspace {
             .unwrap_or_else(|| std::env::temp_dir().join("Flotilla").join("hosts.json"));
         let store = HostStore::new(path);
         let secrets: Arc<dyn SecretStore> = Arc::from(crate::secrets::default_store());
+        // Checking for a signed update never touches the network on a build
+        // without a release feed, and it never replaces anything by itself.
+        let updater = Updater::spawn(crate::updater::Config::detect());
+        let update = updater.state();
         let (profiles, banner) = match store.load() {
             Ok(hosts) => (hosts, None),
             Err(e) => (Vec::new(), Some(SharedString::from(format!("{e:#}")))),
@@ -131,6 +141,9 @@ impl Workspace {
             selected: None,
             center: Center::Empty,
             banner,
+            updater,
+            update,
+            update_dismissed: None,
             focus: cx.focus_handle(),
             add_host: None,
             add_host_subscription: None,
@@ -153,6 +166,13 @@ impl Workspace {
         for i in 0..ws.hosts.len() {
             ws.connect(i, window, cx);
         }
+        let mut updates = ws.updater.watch();
+        cx.spawn(
+            async move |this: WeakEntity<Workspace>, cx: &mut AsyncApp| {
+                watch_updates(this, cx, &mut updates).await;
+            },
+        )
+        .detach();
         ws
     }
 
@@ -238,6 +258,92 @@ impl Workspace {
         self.selected
             .and_then(|i| self.hosts.get(i))
             .map(|h| &h.phase)
+    }
+
+    /// Whether a surface is mid-operation, so restarting would interrupt it.
+    ///
+    /// Today that is a shell with unacknowledged operations in flight or a
+    /// terminal mirror still catching up after a reconnect; agent turns report
+    /// through the same gate, so the update banner never offers a restart while
+    /// one is running.
+    pub(crate) fn busy(&self, cx: &App) -> bool {
+        self.hosts
+            .iter()
+            .filter_map(|host| host.shell.as_ref())
+            .any(|shell| {
+                let shell = shell.read(cx);
+                shell.model().pending() > 0
+                    || shell
+                        .live_terminals()
+                        .iter()
+                        .any(|(_, status)| matches!(status, flc_sync::MirrorStatus::Syncing))
+            })
+    }
+
+    fn on_update_action(&mut self, action: flc_ui::update_banner::Action, cx: &mut Context<Self>) {
+        match action {
+            flc_ui::update_banner::Action::Restart => {
+                if !self.updater.restart_if_idle(self.busy(cx)) {
+                    self.banner = Some("The update waits until the current work finishes.".into());
+                    cx.notify();
+                }
+            }
+            flc_ui::update_banner::Action::Retry => self.updater.check_now(),
+        }
+    }
+
+    fn dismiss_update(&mut self, cx: &mut Context<Self>) {
+        self.update_dismissed = update_key(&self.update);
+        cx.notify();
+    }
+
+    /// The non-modal update banner, if the updater has something to say and the
+    /// user has not dismissed this state.
+    fn render_update_banner(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let banner = crate::updater::banner(&self.update, self.busy(cx))?;
+        if let Some(key) = update_key(&self.update)
+            && self.update_dismissed.as_deref() == Some(key.as_str())
+        {
+            return None;
+        }
+        let theme = cx.theme().clone();
+        let view = flc_ui::update_banner::Banner {
+            tone: match banner.tone {
+                crate::updater::Tone::Info => flc_ui::update_banner::Tone::Info,
+                crate::updater::Tone::Success => flc_ui::update_banner::Tone::Success,
+                crate::updater::Tone::Danger => flc_ui::update_banner::Tone::Danger,
+            },
+            title: banner.title.into(),
+            detail: banner.detail.into(),
+            action: banner.action.map(|action| match action {
+                crate::updater::BannerAction::Restart => (
+                    flc_ui::update_banner::Action::Restart,
+                    SharedString::from("Restart now"),
+                ),
+                crate::updater::BannerAction::Retry => (
+                    flc_ui::update_banner::Action::Retry,
+                    SharedString::from("Try again"),
+                ),
+            }),
+            dismissible: banner.dismissible,
+        };
+        let this = cx.weak_entity();
+        let on_action: flc_ui::update_banner::ActionHandler =
+            std::rc::Rc::new(move |action, _window, cx| {
+                let _ = this.update(cx, |ws, cx| ws.on_update_action(action, cx));
+            });
+        let this = cx.weak_entity();
+        let on_dismiss: flc_ui::update_banner::DismissHandler =
+            std::rc::Rc::new(move |_window, cx| {
+                let _ = this.update(cx, |ws, cx| ws.dismiss_update(cx));
+            });
+        Some(flc_ui::update_banner::update_banner(
+            "update-banner",
+            &view,
+            &theme,
+            on_action,
+            on_dismiss,
+        ))
     }
 
     pub(crate) fn select(&mut self, index: usize, cx: &mut Context<Self>) {
@@ -384,6 +490,51 @@ impl Workspace {
     }
 }
 
+/// How [`update_key`] names a state, so a dismissed banner stays dismissed
+/// until the updater has something new to say.
+fn update_key(state: &UpdateState) -> Option<String> {
+    match state {
+        UpdateState::Idle | UpdateState::Checking => None,
+        UpdateState::Available { version }
+        | UpdateState::Downloading { version, .. }
+        | UpdateState::Staged { version }
+        | UpdateState::Restarting { version } => Some(version.clone()),
+        UpdateState::Failed { version, message } => Some(format!(
+            "failed:{}:{message}",
+            version.as_deref().unwrap_or("")
+        )),
+    }
+}
+
+/// Follow the updater: repaint on every change and quit once the replacement
+/// build has been started.
+async fn watch_updates(
+    this: WeakEntity<Workspace>,
+    cx: &mut AsyncApp,
+    rx: &mut tokio::sync::watch::Receiver<UpdateState>,
+) {
+    loop {
+        let state = rx.borrow_and_update().clone();
+        let restarting = matches!(state, UpdateState::Restarting { .. });
+        let alive = this
+            .update(cx, |ws, cx| {
+                ws.update = state;
+                cx.notify();
+            })
+            .is_ok();
+        if !alive {
+            return;
+        }
+        if restarting {
+            let _ = this.update(cx, |_, cx| cx.quit());
+            return;
+        }
+        if rx.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
 async fn watch_phase(
     this: WeakEntity<Workspace>,
     cx: &mut AsyncApp,
@@ -451,6 +602,7 @@ impl Render for Workspace {
                     .min_h_0()
                     .flex()
                     .flex_col()
+                    .when_some(self.render_update_banner(cx), |d, banner| d.child(banner))
                     .when_some(self.banner.clone(), |d, message| {
                         d.child(
                             div()

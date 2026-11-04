@@ -1,0 +1,21 @@
+[package]
+name = "fl-sign"
+description = "Flotilla release signing tool: Ed25519 key generation, detached signing, manifest generation and verification"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "LicenseRef-Proprietary"
+publish = false
+
+# Standalone: this tool is not part of the product workspace, so CI can run it
+# without touching the app's dependency graph.
+[workspace]
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+ed25519-dalek = "2.2"
+getrandom = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"

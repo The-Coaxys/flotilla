@@ -18,7 +18,9 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+base64.workspace = true
 dirs.workspace = true
+ed25519-dalek.workspace = true
 fl-proto.workspace = true
 fl-transport.workspace = true
 flc-conn.workspace = true
@@ -26,12 +28,15 @@ flc-shell.workspace = true
 flc-sync.workspace = true
 flc-ui.workspace = true
 hex.workspace = true
+semver.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+ureq.workspace = true
 uuid.workspace = true
 
 [target.'cfg(windows)'.dependencies]

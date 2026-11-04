@@ -4,3 +4,4 @@
 *.pdb
 /dist
 /.superpowers
+/scripts/fl-sign/target

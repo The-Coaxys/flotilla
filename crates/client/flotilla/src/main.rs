@@ -8,6 +8,7 @@ mod hosts;
 mod runtime;
 mod secrets;
 mod selftest;
+mod updater;
 
 use std::path::PathBuf;
 
@@ -18,6 +19,11 @@ fn main() {
         std::process::exit(selftest::run(&path));
     }
     init_logging();
+    // A replacement may have been interrupted by a crash or a failed
+    // self-check: confirm the new build or put the previous one back and run it.
+    if updater::startup_recovery() {
+        return;
+    }
     let rt = runtime::start();
     app::run(rt.handle().clone());
 }
