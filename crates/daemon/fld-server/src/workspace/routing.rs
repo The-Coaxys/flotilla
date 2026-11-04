@@ -422,18 +422,23 @@ impl WorkspaceService {
                 let branch_for_rename = branch.clone();
                 blocking(move || fld_git::ops::rename_branch(&path, &branch_for_rename)).await?;
                 let _structure = self.structure.lock().await;
-                self.store({
-                    let branch = branch.clone();
-                    move |store| store.database.set_worktree_branch(worktree, Some(&branch))
-                })
-                .await?;
-                let (_, rev) = self
+                let branch_rev = self
+                    .store({
+                        let branch = branch.clone();
+                        move |store| store.database.set_worktree_branch(worktree, Some(&branch))
+                    })
+                    .await?;
+                let (_, label_rev) = self
                     .store({
                         let label = label.clone();
                         move |store| store.database.set_worktree_label(worktree, &label)
                     })
                     .await?;
-                self.publish(DaemonEvent::WorkspaceTreeChanged { rev });
+                // Either update may be a no-op; publish only a real revision.
+                let rev = label_rev.max(branch_rev.unwrap_or(0));
+                if rev > 0 {
+                    self.publish(DaemonEvent::WorkspaceTreeChanged { rev });
+                }
                 Ok(None)
             }
             GitTask::Commit | GitTask::CommitPush => {
