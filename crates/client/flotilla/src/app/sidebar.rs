@@ -10,6 +10,12 @@ use crate::connect::status_line;
 impl Workspace {
     pub(super) fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let t = cx.theme().clone();
+        // The selected host's projects and worktrees follow the host list.
+        let workspace = self
+            .selected
+            .and_then(|i| self.hosts.get(i))
+            .and_then(|h| h.workspace.clone())
+            .map(|workspace| workspace.update(cx, |workspace, cx| workspace.sidebar_section(cx)));
         let rows: Vec<_> = self
             .hosts
             .iter()
@@ -83,7 +89,8 @@ impl Workspace {
                     .flex()
                     .flex_col()
                     .gap(px(2.))
-                    .children(rows),
+                    .children(rows)
+                    .children(workspace),
             )
             .child(
                 div()

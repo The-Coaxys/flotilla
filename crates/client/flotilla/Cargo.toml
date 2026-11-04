@@ -10,7 +10,7 @@ build = "build.rs"
 
 [features]
 # Local X11 runs on Linux for development and UI checks; releases ship Windows.
-linux-x11 = ["gpui/x11"]
+linux-x11 = ["gpui/x11", "flc-editor/linux-x11"]
 
 [[bin]]
 name = "flotilla"
@@ -19,11 +19,14 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 dirs.workspace = true
+fl-model.workspace = true
 fl-proto.workspace = true
 fl-transport.workspace = true
 flc-conn.workspace = true
+flc-editor.workspace = true
 flc-shell.workspace = true
 flc-sync.workspace = true
+flc-terminal.workspace = true
 flc-ui.workspace = true
 hex.workspace = true
 serde.workspace = true

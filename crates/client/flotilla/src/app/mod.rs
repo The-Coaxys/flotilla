@@ -1,6 +1,7 @@
 //! The GPUI application: one window with a title bar, a host sidebar and a center pane.
 mod add_host;
 mod host_view;
+mod host_workspace;
 mod sidebar;
 mod titlebar;
 
@@ -70,8 +71,9 @@ pub(crate) struct HostEntry {
     supervisor: Option<Supervisor>,
     /// Terminal session for this host; `None` until the first connection.
     pub(crate) sync: Option<Arc<flc_sync::Sync>>,
-    pub(crate) shell: Option<Entity<flc_shell::ShellView>>,
-    shell_events: Option<Subscription>,
+    /// Projects, worktrees and terminals of the connected host.
+    pub(crate) workspace: Option<Entity<host_workspace::HostWorkspace>>,
+    workspace_events: Option<Subscription>,
     /// Latest OSC 52 store waiting for the user's first answer for this host.
     pub(crate) clipboard_request: Option<String>,
     /// Bumped on every (re)connect so stale phase watchers are ignored.
@@ -122,8 +124,8 @@ impl Workspace {
                     phase: ConnPhase::Idle,
                     supervisor: None,
                     sync: None,
-                    shell: None,
-                    shell_events: None,
+                    workspace: None,
+                    workspace_events: None,
                     clipboard_request: None,
                     generation: 0,
                 })
@@ -156,18 +158,13 @@ impl Workspace {
         ws
     }
 
-    /// Build the shell view for a connected host on first display. Requires a
-    /// window (the shell takes focus), so it runs from the render path.
-    pub(crate) fn ensure_shell(
-        &mut self,
-        index: usize,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    /// Build the workspace view for a connected host on first display. Runs
+    /// from the render path, where a window exists for its shells.
+    pub(crate) fn ensure_shell(&mut self, index: usize, cx: &mut Context<Self>) {
         let Some(entry) = self.hosts.get_mut(index) else {
             return;
         };
-        if entry.shell.is_some() {
+        if entry.workspace.is_some() {
             return;
         }
         let Some(sync) = entry.sync.clone() else {
@@ -176,33 +173,40 @@ impl Workspace {
         if !matches!(entry.phase, ConnPhase::Connected { .. }) {
             return;
         }
-        let shell = cx.new(|cx| {
-            flc_shell::ShellView::new(sync, flc_shell::ShellViewOptions::default(), window, cx)
-        });
+        // The daemon socket lives under the remote home's .flotilla.
+        let home_dir = entry
+            .profile
+            .socket_path
+            .as_deref()
+            .and_then(|socket| socket.split("/.flotilla/").next())
+            .filter(|home| home.starts_with('/'))
+            .unwrap_or("/")
+            .to_string();
+        let workspace = cx.new(|cx| host_workspace::HostWorkspace::new(sync, home_dir, cx));
         // The phase already reached Connected, so no watch update will carry
         // the latency: publish it now or Auto prediction stays disabled.
         if let ConnPhase::Connected { rtt_ms, .. } = entry.phase {
-            shell.update(cx, |shell, _| {
-                shell.set_rtt(Some(std::time::Duration::from_millis(rtt_ms.into())));
+            workspace.update(cx, |workspace, cx| {
+                workspace.set_rtt(Some(std::time::Duration::from_millis(rtt_ms.into())), cx);
             });
         }
         let host_id = entry.profile.id.clone();
-        entry.shell_events = Some(cx.subscribe(
-            &shell,
-            move |ws, _shell, event: &flc_shell::ShellEvent, cx| {
-                ws.on_shell_event(&host_id, event, cx)
+        entry.workspace_events = Some(cx.subscribe(
+            &workspace,
+            move |ws, _, event: &host_workspace::HostWorkspaceEvent, cx| {
+                ws.on_workspace_event(&host_id, event, cx)
             },
         ));
-        entry.shell = Some(shell);
+        entry.workspace = Some(workspace);
     }
 
-    fn on_shell_event(
+    fn on_workspace_event(
         &mut self,
         host_id: &str,
-        event: &flc_shell::ShellEvent,
+        event: &host_workspace::HostWorkspaceEvent,
         cx: &mut Context<Self>,
     ) {
-        let flc_shell::ShellEvent::ClipboardStore { text, .. } = event;
+        let host_workspace::HostWorkspaceEvent::ClipboardStore(text) = event;
         let Some(entry) = self.hosts.iter_mut().find(|h| h.profile.id == host_id) else {
             return;
         };
@@ -261,7 +265,7 @@ impl Workspace {
             old.stop();
         }
         // A new connection gets a new session and shell bound to it.
-        entry.shell = None;
+        entry.workspace = None;
         entry.sync = None;
         entry.generation += 1;
         let Some(spec) = crate::connect::connect_spec(&entry.profile, token) else {
@@ -288,7 +292,7 @@ impl Workspace {
             ))
         };
         entry.sync = Some(sync);
-        entry.shell = None;
+        entry.workspace = None;
         entry.supervisor = Some(supervisor);
         entry.phase = ConnPhase::Connecting;
         let (host_id, generation) = (entry.profile.id.clone(), entry.generation);
@@ -369,8 +373,8 @@ impl Workspace {
                     phase: ConnPhase::Idle,
                     supervisor: None,
                     sync: None,
-                    shell: None,
-                    shell_events: None,
+                    workspace: None,
+                    workspace_events: None,
                     clipboard_request: None,
                     generation: 0,
                 });
@@ -411,8 +415,8 @@ async fn watch_phase(
                     return;
                 };
                 h.phase = phase;
-                if let Some(shell) = &h.shell {
-                    shell.update(cx, |shell, _| shell.set_rtt(rtt));
+                if let Some(workspace) = &h.workspace {
+                    workspace.update(cx, |workspace, cx| workspace.set_rtt(rtt, cx));
                 }
                 cx.notify();
             })

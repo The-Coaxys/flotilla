@@ -10,7 +10,9 @@ use std::time::Duration;
 
 use fl_model::layout::{Axis, Layout, SplitNode, SplitTree};
 use fl_model::{IncarnationId, PaneId, Size, SplitId, TabId, TerminalId, ViewId};
-use flc_sync::{ClipboardTarget, MirrorEvent, MirrorStatus, Sync, SyncEvent, TerminalNotice};
+use flc_sync::{
+    ClipboardTarget, LayoutHandle, MirrorEvent, MirrorStatus, Sync, SyncEvent, TerminalNotice,
+};
 use flc_terminal::{EchoPolicy, TerminalView, TerminalViewOptions};
 use flc_ui::input::{TextInput, TextInputEvent};
 use flc_ui::theme::{ActiveTheme, Theme};
@@ -43,6 +45,7 @@ impl gpui::EventEmitter<ShellEvent> for ShellView {}
 
 pub struct ShellView {
     sync: Arc<Sync>,
+    layout: LayoutHandle,
     options: ShellViewOptions,
     model: ShellModel,
     sources: HashMap<(TerminalId, IncarnationId), Arc<MirrorSource>>,
@@ -187,16 +190,20 @@ pub(crate) fn shortcut_for(ctrl: bool, shift: bool, alt: bool, key: &str) -> Opt
 }
 
 impl ShellView {
+    /// A shell over one layout scope of `sync` (the host's home layout or
+    /// a worktree's).
     pub fn new(
         sync: Arc<Sync>,
+        layout: LayoutHandle,
         options: ShellViewOptions,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let mut model = ShellModel::default();
-        model.adopt(&sync.workspace());
+        model.adopt(&layout.workspace());
         let mut view = Self {
             sync: sync.clone(),
+            layout: layout.clone(),
             options,
             model,
             sources: HashMap::new(),
@@ -216,14 +223,14 @@ impl ShellView {
         view.open_first_terminal(cx);
         view.attach_panes(window, cx);
 
-        let mut changes = sync.workspace_changes();
+        let mut changes = layout.workspace_changes();
         view._workspace = cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             loop {
                 if changes.changed().await.is_err() {
                     break;
                 }
                 let alive = this.update(cx, |view, cx| {
-                    view.model.adopt(&view.sync.workspace());
+                    view.model.adopt(&view.layout.workspace());
                     view.open_first_terminal(cx);
                     cx.notify();
                 });
@@ -482,7 +489,7 @@ impl ShellView {
     }
 
     fn submit(&mut self, op: fl_model::layout::LayoutOp, cx: &mut Context<Self>) {
-        let ticket = self.sync.apply(op);
+        let ticket = self.layout.apply(op);
         cx.spawn(
             async move |this: WeakEntity<ShellView>, cx: &mut AsyncApp| match ticket.wait().await {
                 Ok(_) => {}

@@ -63,7 +63,7 @@ impl Workspace {
         if let Center::Host = self.center
             && let Some(index) = self.selected
         {
-            self.ensure_shell(index, window, cx);
+            self.ensure_shell(index, cx);
         }
         let t = cx.theme().clone();
         let body: AnyElement = match &self.center {
@@ -71,15 +71,15 @@ impl Workspace {
             // A connected host shows its live terminal workspace; the host card
             // stays available while connecting or when the link has failed.
             Center::Host => match self.selected {
-                Some(i) if i < self.hosts.len() => match &self.hosts[i].shell {
-                    Some(shell) => div()
+                Some(i) if i < self.hosts.len() => match &self.hosts[i].workspace {
+                    Some(workspace) => div()
                         .size_full()
                         .flex()
                         .flex_col()
                         .when_some(self.render_clipboard_request(i, cx), |d, prompt| {
                             d.child(prompt)
                         })
-                        .child(div().flex_1().min_h(px(0.)).child(shell.clone()))
+                        .child(div().flex_1().min_h(px(0.)).child(workspace.clone()))
                         .into_any_element(),
                     None => self.render_host(i, cx).into_any_element(),
                 },
