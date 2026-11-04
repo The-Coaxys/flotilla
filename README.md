@@ -48,6 +48,31 @@ for the SSH transport and on UDP 7443 for QUIC. The client races QUIC and SSH
 and keeps whichever connects first; on an SSH link it re-probes QUIC every
 30 seconds and moves over when UDP gets through.
 
+## What M3 delivers
+
+- **The whole review loop from the bottom bar.** Commit (dialog or all
+  changes), push, open a pull request, mark it ready, merge with the method the
+  repository allows, then delete the merged worktree. The adaptive button shows
+  the one next step for the current state and a dropdown lists the rest.
+- **A forge that uses the server's own sign-in.** GitHub through `gh`: the
+  branch's pull request, mergeability, review decision, unresolved threads and
+  every check (paginated), with polling that backs off on rate limits. A
+  missing or signed-out `gh` is reported as an unavailable reason, never an
+  error.
+- **Checks and reviews.** A Checks tab with links and statuses, and
+  app-managed review threads anchored to a file or a line range, with replies,
+  Should fix / Dismiss, lifecycle states and a pending bundle you can copy or
+  dispatch to an agent.
+- **Sections.** Manual and filter sections (pull request state, review
+  decision, checks, agent state, run state, branch glob) with display order,
+  filter priority, pins and manual assignments; pins win, then manual
+  assignment, then the first matching filter.
+- **Fast/Thorough routes.** Per-scope provider, profile, model, thinking and
+  prompt templates (global, workspace, project, plus the repository's
+  `.flotilla/config.json`), with separate click and Ctrl-click dispatch modes:
+  prepare the prompt, send it in the current or a new chat, or run it in the
+  background.
+
 ## What M2 delivers
 
 - **Projects.** Add any folder on the server through a remote folder picker, or
