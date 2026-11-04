@@ -412,6 +412,17 @@ fn row_index_for_seq(rows: &[TranscriptRow], seq: u64) -> Option<usize> {
 }
 
 impl HostWorkspace {
+    pub(super) fn chat_update_busy(&self) -> bool {
+        !self.chat.inflight.is_empty()
+            || (!self.chat_live() && !self.chat.state.sessions.is_empty())
+            || self
+                .chat
+                .state
+                .sessions
+                .values()
+                .any(|session| can_stop(&session.status))
+    }
+
     /// True only while the link is up and the daemon actually answers chat
     /// requests (protocol 0.4). Without it every chat control is disabled.
     fn chat_live(&self) -> bool {

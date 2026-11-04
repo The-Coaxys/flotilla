@@ -3,3 +3,4 @@ pub mod input;
 pub mod keymap;
 pub mod theme;
 pub mod theme_settings;
+pub mod update_banner;

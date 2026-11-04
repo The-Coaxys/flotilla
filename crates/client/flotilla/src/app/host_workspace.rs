@@ -418,6 +418,24 @@ impl HostWorkspace {
         }
     }
 
+    pub(crate) fn update_busy(&self, cx: &gpui::App) -> bool {
+        self.chat_update_busy()
+            || self.shells.values().any(|(shell, _)| {
+                let shell = shell.read(cx);
+                shell.model().pending() > 0
+                    || shell
+                        .live_terminals()
+                        .iter()
+                        .any(|(_, status)| matches!(status, flc_sync::MirrorStatus::Syncing))
+            })
+            || self.documents.values().any(|documents| {
+                documents.open.iter().any(|document| match &document.kind {
+                    DocumentKind::File { editor, .. } => editor.read(cx).is_dirty(),
+                    DocumentKind::Diff(_) => false,
+                })
+            })
+    }
+
     fn is_folder(&self, worktree: &Worktree) -> bool {
         self.state.tree.as_ref().is_some_and(|tree| {
             tree.projects

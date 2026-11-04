@@ -86,6 +86,9 @@ jobs:
     needs: daemon
     runs-on: windows-latest
     timeout-minutes: 90
+    env:
+      # CI runs and smoke tests never talk to the release feed.
+      FLOTILLA_NO_UPDATE_CHECK: "1"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install toolchain (rust-toolchain.toml)
@@ -202,6 +205,12 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      # The signing key and tool are release-only: no other job can sign.
+      - name: Install toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+      - name: Build the signing tool
+        run: cargo build --release --manifest-path scripts/fl-sign/Cargo.toml
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: artifacts
@@ -214,6 +223,54 @@ jobs:
           cp artifacts/flotilla-windows-x64/flotilla-windows-licenses.zip upload/
           cp artifacts/daemon/flotillad-* upload/
           (cd upload && sha256sum * > SHA256SUMS.txt)
+          ls -l upload
+      - name: Verify the built assets against SHA256SUMS.txt
+        run: (cd upload && sha256sum -c SHA256SUMS.txt)
+      - name: Load the release tag and the product version
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            tag="$GITHUB_REF_NAME"
+          else
+            tag="nightly"
+          fi
+          # The updater orders releases by the version the binary reports
+          # (`PRODUCT_VERSION`), not by the milestone tag, and its self-check
+          # compares the report with the manifest.
+          version=$(cargo metadata --locked --format-version 1 --no-deps \
+            | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "flotilla"))')
+          echo "FLOTILLA_RELEASE_TAG=$tag" >> "$GITHUB_ENV"
+          echo "FLOTILLA_RELEASE_VERSION=$version" >> "$GITHUB_ENV"
+          echo "tag=$tag version=$version"
+      - name: Sign the assets and write the signed manifest
+        env:
+          FLOTILLA_SIGNING_KEY: ${{ secrets.FLOTILLA_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${FLOTILLA_SIGNING_KEY:-}" ]]; then
+            echo "::error::FLOTILLA_SIGNING_KEY is not set; refusing to publish an unsigned release"
+            exit 1
+          fi
+          sign=./scripts/fl-sign/target/release/fl-sign
+          # The secret must be the key the client was built to trust.
+          pub=$("$sign" pubkey | sed -n 's/^public_key=//p')
+          grep -qF "$pub" crates/client/flotilla/src/updater/signature.rs || {
+            echo "::error::FLOTILLA_SIGNING_KEY does not match the public key embedded in the client"
+            exit 1
+          }
+          echo "FLOTILLA_SIGNING_PUBLIC_KEY=$pub" >> "$GITHUB_ENV"
+          "$sign" manifest --version "$FLOTILLA_RELEASE_VERSION" --tag "$FLOTILLA_RELEASE_TAG" \
+            --dir upload --out upload/latest.json
+          # latest.json is signed by `manifest`; every artifact gets its own
+          # detached signature so a manually downloaded installer can be checked.
+          "$sign" sign upload/Flotilla-Setup-x64.exe upload/flotilla-x64.exe \
+            upload/flotilla-windows-licenses.zip \
+            upload/flotillad-x86_64-unknown-linux-musl \
+            upload/flotillad-aarch64-unknown-linux-musl upload/SHA256SUMS.txt
+          "$sign" verify "$pub" upload/latest.json upload/Flotilla-Setup-x64.exe \
+            upload/flotilla-x64.exe upload/flotilla-windows-licenses.zip \
+            upload/flotillad-x86_64-unknown-linux-musl \
+            upload/flotillad-aarch64-unknown-linux-musl upload/SHA256SUMS.txt
           ls -l upload
       - name: Publish
         env:
@@ -232,3 +289,71 @@ jobs:
               --title "Flotilla nightly (${GITHUB_SHA::7})" \
               --notes "Automated build of ${GITHUB_SHA}. Install with Flotilla-Setup-x64.exe. Portable users should extract flotilla-windows-licenses.zip next to flotilla-x64.exe."
           fi
+      - name: Verify the published release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          mkdir -p verify
+          gh release download "$FLOTILLA_RELEASE_TAG" --dir verify --clobber
+          (cd verify && sha256sum -c SHA256SUMS.txt)
+          sign=./scripts/fl-sign/target/release/fl-sign
+          "$sign" verify "$FLOTILLA_SIGNING_PUBLIC_KEY" verify/latest.json \
+            verify/Flotilla-Setup-x64.exe verify/flotilla-x64.exe \
+            verify/flotilla-windows-licenses.zip \
+            verify/flotillad-x86_64-unknown-linux-musl \
+            verify/flotillad-aarch64-unknown-linux-musl verify/SHA256SUMS.txt
+
+  signing:
+    name: sign release manifest (dry run)
+    needs: [daemon, windows]
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+      - name: Build the signing tool
+        run: cargo build --release --manifest-path scripts/fl-sign/Cargo.toml
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: artifacts
+      - name: Assemble, sign and verify without publishing
+        env:
+          FLOTILLA_SIGNING_KEY: ${{ secrets.FLOTILLA_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${FLOTILLA_SIGNING_KEY:-}" ]]; then
+            echo "::error::FLOTILLA_SIGNING_KEY is not set"
+            exit 1
+          fi
+          mkdir -p upload
+          cp artifacts/flotilla-windows-x64/Flotilla-Setup-x64.exe upload/
+          cp artifacts/flotilla-windows-x64/flotilla.exe upload/flotilla-x64.exe
+          cp artifacts/flotilla-windows-x64/flotilla-windows-licenses.zip upload/
+          cp artifacts/daemon/flotillad-* upload/
+          (cd upload && sha256sum * > SHA256SUMS.txt && sha256sum -c SHA256SUMS.txt)
+          version=$(cargo metadata --locked --format-version 1 --no-deps \
+            | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "flotilla"))')
+          sign=./scripts/fl-sign/target/release/fl-sign
+          pub=$("$sign" pubkey | sed -n 's/^public_key=//p')
+          grep -qF "$pub" crates/client/flotilla/src/updater/signature.rs || {
+            echo "::error::FLOTILLA_SIGNING_KEY does not match the public key embedded in the client"
+            exit 1
+          }
+          "$sign" manifest --version "$version" --tag "dry-run" --dir upload --out upload/latest.json
+          "$sign" sign upload/Flotilla-Setup-x64.exe upload/flotilla-x64.exe \
+            upload/flotilla-windows-licenses.zip \
+            upload/flotillad-x86_64-unknown-linux-musl \
+            upload/flotillad-aarch64-unknown-linux-musl upload/SHA256SUMS.txt
+          "$sign" verify "$pub" upload/latest.json upload/Flotilla-Setup-x64.exe \
+            upload/flotilla-x64.exe upload/flotilla-windows-licenses.zip \
+            upload/flotillad-x86_64-unknown-linux-musl \
+            upload/flotillad-aarch64-unknown-linux-musl upload/SHA256SUMS.txt
+          echo "signed manifest:" && cat upload/latest.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: signed-release-dry-run
+          path: upload/
+          if-no-files-found: error
