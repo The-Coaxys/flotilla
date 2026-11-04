@@ -11,9 +11,10 @@ the client never ends a running agent or its shell.
 |---|---|---|
 | M0 | SSH + QUIC transports, bootstrap/upgrade, host registry, frameless client shell, nightly Windows release | released |
 | M1 | Durable PTYs, exact terminal checkpoints, reconnecting sync, native terminal surface, tabs/panes/views, predictive echo | released (v0.2.0) |
-| M2 | Projects and worktrees, live git status, file tree and editor, Changes diff view, setup/run scripts | implemented |
-| M3 | GitHub integration, adaptive Git actions, Checks | in progress |
-| M4–M7 | Chat UI and agent adapters, orchestration and `fl`, polish | planned |
+| M2 | Projects and worktrees, live git status, file tree and editor, Changes diff view, setup/run scripts | released (v0.3.0) |
+| M3 | GitHub integration, adaptive Git actions, sections, app-managed review threads, routed actions | in progress |
+| M4 | Chat service, Claude and Codex adapters, chat surface, approvals, inbox | in progress |
+| M5–M7 | More adapters, orchestration and `fl`, polish | planned |
 
 M1 known limits are recorded at the end of
 [`docs/superpowers/plans/2026-11-02-flotilla-m1-terminals.md`](docs/superpowers/plans/2026-11-02-flotilla-m1-terminals.md):

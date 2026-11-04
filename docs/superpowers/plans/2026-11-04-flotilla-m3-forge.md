@@ -197,3 +197,26 @@ thread survived with `Copy pending` producing the thread's prompt on the clipboa
 
 Known gaps at this point: routed submit execution (needs the chat runtime), routes/templates UI
 and the agent-routed Git actions UI (in progress), and a Windows client run of these surfaces.
+
+
+## Routed actions (Fast/Thorough)
+
+- Routes, prompt templates, dispatch modes and provider discovery are implemented in the
+  domain model, store (schema V6), protocol and daemon service. Templates come from the most
+  specific scope, then the repository's `.flotilla/config.json`, then a built-in default.
+- The daemon fills `{{branch}}`, `{{base}}`, `{{diff}}` (diff stat), `{{checks}}` (forge
+  check list) and `{{reviews}}` (pending review bundle) from real state; unknown values stay
+  literal rather than invented.
+- The native Git menu lists routed actions with the dispatch mode they will use; plain and
+  Ctrl-click resolve separately. Prepare modes open a modal with the daemon-rendered prompt,
+  Copy prompt and an explicit Send. Submit modes run real adapters: structured tasks use one
+  bounded JSON-schema call and apply only validated output; interactive tasks run a chat
+  session whose durable events drive Prepared → Running → Completed/Failed.
+- Bugs found and fixed in the client smoke: the actions menu had no explicit height, so it
+  painted but received no clicks (they fell through to the terminal); the menu now sizes itself
+  from its entries and closes when an action runs. Verified in X11: route saved for the Fast
+  group against the discovered Codex CLI, `Fix CI` became the primary action once checks
+  failed, its menu entry opened the prepared-prompt modal, and the dispatch strip showed
+  "Prepared — not sent".
+- Not exercised here: a live provider turn with a real model (credentials/cost), a Windows
+  client run, and the chat surface itself.
