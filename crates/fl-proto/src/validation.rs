@@ -117,91 +117,6 @@ pub(crate) fn process(value: &ProcessInfo) -> Result<(), ValidationError> {
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use fl_model::{IncarnationId, LogCursor, TerminalId};
-
-    fn info() -> ProcessInfo {
-        ProcessInfo {
-            terminal: TerminalId::from_bytes([1; 16]),
-            incarnation: IncarnationId::from_bytes([2; 16]),
-            pid: 1,
-            size: Size::new(80, 24),
-            argv: vec!["sh".into()],
-            cwd: "/".into(),
-            state: ProcessState::Running,
-            tail: LogCursor::default(),
-            echo: true,
-        }
-    }
-
-    #[test]
-    fn process_metadata_cannot_bypass_wire_geometry_and_string_bounds() {
-        let mut value = info();
-        assert!(process(&value).is_ok());
-        value.size.cell_width = u16::MAX;
-        assert!(process(&value).is_err());
-        value.size = Size::new(80, 24);
-        value.argv = vec!["x".repeat(MAX_TEXT_BYTES); MAX_ARGV_BYTES / MAX_TEXT_BYTES];
-        assert!(process(&value).is_ok());
-        value.argv.push("x".into());
-        assert!(matches!(
-            process(&value),
-            Err(ValidationError::Limit {
-                field: "argv bytes",
-                ..
-            })
-        ));
-        value.argv = vec!["x".into(); MAX_ARG_COUNT + 1];
-        assert!(matches!(
-            process(&value),
-            Err(ValidationError::Limit {
-                field: "argv count",
-                ..
-            })
-        ));
-        value.argv.clear();
-        value.cwd = "/bad\0path".into();
-        assert!(process(&value).is_err());
-    }
-
-    #[test]
-    fn process_list_rejects_duplicate_terminal_identity() {
-        let value = info();
-        assert!(
-            crate::Response::Processes(vec![value.clone(), value])
-                .validate()
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn capabilities_reject_unknown_schema_duplicate_roles_and_invalid_engine() {
-        let mut value = crate::Capabilities {
-            terminal_protocol: crate::TERMINAL_PROTOCOL,
-            channel_schema: crate::CHANNEL_SCHEMA,
-            engine_id: "engine".into(),
-            roles: vec![crate::ChannelRole::TerminalHot],
-            clock_ns: 1,
-        };
-        assert!(value.validate().is_ok());
-        value.terminal_protocol += 1;
-        assert!(matches!(
-            value.validate(),
-            Err(ValidationError::Schema { .. })
-        ));
-        value.terminal_protocol = crate::TERMINAL_PROTOCOL;
-        value.roles.push(crate::ChannelRole::TerminalHot);
-        assert!(value.validate().is_err());
-        value.roles.pop();
-        value.engine_id = " \n".into();
-        assert!(value.validate().is_err());
-        value.engine_id = "x".repeat(MAX_ENGINE_ID_BYTES + 1);
-        assert!(value.validate().is_err());
-    }
-}
-
 // --- M2 bounds -------------------------------------------------------------
 
 /// One absolute path on the daemon host.
@@ -306,5 +221,90 @@ pub fn daemon_event(value: &fl_model::workspace::DaemonEvent) -> Result<(), Vali
         DaemonEvent::WorktreeStatus(status) => worktree_status(status),
         DaemonEvent::ScriptChanged(state) => script_kind(&state.kind),
         DaemonEvent::WorkspaceTreeChanged { .. } | DaemonEvent::LayoutChanged { .. } => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fl_model::{IncarnationId, LogCursor, TerminalId};
+
+    fn info() -> ProcessInfo {
+        ProcessInfo {
+            terminal: TerminalId::from_bytes([1; 16]),
+            incarnation: IncarnationId::from_bytes([2; 16]),
+            pid: 1,
+            size: Size::new(80, 24),
+            argv: vec!["sh".into()],
+            cwd: "/".into(),
+            state: ProcessState::Running,
+            tail: LogCursor::default(),
+            echo: true,
+        }
+    }
+
+    #[test]
+    fn process_metadata_cannot_bypass_wire_geometry_and_string_bounds() {
+        let mut value = info();
+        assert!(process(&value).is_ok());
+        value.size.cell_width = u16::MAX;
+        assert!(process(&value).is_err());
+        value.size = Size::new(80, 24);
+        value.argv = vec!["x".repeat(MAX_TEXT_BYTES); MAX_ARGV_BYTES / MAX_TEXT_BYTES];
+        assert!(process(&value).is_ok());
+        value.argv.push("x".into());
+        assert!(matches!(
+            process(&value),
+            Err(ValidationError::Limit {
+                field: "argv bytes",
+                ..
+            })
+        ));
+        value.argv = vec!["x".into(); MAX_ARG_COUNT + 1];
+        assert!(matches!(
+            process(&value),
+            Err(ValidationError::Limit {
+                field: "argv count",
+                ..
+            })
+        ));
+        value.argv.clear();
+        value.cwd = "/bad\0path".into();
+        assert!(process(&value).is_err());
+    }
+
+    #[test]
+    fn process_list_rejects_duplicate_terminal_identity() {
+        let value = info();
+        assert!(
+            crate::Response::Processes(vec![value.clone(), value])
+                .validate()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn capabilities_reject_unknown_schema_duplicate_roles_and_invalid_engine() {
+        let mut value = crate::Capabilities {
+            terminal_protocol: crate::TERMINAL_PROTOCOL,
+            channel_schema: crate::CHANNEL_SCHEMA,
+            engine_id: "engine".into(),
+            roles: vec![crate::ChannelRole::TerminalHot],
+            clock_ns: 1,
+        };
+        assert!(value.validate().is_ok());
+        value.terminal_protocol += 1;
+        assert!(matches!(
+            value.validate(),
+            Err(ValidationError::Schema { .. })
+        ));
+        value.terminal_protocol = crate::TERMINAL_PROTOCOL;
+        value.roles.push(crate::ChannelRole::TerminalHot);
+        assert!(value.validate().is_err());
+        value.roles.pop();
+        value.engine_id = " \n".into();
+        assert!(value.validate().is_err());
+        value.engine_id = "x".repeat(MAX_ENGINE_ID_BYTES + 1);
+        assert!(value.validate().is_err());
     }
 }
