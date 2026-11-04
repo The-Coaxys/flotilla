@@ -1,0 +1,30 @@
+[package]
+name = "fl"
+description = "Flotilla orchestration CLI"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "fl"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+fl-model.workspace = true
+fl-proto.workspace = true
+fl-transport.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+
+# The end-to-end test runs a real daemon and process host, which are Unix-only.
+[target.'cfg(unix)'.dev-dependencies]
+fld-prochost.workspace = true
+fld-server.workspace = true
+fl-prochost-proto.workspace = true
+tempfile.workspace = true

@@ -2335,6 +2335,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1c66915cc5391097de7a2b0b972e8505aa33c0df401fd3a6811dbdb32881ba48"
 
 [[package]]
+name = "fl"
+version = "0.2.0"
+dependencies = [
+ "clap",
+ "fl-model",
+ "fl-prochost-proto",
+ "fl-proto",
+ "fl-transport",
+ "fld-prochost",
+ "fld-server",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "fl-model"
 version = "0.2.0"
 dependencies = [

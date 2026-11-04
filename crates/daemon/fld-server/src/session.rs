@@ -525,6 +525,38 @@ async fn handle_request(
         }
         Request::ListInbox => chat.inbox().await.map(Response::Inbox),
         Request::DismissInbox { item } => chat.dismiss_inbox(item).await.map(|()| Response::Done),
+        // --- M6: `fl` CLI (0.4) ---
+        Request::ResolveCaller { cwd, session } => workspace
+            .resolve_caller(cwd, session)
+            .await
+            .map(Response::Caller),
+        Request::RenameWorktreeBranch { worktree, branch } => workspace
+            .rename_branch(worktree, branch)
+            .await
+            .map(Response::Worktree),
+        Request::SetWorktreeTarget { worktree, target } => workspace
+            .set_target(worktree, target)
+            .await
+            .map(Response::Worktree),
+        Request::CheckProjectScripts { worktree } => workspace
+            .check_project_scripts(worktree)
+            .await
+            .map(Response::ScriptCheck),
+        Request::GetChatSession { session } => {
+            chat.session(session).await.map(Response::ChatSession)
+        }
+        Request::ListChatHistory { limit } => workspace
+            .chat_history(limit)
+            .await
+            .map(Response::ChatSessions),
+        Request::SelectWorkspace { workspace: id } => workspace
+            .select_workspace(id)
+            .await
+            .map(Response::Workspace),
+        Request::GetSelectedWorkspace => workspace
+            .selected_workspace()
+            .await
+            .map(Response::SelectedWorkspace),
     }
 }
 

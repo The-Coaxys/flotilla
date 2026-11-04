@@ -6,15 +6,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use fl_model::workspace::{
-    DaemonEvent, Project, ScriptKind, ScriptRunState, ScriptState, Worktree,
+    DaemonEvent, Project, ProjectScriptCheck, ScriptKind, ScriptRunState, ScriptState, Worktree,
 };
 use fl_model::{ProcessState, Size, WorktreeId};
 use fl_proto::RpcError;
-use fl_proto::validation::MAX_SCRIPTS;
+use fl_proto::validation::{MAX_SCRIPTS, MAX_TEXT_BYTES};
 use fld_git::config::RepoConfig;
 use fld_store::TerminalKey;
 
 use super::{WorkspaceService, internal, invalid};
+use crate::terminal::bounded;
 
 const SCRIPT_SIZE: Size = Size::new(120, 32);
 /// Teardown must finish within this before the worktree is removed anyway.
@@ -331,6 +332,49 @@ impl WorkspaceService {
                 self.state_of(id, kind, key)
             })
             .collect())
+    }
+
+    /// Parse the worktree's config and report its configured scripts without
+    /// starting anything. A missing file is valid and empty.
+    pub(crate) async fn check_project_scripts(
+        &self,
+        id: WorktreeId,
+    ) -> Result<ProjectScriptCheck, RpcError> {
+        let (worktree, _) = self.worktree(id).await?;
+        let root = PathBuf::from(&worktree.path);
+        let config_path = super::utf8(&root.join(fld_git::config::CONFIG_PATH))?;
+        let loaded = tokio::task::spawn_blocking(move || fld_git::config::load_config(&root))
+            .await
+            .map_err(|error| internal(format!("background task failed: {error}")))?;
+        let (error, setup, teardown, runs) = match loaded {
+            Ok(Some(config)) => (
+                None,
+                !config.setup.is_empty(),
+                !config.teardown.is_empty(),
+                config
+                    .run
+                    .iter()
+                    .filter(|(name, target)| {
+                        !target.commands.is_empty()
+                            && name.len() <= MAX_TEXT_BYTES
+                            && !name.contains('\0')
+                    })
+                    .map(|(name, _)| name.clone())
+                    .collect::<Vec<_>>(),
+            ),
+            Ok(None) => (None, false, false, Vec::new()),
+            Err(error) => (Some(bounded(error.to_string())), false, false, Vec::new()),
+        };
+        let mut runs = runs;
+        runs.truncate(MAX_SCRIPTS);
+        Ok(ProjectScriptCheck {
+            worktree: id,
+            config_path,
+            error,
+            setup,
+            teardown,
+            runs,
+        })
     }
 
     /// Run the configured teardown and wait (bounded) for it to finish.
