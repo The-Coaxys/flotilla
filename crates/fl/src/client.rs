@@ -98,6 +98,35 @@ impl DaemonClient {
         })
     }
 
+    /// Wait for the next pushed event, at most `wait`. `None` means the
+    /// deadline expired with no event. RPC results and pongs are ignored.
+    pub async fn event(
+        &mut self,
+        wait: Duration,
+    ) -> Result<Option<fl_model::workspace::DaemonEvent>, CliError> {
+        let deadline = tokio::time::Instant::now() + wait;
+        loop {
+            match tokio::time::timeout_at(deadline, self.reader.recv::<ServerMsg>()).await {
+                Err(_) => return Ok(None),
+                Ok(message) => match message.map_err(CliError::from)? {
+                    ServerMsg::Event(event) => return Ok(Some(event)),
+                    ServerMsg::Pong { .. } | ServerMsg::RpcResult { .. } => continue,
+                    ServerMsg::Rejected(reason) => {
+                        return Err(CliError::new(
+                            "rejected",
+                            format!("daemon rejected the connection: {reason:?}"),
+                        ));
+                    }
+                    other => {
+                        return Err(CliError::internal(format!(
+                            "unexpected daemon message: {other:?}"
+                        )));
+                    }
+                },
+            }
+        }
+    }
+
     pub async fn rpc(&mut self, request: Request) -> Result<Response, CliError> {
         self.next_id += 1;
         let id = self.next_id;
@@ -147,6 +176,15 @@ impl DaemonClient {
     }
 
     pub async fn rpc(&mut self, _request: Request) -> Result<Response, CliError> {
+        Err(CliError::unsupported(
+            "fl requires a Unix host with a Flotilla daemon socket",
+        ))
+    }
+
+    pub async fn event(
+        &mut self,
+        _wait: Duration,
+    ) -> Result<Option<fl_model::workspace::DaemonEvent>, CliError> {
         Err(CliError::unsupported(
             "fl requires a Unix host with a Flotilla daemon socket",
         ))

@@ -1070,7 +1070,9 @@ fn version_two(root: &Path) -> (Layout, Vec<TerminalEntry>) {
              DROP TABLE IF EXISTS chat_meta; DROP TABLE IF EXISTS routing; DROP TABLE IF EXISTS reviews; \
              DROP TABLE IF EXISTS sections; DROP TABLE IF EXISTS scripts; DROP TABLE IF EXISTS worktree_layouts; \
              DROP TABLE IF EXISTS worktrees; DROP TABLE IF EXISTS projects; DROP TABLE IF EXISTS workspaces; \
-             DROP TABLE IF EXISTS workspace_meta; PRAGMA user_version=2;",
+             DROP TABLE IF EXISTS workspace_meta; DROP TABLE IF EXISTS coordination_state; \
+             DROP TABLE IF EXISTS coordination_locks; DROP TABLE IF EXISTS team_roles; \
+             DROP TABLE IF EXISTS team_runs; PRAGMA user_version=2;",
         )
         .unwrap();
     (layout, terminals)

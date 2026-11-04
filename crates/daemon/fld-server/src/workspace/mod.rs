@@ -3,12 +3,14 @@
 //!
 //! Durable structure lives in `fld-store` (schema v3). Structural changes
 //! are serialized and each one publishes `WorkspaceTreeChanged`.
+mod coordination;
 mod forge;
 mod review;
 mod routing;
 mod scripts;
 mod sections;
 mod status;
+mod team;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -53,6 +55,8 @@ pub(crate) struct WorkspaceService {
     dispatch_cancels: Mutex<HashMap<fl_model::TaskRunId, CancellationToken>>,
     /// Cached provider discovery; handshakes are expensive and change slowly.
     providers: tokio::sync::Mutex<Option<(std::time::Instant, Vec<fld_agent::ProviderDiscovery>)>>,
+    /// Serializes team role bookkeeping and run settlement.
+    teams: tokio::sync::Mutex<()>,
     cancel: CancellationToken,
 }
 
@@ -136,11 +140,13 @@ impl WorkspaceService {
             dispatches: Mutex::default(),
             dispatch_cancels: Mutex::default(),
             providers: tokio::sync::Mutex::new(None),
+            teams: tokio::sync::Mutex::new(()),
             cancel,
         });
         service.reconcile().await?;
         service.clone().resume_scripts().await?;
         service.start_forge_polling();
+        service.watch_team_notices();
         Ok(service)
     }
 

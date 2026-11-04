@@ -415,7 +415,8 @@ mod tests {
                  DROP TABLE IF EXISTS chat_pending; DROP TABLE IF EXISTS chat_events; \
                  DROP TABLE IF EXISTS chat_sessions; DROP TABLE IF EXISTS chat_meta; \
                  DROP TABLE IF EXISTS routing; DROP TABLE IF EXISTS reviews; DROP TABLE IF EXISTS sections; \
-                 PRAGMA user_version=3;",
+                 DROP TABLE IF EXISTS coordination_state; DROP TABLE IF EXISTS coordination_locks; \
+                 DROP TABLE IF EXISTS team_roles; DROP TABLE IF EXISTS team_runs; PRAGMA user_version=3;",
             )
             .unwrap();
         drop(db);

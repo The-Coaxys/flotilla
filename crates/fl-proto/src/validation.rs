@@ -240,6 +240,10 @@ pub fn daemon_event(value: &fl_model::workspace::DaemonEvent) -> Result<(), Vali
         | DaemonEvent::LayoutChanged { .. }
         | DaemonEvent::ReviewChanged { .. }
         | DaemonEvent::InboxChanged => Ok(()),
+        DaemonEvent::CoordinationChanged { scope, key, .. } => {
+            coordination_scope(scope)?;
+            coordination_key(key)
+        }
     }
 }
 
@@ -466,6 +470,7 @@ fn chat_content(event: &fl_model::chat::ChatEvent, depth: usize) -> Result<(), V
             chat_event_text(output)
         }
         ChatEvent::ProcessExited { .. } => Ok(()),
+        ChatEvent::HookFact(fact) => event_text("hook detail", &fact.detail),
     }
 }
 
@@ -590,6 +595,165 @@ pub fn sections_state(value: &fl_model::sections::SectionsState) -> Result<(), V
         MAX_MEMBERSHIPS,
     )?;
     value.validate().map_err(ValidationError::Invalid)
+}
+
+// --- M6 slice 2: coordination, team runs and hooks -------------------------
+
+pub fn coordination_scope(
+    value: &fl_model::coordination::CoordinationScope,
+) -> Result<(), ValidationError> {
+    match value {
+        fl_model::coordination::CoordinationScope::Global => Ok(()),
+        fl_model::coordination::CoordinationScope::Workspace(id) => {
+            non_nil_id("coordination workspace", id.as_bytes())
+        }
+        fl_model::coordination::CoordinationScope::Worktree(id) => {
+            non_nil_id("coordination worktree", id.as_bytes())
+        }
+    }
+}
+
+pub fn coordination_key(key: &str) -> Result<(), ValidationError> {
+    text(
+        "coordination key",
+        key,
+        fl_model::coordination::MAX_COORDINATION_KEY_BYTES,
+    )?;
+    if key.trim().is_empty() || key.contains('\0') {
+        return Err(ValidationError::Invalid("coordination key"));
+    }
+    Ok(())
+}
+
+pub fn coordination_owner(owner: &str) -> Result<(), ValidationError> {
+    text(
+        "coordination owner",
+        owner,
+        fl_model::coordination::MAX_COORDINATION_OWNER_BYTES,
+    )?;
+    if owner.trim().is_empty() || owner.contains('\0') {
+        return Err(ValidationError::Invalid("coordination owner"));
+    }
+    Ok(())
+}
+
+pub fn coordination_value(
+    value: &fl_model::coordination::CoordinationValue,
+) -> Result<(), ValidationError> {
+    coordination_scope(&value.scope)?;
+    coordination_key(&value.key)?;
+    bound(
+        "coordination value",
+        value.value.len(),
+        fl_model::coordination::MAX_COORDINATION_VALUE_BYTES,
+    )?;
+    if value.version == 0 {
+        return Err(ValidationError::Invalid("coordination version"));
+    }
+    Ok(())
+}
+
+pub fn coordination_lock(
+    value: &fl_model::coordination::CoordinationLock,
+) -> Result<(), ValidationError> {
+    coordination_scope(&value.scope)?;
+    coordination_key(&value.key)?;
+    coordination_owner(&value.owner)?;
+    if value.expires_ms < value.acquired_ms {
+        return Err(ValidationError::Invalid("coordination lock expiry"));
+    }
+    Ok(())
+}
+
+pub fn coordination_snapshot(
+    value: &fl_model::coordination::CoordinationSnapshot,
+) -> Result<(), ValidationError> {
+    if let Some(entry) = &value.value {
+        coordination_value(entry)?;
+    }
+    if let Some(lock) = &value.lock {
+        coordination_lock(lock)?;
+    }
+    Ok(())
+}
+
+pub fn hook_event(value: &fl_model::coordination::HookEvent) -> Result<(), ValidationError> {
+    text("hook name", &value.name, MAX_TEXT_BYTES)?;
+    if value.name.trim().is_empty() {
+        return Err(ValidationError::Invalid("hook name"));
+    }
+    for field in [&value.tool, &value.tool_id].into_iter().flatten() {
+        text("hook identity", field, MAX_TEXT_BYTES)?;
+    }
+    text("hook detail", &value.detail, fl_model::chat::MAX_CHAT_TEXT)
+}
+
+pub fn team_run(value: &fl_model::team::TeamRun) -> Result<(), ValidationError> {
+    non_nil("team run", value.id)?;
+    non_nil_id("team worktree", value.worktree.as_bytes())?;
+    text(
+        "team lead",
+        &value.lead,
+        fl_model::team::MAX_TEAM_LABEL_BYTES,
+    )?;
+    bound(
+        "team roles",
+        value.roles.len(),
+        fl_model::team::MAX_TEAM_ROLES,
+    )?;
+    if value.roles.is_empty() {
+        return Err(ValidationError::Invalid("team roles"));
+    }
+    for (index, role) in value.roles.iter().enumerate() {
+        text(
+            "team role label",
+            &role.label,
+            fl_model::team::MAX_TEAM_LABEL_BYTES,
+        )?;
+        text(
+            "team role provider",
+            &role.provider,
+            fl_model::team::MAX_TEAM_PROVIDER_BYTES,
+        )?;
+        if role.label.trim().is_empty() || role.provider.trim().is_empty() {
+            return Err(ValidationError::Invalid("team role"));
+        }
+        if value.roles[..index]
+            .iter()
+            .any(|other| other.label == role.label)
+        {
+            return Err(ValidationError::Invalid("duplicate team role label"));
+        }
+        if let Some(session) = role.session {
+            non_nil("team role session", session)?;
+        }
+        if let Some(report) = &role.report {
+            text(
+                "team report summary",
+                &report.summary,
+                fl_model::team::MAX_TEAM_SUMMARY_BYTES,
+            )?;
+            if let Some(path) = &report.result_file {
+                text(
+                    "team result file",
+                    path,
+                    fl_model::team::MAX_TEAM_RESULT_FILE_BYTES,
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn team_runs(values: &[fl_model::team::TeamRun]) -> Result<(), ValidationError> {
+    bound("team runs", values.len(), fl_model::team::MAX_TEAM_RUNS)?;
+    for (index, value) in values.iter().enumerate() {
+        team_run(value)?;
+        if values[..index].iter().any(|other| other.id == value.id) {
+            return Err(ValidationError::Invalid("duplicate team run"));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

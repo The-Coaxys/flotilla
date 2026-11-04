@@ -174,6 +174,7 @@ async fn control(
                         | fl_model::workspace::DaemonEvent::ChatSessionChanged(_)
                         | fl_model::workspace::DaemonEvent::ChatEventAppended { .. }
                         | fl_model::workspace::DaemonEvent::InboxChanged
+                        | fl_model::workspace::DaemonEvent::CoordinationChanged { .. }
                 )
                     || hello.proto.major > 0
                     || hello.proto.minor >= 4;
@@ -557,6 +558,70 @@ async fn handle_request(
             .selected_workspace()
             .await
             .map(Response::SelectedWorkspace),
+        // --- M6 slice 2: coordination, teams and hooks (0.4) ---
+        Request::CoordinationGet { scope, key } => workspace
+            .coordination_get(scope, key)
+            .await
+            .map(Response::CoordinationSnapshot),
+        Request::CoordinationSet {
+            scope,
+            key,
+            value,
+            if_version,
+        } => workspace
+            .coordination_set(scope, key, value, if_version)
+            .await
+            .map(Response::CoordinationValue),
+        Request::CoordinationDelete {
+            scope,
+            key,
+            if_version,
+        } => workspace
+            .coordination_delete(scope, key, if_version)
+            .await
+            .map(|()| Response::Done),
+        Request::LockCoordination {
+            scope,
+            key,
+            owner,
+            ttl_ms,
+        } => workspace
+            .coordination_lock(scope, key, owner, ttl_ms)
+            .await
+            .map(Response::CoordinationLock),
+        Request::UnlockCoordination { scope, key, owner } => workspace
+            .coordination_unlock(scope, key, owner)
+            .await
+            .map(|()| Response::Done),
+        Request::TeamRun { worktree, spec } => workspace
+            .team_run(worktree, spec)
+            .await
+            .map(Response::TeamRun),
+        Request::TeamStatus { worktree, run } => workspace
+            .team_status(worktree, run)
+            .await
+            .map(Response::TeamRun),
+        Request::TeamList { worktree } => {
+            workspace.team_list(worktree).await.map(Response::TeamRuns)
+        }
+        Request::TeamCancel { run } => workspace.team_cancel(run).await.map(Response::TeamRun),
+        Request::TeamReportSubmit {
+            run,
+            role,
+            summary,
+            result_file,
+        } => workspace
+            .team_report_submit(run, role, summary, result_file)
+            .await
+            .map(Response::TeamRun),
+        Request::TeamReport { run } => workspace.team_report(run).await.map(Response::TeamRun),
+        Request::HookEvent {
+            session,
+            event: hook,
+        } => {
+            let sequence = chat.ingest_hook(session, hook).await?;
+            Ok(Response::HookRecorded { session, sequence })
+        }
     }
 }
 

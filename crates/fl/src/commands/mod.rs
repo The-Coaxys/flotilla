@@ -1,8 +1,12 @@
 //! Command dispatch and the helpers shared by the command families.
 mod agent;
 mod chat;
+mod coordination;
+mod hook;
+mod instructions;
 mod layout;
 mod scripts;
+mod team;
 mod workspace;
 mod worktree;
 
@@ -22,6 +26,11 @@ use crate::output::Reporter;
 
 pub async fn run(cli: &Cli) -> Result<(), CliError> {
     let reporter = Reporter::new(cli.json || cli.output == OutputFormat::Json);
+    // Embedded guides never need the daemon: a broken connection must not
+    // hide the trusted contract from an agent.
+    if let Command::Instructions { topic } = &cli.command {
+        return instructions::run(&reporter, *topic);
+    }
     let socket = socket_path()?;
     let mut client = DaemonClient::connect(&socket).await?;
     match &cli.command {
@@ -41,6 +50,26 @@ pub async fn run(cli: &Cli) -> Result<(), CliError> {
         Command::Chat { command } => chat::run(&mut client, &reporter, cli, command).await,
         Command::History { command } => chat::run_history(&mut client, &reporter, command).await,
         Command::Agent { command } => agent::run(&mut client, &reporter, cli, command).await,
+        Command::Instructions { .. } => unreachable!("handled before connecting"),
+        Command::CoordinationState { command } => {
+            coordination::run(&mut client, &reporter, cli, command).await
+        }
+        Command::Team { command } => team::run(&mut client, &reporter, cli, command).await,
+        Command::Hook {
+            event,
+            session,
+            payload,
+        } => {
+            hook::run(
+                &mut client,
+                &reporter,
+                cli,
+                event,
+                *session,
+                payload.as_deref(),
+            )
+            .await
+        }
     }
 }
 

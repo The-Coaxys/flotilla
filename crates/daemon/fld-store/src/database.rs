@@ -36,7 +36,7 @@ use std::{
     time::Duration,
 };
 
-const SCHEMA_VERSION: u32 = 8;
+const SCHEMA_VERSION: u32 = 9;
 const MAX_LAYOUT_BYTES: usize = 128 * 1024;
 const MAX_ENTRY_BYTES: usize = 512 * 1024;
 const MAX_TEXT_BYTES: usize = 4096;
@@ -562,6 +562,10 @@ fn migrate(connection: &mut Connection, root: &File, path: &Path, existed: bool)
             transaction.execute_batch(cli::SCHEMA_V8)?;
             transaction.execute("INSERT OR IGNORE INTO cli_meta(singleton) VALUES(1)", [])?;
         }
+        if version < 9 {
+            transaction.execute_batch(coordination::SCHEMA_V9)?;
+            transaction.execute_batch(team::SCHEMA_V9)?;
+        }
         transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     }
     // Never initialize over a missing/corrupt default or partially valid rows.
@@ -579,6 +583,8 @@ fn migrate(connection: &mut Connection, root: &File, path: &Path, existed: bool)
         return Err(corrupt("invalid persisted operation identity or hash"));
     }
     chat::validate_chat_integrity(&transaction)?;
+    coordination::validate_integrity(&transaction)?;
+    team::validate_integrity(&transaction)?;
     transaction.commit()?;
     Ok(())
 }
@@ -1328,6 +1334,16 @@ mod sections;
 #[path = "cli.rs"]
 mod cli;
 
+#[path = "coordination.rs"]
+pub mod coordination;
+
+#[path = "team.rs"]
+pub mod team;
+
 #[cfg(test)]
 #[path = "database_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "m6_tests.rs"]
+mod m6_tests;

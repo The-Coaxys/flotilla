@@ -377,6 +377,9 @@ fn event_summary(event: &ChatEvent) -> String {
         ChatEvent::ProcessExited { code, expected } => {
             format!("process exited {code:?} expected={expected}")
         }
+        ChatEvent::HookFact(fact) => {
+            format!("hook {:?}: {}", fact.kind, excerpt(&fact.detail))
+        }
     }
 }
 
