@@ -68,12 +68,49 @@ impl WorkspaceService {
         };
         let mode = mode.unwrap_or_else(|| route.mode(alternate));
         let base = worktree.target.clone().or(project.default_branch.clone());
+        // Fill the placeholders from real state: failing checks, pending
+        // reviews and the worktree's diff summary. Anything unknown stays a
+        // literal placeholder rather than invented text.
+        let checks = if matches!(task, GitTask::FixCi | GitTask::Investigate) {
+            match self.forge_status(id).await {
+                Ok(state) => state.pr.and_then(|pr| {
+                    (!pr.checks.is_empty()).then(|| {
+                        pr.checks
+                            .iter()
+                            .map(|check| format!("{}: {:?}", check.name, check.status))
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    })
+                }),
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+        let reviews = if task == GitTask::FixComments {
+            self.pending_review_bundle(id)
+                .await
+                .ok()
+                .map(|bundle| bundle.prompt)
+        } else {
+            None
+        };
+        let diff_root = std::path::PathBuf::from(&worktree.path);
+        let diff = tokio::task::spawn_blocking(move || {
+            fld_git::cmd::run(&diff_root, &["diff", "--stat", "HEAD"])
+                .ok()
+                .map(|bytes| String::from_utf8_lossy(&bytes).trim().to_owned())
+                .filter(|text| !text.is_empty())
+        })
+        .await
+        .ok()
+        .flatten();
         let template_context = TemplateContext {
             branch: worktree.branch.clone(),
             base,
-            diff: None,
-            checks: None,
-            reviews: None,
+            diff,
+            checks,
+            reviews,
             task: Some(context).filter(|text| !text.trim().is_empty()),
         };
         // A repository's own templates apply below the stored scopes.

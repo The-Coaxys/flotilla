@@ -539,6 +539,103 @@ async fn incompatible_peer_is_rejected_before_workspace_events() {
     daemon.shutdown().await;
 }
 
+/// Routes are durable and a prepare-mode dispatch returns the daemon's own
+/// rendered prompt for the worktree (no provider process is started).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn routing_round_trips_and_prepares_a_git_task() {
+    use fl_model::routing::{
+        DispatchMode, GitTask, RouteKey, RouteOverride, RouteSpec, RoutingMutation, Scope,
+        TaskDispatchState,
+    };
+
+    let fixture = Fixture::new().await;
+    let repo = fixture.repo();
+    let daemon = fixture.start().await;
+    let mut control = Control::connect(&daemon.socket_path).await;
+    let Response::WorkspaceTree(tree) = control.ok(Request::GetWorkspaceTree).await else {
+        panic!("expected tree");
+    };
+    let Response::RoutingState(initial) = control.ok(Request::GetRouting).await else {
+        panic!("expected routing");
+    };
+    assert_eq!(initial.rev, 0);
+    let mut route = RouteSpec::new("codex");
+    route.click = DispatchMode::NewPrepare;
+    let Response::RoutingState(saved) = control
+        .ok(Request::MutateRouting {
+            expected_rev: 0,
+            mutation: RoutingMutation::SetRoute(RouteOverride {
+                scope: Scope::Global,
+                key: RouteKey::Action(GitTask::FixCi),
+                route,
+            }),
+        })
+        .await
+    else {
+        panic!("expected routing");
+    };
+    assert_eq!(saved.rev, 1);
+    control
+        .event("routing change", |event| match event {
+            DaemonEvent::RoutingChanged(state) if state.rev == 1 => Some(()),
+            _ => None,
+        })
+        .await;
+    // A stale revision is refused without overwriting.
+    let stale = control
+        .rpc(Request::MutateRouting {
+            expected_rev: 0,
+            mutation: RoutingMutation::SetRoute(RouteOverride {
+                scope: Scope::Global,
+                key: RouteKey::Action(GitTask::FixCi),
+                route: RouteSpec::new("claude"),
+            }),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(stale.code, RpcErrorCode::RevisionConflict);
+
+    let Response::Project(project) = control
+        .ok(Request::AddProject {
+            workspace: tree.workspaces[0].id,
+            path: repo.display().to_string(),
+        })
+        .await
+    else {
+        panic!("expected project");
+    };
+    let Response::Worktree(task) = control
+        .ok(Request::CreateWorktree {
+            project: project.id,
+            branch: Some("routed".into()),
+            base: None,
+        })
+        .await
+    else {
+        panic!("expected worktree");
+    };
+    let Response::TaskDispatch(dispatch) = control
+        .ok(Request::DispatchGitTask {
+            worktree: task.id,
+            task: GitTask::FixCi,
+            mode: None,
+            alternate: false,
+            context: "build fails on Linux".into(),
+        })
+        .await
+    else {
+        panic!("expected dispatch");
+    };
+    assert_eq!(dispatch.state, TaskDispatchState::Prepared);
+    assert_eq!(dispatch.mode, DispatchMode::NewPrepare);
+    assert!(
+        dispatch.prompt.contains("These checks fail"),
+        "{}",
+        dispatch.prompt
+    );
+    assert!(dispatch.prompt.contains("routed"), "{}", dispatch.prompt);
+}
+
 /// A stand-in for `gh` that keeps one pull request's state in files: it
 /// answers the PR query, and records `pr create` (title, body from stdin,
 /// draft), `pr ready` and `pr merge`.

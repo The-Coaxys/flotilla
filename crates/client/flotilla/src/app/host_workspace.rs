@@ -31,10 +31,10 @@ use gpui::{
 use super::git_actions::{self, GitAction};
 use super::host_view::{primary_button, secondary_button};
 
-#[path = "host_sections.rs"]
-mod sections;
 #[path = "host_routes.rs"]
 mod routes;
+#[path = "host_sections.rs"]
+mod sections;
 
 /// Largest file the editor opens (the daemon's read limit).
 const READ_LIMIT: u32 = 8 * 1024 * 1024;
@@ -1543,8 +1543,7 @@ impl HostWorkspace {
             .and_then(|w| self.git_context(w))
             .map(|context| {
                 let action = git_actions::primary(context);
-                let dispatching =
-                    worktree_id.is_some_and(|id| self.dispatch_pending(id));
+                let dispatching = worktree_id.is_some_and(|id| self.dispatch_pending(id));
                 let label: SharedString = if dispatching {
                     "Dispatching…".into()
                 } else {
@@ -1568,19 +1567,20 @@ impl HostWorkspace {
                             .px(px(10.))
                             .cursor_pointer()
                             .child(label)
-                            .on_click(cx.listener(move |view, event, window, cx| {
-                                if view.git_busy.is_none()
-                                    && !worktree_id
-                                        .is_some_and(|id| view.dispatch_pending(id))
-                                {
-                                    view.run_git_action(
-                                        action,
-                                        event.modifiers().control,
-                                        window,
-                                        cx,
-                                    )
-                                }
-                            })),
+                            .on_click(cx.listener(
+                                move |view, event: &gpui::ClickEvent, window, cx| {
+                                    if view.git_busy.is_none()
+                                        && !worktree_id.is_some_and(|id| view.dispatch_pending(id))
+                                    {
+                                        view.run_git_action(
+                                            action,
+                                            event.modifiers().control,
+                                            window,
+                                            cx,
+                                        )
+                                    }
+                                },
+                            )),
                     )
                     .child(
                         div()
@@ -1854,6 +1854,10 @@ impl HostWorkspace {
             .get(&worktree.id)
             .and_then(|f| f.pr.as_ref())
             .map(|pr| pr.url.clone());
+        let mut entries = actions.len();
+        if pr_url.is_some() {
+            entries += 1;
+        }
         let mut menu = div()
             .id("git-actions-menu")
             .absolute()
@@ -1861,6 +1865,9 @@ impl HostWorkspace {
             .bottom(px(32.))
             .right(px(if self.panel_open { 330. } else { 10. }))
             .w(px(320.))
+            // An absolutely positioned box only receives clicks over an
+            // explicit size: `bottom` alone leaves the hit area empty.
+            .h(px(26. * (entries as f32) + 8.))
             .py(px(4.))
             .flex()
             .flex_col()
@@ -1890,9 +1897,11 @@ impl HostWorkspace {
                     .hover(move |s| s.bg(hover))
                     .when(!action.actionable(), |d| d.text_color(t.text_tertiary))
                     .child(label)
-                    .on_click(cx.listener(move |view, event, window, cx| {
-                        view.run_git_action(action, event.modifiers().control, window, cx)
-                    })),
+                    .on_click(
+                        cx.listener(move |view, event: &gpui::ClickEvent, window, cx| {
+                            view.run_git_action(action, event.modifiers().control, window, cx)
+                        }),
+                    ),
             );
         }
         if let Some(url) = pr_url {

@@ -101,7 +101,7 @@ pub struct Context<'a> {
     pub forge: Option<&'a ForgeState>,
 }
 
-fn open_pr(cx: Context) -> Option<&fl_model::forge::PullRequest> {
+fn open_pr<'a>(cx: Context<'a>) -> Option<&'a fl_model::forge::PullRequest> {
     cx.forge
         .and_then(|forge| forge.pr.as_ref())
         .filter(|pr| pr.state == PrState::Open)

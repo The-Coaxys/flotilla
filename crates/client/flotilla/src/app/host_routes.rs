@@ -491,9 +491,8 @@ impl HostWorkspace {
                 routing.rev,
             )
         };
-        let spec = existing.unwrap_or_else(|| {
-            RouteSpec::new(self.available_provider().unwrap_or_default())
-        });
+        let spec = existing
+            .unwrap_or_else(|| RouteSpec::new(self.available_provider().unwrap_or_default()));
         let profile = cx.new(|cx| TextInput::new(cx, "Provider profile (optional)"));
         let model = cx.new(|cx| TextInput::new(cx, "Model (optional)"));
         let thinking = cx.new(|cx| TextInput::new(cx, "Thinking setting (optional)"));
@@ -520,6 +519,7 @@ impl HostWorkspace {
         self.dialog = None;
         self.sections_ui.close();
         self.routes_ui.error = None;
+        let focus = profile.read(cx).focus_handle(cx);
         self.routes_ui.dialog = Some(RoutesDialog::EditRoute(RouteDraft {
             workspace,
             scope,
@@ -535,7 +535,7 @@ impl HostWorkspace {
             busy: false,
             _events: events,
         }));
-        profile.read(cx).focus_handle(cx).focus(window);
+        focus.focus(window);
         cx.notify();
     }
 
@@ -622,8 +622,7 @@ impl HostWorkspace {
                         if let Some(Ok(state)) = fresh.as_ref() {
                             view.routes_ui.snapshot = Some(state.clone());
                         }
-                        if let Some(RoutesDialog::EditRoute(draft)) =
-                            view.routes_ui.dialog.as_mut()
+                        if let Some(RoutesDialog::EditRoute(draft)) = view.routes_ui.dialog.as_mut()
                         {
                             draft.busy = false;
                             if is_conflict(&error) {
@@ -984,14 +983,13 @@ impl HostWorkspace {
                 match result {
                     Ok(dispatch) => {
                         if dispatch.state == TaskDispatchState::Prepared {
-                            view.routes_ui.dialog =
-                                Some(RoutesDialog::Dispatch(DispatchModal {
-                                    dispatch: dispatch.clone(),
-                                    context: context.clone(),
-                                    sending: false,
-                                    error: None,
-                                    copied: false,
-                                }));
+                            view.routes_ui.dialog = Some(RoutesDialog::Dispatch(DispatchModal {
+                                dispatch: dispatch.clone(),
+                                context: context.clone(),
+                                sending: false,
+                                error: None,
+                                copied: false,
+                            }));
                         }
                         view.push_notice(DispatchNotice::Record { dispatch, context });
                     }
@@ -1038,7 +1036,9 @@ impl HostWorkspace {
         let Some(RoutesDialog::Dispatch(modal)) = self.routes_ui.dialog.as_ref() else {
             return;
         };
-        cx.write_to_clipboard(gpui::ClipboardItem::new_string(modal.dispatch.prompt.clone()));
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+            modal.dispatch.prompt.clone(),
+        ));
         if let Some(RoutesDialog::Dispatch(modal)) = self.routes_ui.dialog.as_mut() {
             modal.copied = true;
         }
@@ -1053,8 +1053,7 @@ impl HostWorkspace {
             return;
         }
         let Some(mode) = submit_mode(modal.dispatch.mode) else {
-            modal.error =
-                Some("This dispatch already submits or runs in the background.".into());
+            modal.error = Some("This dispatch already submits or runs in the background.".into());
             cx.notify();
             return;
         };
@@ -1086,8 +1085,7 @@ impl HostWorkspace {
                         view.push_notice(DispatchNotice::Record { dispatch, context });
                     }
                     Err(error) => {
-                        if let Some(RoutesDialog::Dispatch(modal)) =
-                            view.routes_ui.dialog.as_mut()
+                        if let Some(RoutesDialog::Dispatch(modal)) = view.routes_ui.dialog.as_mut()
                         {
                             modal.sending = false;
                             modal.error = Some(error_text(&error));
@@ -1229,9 +1227,7 @@ impl HostWorkspace {
         }
         body = body.child(heading("Prompt templates", t));
         for action in GitTask::ALL {
-            body = body.child(self.template_row(
-                routing, workspace, scope, action, t, cx,
-            ));
+            body = body.child(self.template_row(routing, workspace, scope, action, t, cx));
         }
         if let Some(error) = self.routes_ui.error.clone() {
             body = body.child(
@@ -1242,13 +1238,11 @@ impl HostWorkspace {
             );
         }
         let can_close = !self.routes_ui.busy;
-        body = body.child(
-            div().flex().justify_end().child(
-                action_button("routes-done", "Done", can_close, t).when(can_close, |d| {
-                    d.on_click(cx.listener(|view, _, window, cx| view.close_dialog(window, cx)))
-                }),
-            ),
-        );
+        body = body.child(div().flex().justify_end().child(
+            action_button("routes-done", "Done", can_close, t).when(can_close, |d| {
+                d.on_click(cx.listener(|view, _, window, cx| view.close_dialog(window, cx)))
+            }),
+        ));
         body.into_any_element()
     }
 
@@ -1366,7 +1360,9 @@ impl HostWorkspace {
         };
         let rev = routing.rev;
         let row = div()
-            .id(SharedString::from(format!("template-row-{scope:?}-{action:?}")))
+            .id(SharedString::from(format!(
+                "template-row-{scope:?}-{action:?}"
+            )))
             .flex()
             .items_center()
             .gap(px(8.))
@@ -1481,14 +1477,10 @@ impl HostWorkspace {
                             .child("Click"),
                     )
                     .child(
-                        action_button("route-click-mode", draft.click.label(), enabled, t).when(
-                            enabled,
-                            |d| {
-                                d.on_click(
-                                    cx.listener(|view, _, _, cx| view.cycle_click(cx)),
-                                )
-                            },
-                        ),
+                        action_button("route-click-mode", draft.click.label(), enabled, t)
+                            .when(enabled, |d| {
+                                d.on_click(cx.listener(|view, _, _, cx| view.cycle_click(cx)))
+                            }),
                     ),
             )
             .child(
@@ -1504,15 +1496,10 @@ impl HostWorkspace {
                             .child("Ctrl+click"),
                     )
                     .child(
-                        action_button(
-                            "route-alt-mode",
-                            draft.alternate_click.label(),
-                            enabled,
-                            t,
-                        )
-                        .when(enabled, |d| {
-                            d.on_click(cx.listener(|view, _, _, cx| view.cycle_alternate(cx)))
-                        }),
+                        action_button("route-alt-mode", draft.alternate_click.label(), enabled, t)
+                            .when(enabled, |d| {
+                                d.on_click(cx.listener(|view, _, _, cx| view.cycle_alternate(cx)))
+                            }),
                     ),
             );
         if let Some(error) = draft.error.clone() {
@@ -1538,7 +1525,11 @@ impl HostWorkspace {
                 .child(
                     action_button(
                         "route-save",
-                        if draft.busy { "Saving…" } else { "Save route" },
+                        if draft.busy {
+                            "Saving…"
+                        } else {
+                            "Save route"
+                        },
                         enabled,
                         t,
                     )
@@ -1590,19 +1581,16 @@ impl HostWorkspace {
         };
         if providers.is_empty() {
             rows.push(
-                note(
-                    "The daemon discovered no installable chat providers.",
-                    t,
-                )
-                .into_any_element(),
+                note("The daemon discovered no installable chat providers.", t).into_any_element(),
             );
         }
         for (index, provider) in providers.iter().enumerate() {
             let id = provider.provider.id.clone();
             let selected = draft.provider.as_deref() == Some(id.as_str());
-            let unavailable = provider.unavailable_reason.clone().or_else(|| {
-                (!provider.capabilities.chat).then(|| "no chat capability".to_owned())
-            });
+            let unavailable = provider
+                .unavailable_reason
+                .clone()
+                .or_else(|| (!provider.capabilities.chat).then(|| "no chat capability".to_owned()));
             let version = provider
                 .version
                 .as_ref()
@@ -1616,7 +1604,11 @@ impl HostWorkspace {
                 .flex()
                 .flex_col()
                 .gap(px(2.))
-                .bg(if selected { t.row_selected } else { t.surface_bg })
+                .bg(if selected {
+                    t.row_selected
+                } else {
+                    t.surface_bg
+                })
                 .text_size(t.text_size_sm)
                 .child(
                     div()
@@ -1644,9 +1636,9 @@ impl HostWorkspace {
                 None => row,
             };
             if unavailable.is_none() && enabled {
-                row = row.on_click(cx.listener(move |view, _, _, cx| {
-                    view.choose_provider(id.clone(), cx)
-                }));
+                row = row.on_click(
+                    cx.listener(move |view, _, _, cx| view.choose_provider(id.clone(), cx)),
+                );
             }
             rows.push(row.into_any_element());
         }
@@ -1764,7 +1756,11 @@ impl HostWorkspace {
                 .child(
                     action_button(
                         "template-save",
-                        if draft.busy { "Saving…" } else { "Save template" },
+                        if draft.busy {
+                            "Saving…"
+                        } else {
+                            "Save template"
+                        },
                         enabled,
                         t,
                     )
@@ -1776,7 +1772,12 @@ impl HostWorkspace {
         body.into_any_element()
     }
 
-    fn dispatch_modal(&self, modal: &DispatchModal, t: &Theme, cx: &mut Context<Self>) -> AnyElement {
+    fn dispatch_modal(
+        &self,
+        modal: &DispatchModal,
+        t: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let dispatch = &modal.dispatch;
         let can_close = !modal.sending;
         let mut body = div().flex().flex_col().gap(px(10.));
@@ -1834,7 +1835,11 @@ impl HostWorkspace {
                 .child(
                     action_button(
                         "dispatch-copy",
-                        if modal.copied { "Copied" } else { "Copy prompt" },
+                        if modal.copied {
+                            "Copied"
+                        } else {
+                            "Copy prompt"
+                        },
                         true,
                         t,
                     )
@@ -1851,13 +1856,12 @@ impl HostWorkspace {
                         d.on_click(cx.listener(|view, _, _, cx| view.send_prepared(cx)))
                     }),
                 )
-                .child(
-                    action_button("dispatch-close", "Close", can_close, t).when(can_close, |d| {
-                        d.on_click(cx.listener(|view, _, window, cx| {
-                            view.close_dialog(window, cx)
-                        }))
-                    }),
-                ),
+                .child(action_button("dispatch-close", "Close", can_close, t).when(
+                    can_close,
+                    |d| {
+                        d.on_click(cx.listener(|view, _, window, cx| view.close_dialog(window, cx)))
+                    },
+                )),
         );
         body.into_any_element()
     }
@@ -1886,7 +1890,12 @@ impl HostWorkspace {
             },
         }
         let mut rows: Vec<Row> = Vec::new();
-        for pending in self.routes_ui.pending.iter().filter(|p| p.worktree == worktree) {
+        for pending in self
+            .routes_ui
+            .pending
+            .iter()
+            .filter(|p| p.worktree == worktree)
+        {
             rows.push(Row::Pending(PendingDispatch {
                 seq: pending.seq,
                 worktree: pending.worktree,
@@ -1960,7 +1969,10 @@ impl HostWorkspace {
                     };
                     strip = strip.child(
                         div()
-                            .id(SharedString::from(format!("dispatch-pending-{}", pending.seq)))
+                            .id(SharedString::from(format!(
+                                "dispatch-pending-{}",
+                                pending.seq
+                            )))
                             .flex()
                             .items_center()
                             .gap(px(6.))
@@ -2010,22 +2022,17 @@ impl HostWorkspace {
                     mode,
                     message,
                 } => {
-                    strip = strip.child(
-                        div()
-                            .id(SharedString::from(format!("dispatch-failed-{seq}")))
-                            .flex()
-                            .flex_col()
-                            .child(
-                                div()
-                                    .text_color(t.danger)
-                                    .child(SharedString::from(format!(
-                                        "{} · {} — failed",
-                                        task.label(),
-                                        mode.label()
-                                    ))),
-                            )
-                            .child(div().text_color(t.text_secondary).child(message)),
-                    );
+                    strip =
+                        strip.child(
+                            div()
+                                .id(SharedString::from(format!("dispatch-failed-{seq}")))
+                                .flex()
+                                .flex_col()
+                                .child(div().text_color(t.danger).child(SharedString::from(
+                                    format!("{} · {} — failed", task.label(), mode.label()),
+                                )))
+                                .child(div().text_color(t.text_secondary).child(message)),
+                        );
                 }
             }
         }
@@ -2084,7 +2091,11 @@ mod tests {
     fn click_and_alternate_resolve_from_the_route() {
         let workspace = WorkspaceId::new();
         let project = ProjectId::new();
-        let state = routing_with(base_route(), RouteKey::Group(routing::RouteGroup::Thorough), Scope::Global);
+        let state = routing_with(
+            base_route(),
+            RouteKey::Group(routing::RouteGroup::Thorough),
+            Scope::Global,
+        );
         assert_eq!(
             resolve_dispatch_mode(&state, GitTask::FixCi, project, workspace, false),
             Some(DispatchMode::ReusePrepare)
@@ -2271,5 +2282,4 @@ mod tests {
             DispatchMode::ReusePrepare
         );
     }
-
 }
