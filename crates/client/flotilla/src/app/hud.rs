@@ -144,8 +144,10 @@ impl Workspace {
         Some(
             div()
                 .absolute()
-                .right(px(12.))
-                .top(px(48.))
+                // Bottom-left of the center area: never covers the right panel
+                // or the settings overlay, which open above the canvas.
+                .left(px(300.))
+                .bottom(px(56.))
                 .w(px(268.))
                 .p(px(12.))
                 .rounded(px(6.))
