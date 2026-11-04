@@ -131,6 +131,10 @@ The client was run under Xvfb against the daemon in `flsmoke`'s home, with a scr
   returns to `idle`, and the transcript shows `seq 22`.
 - The right panel `Chat` tab lists the durable session, its status/seq and the inbox badge;
   opening the session from the list restores the same transcript after a client restart.
+- Resume across a daemon restart: a session created with `fl chat new`, messaged, then
+  surviving `systemctl --user restart flotillad`, keeps its native provider session id
+  (`706e5f59-...`) and continues from sequence 13 to 26 with the next `fl chat send`; the
+  session stays `Idle` and is not backed by a fresh conversation.
 
 Not exercised, and therefore not claimed: a real Claude/Codex CLI turn, a real question card
 against a live provider, Windows toast activation (in-app toasts only), and a real routed
