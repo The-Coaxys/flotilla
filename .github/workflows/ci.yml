@@ -263,10 +263,13 @@ jobs:
           # latest.json is signed by `manifest`; every artifact gets its own
           # detached signature so a manually downloaded installer can be checked.
           "$sign" sign upload/Flotilla-Setup-x64.exe upload/flotilla-x64.exe \
-            upload/flotilla-windows-licenses.zip upload/flotillad-* upload/SHA256SUMS.txt
+            upload/flotilla-windows-licenses.zip \
+            upload/flotillad-x86_64-unknown-linux-musl \
+            upload/flotillad-aarch64-unknown-linux-musl upload/SHA256SUMS.txt
           "$sign" verify "$pub" upload/latest.json upload/Flotilla-Setup-x64.exe \
             upload/flotilla-x64.exe upload/flotilla-windows-licenses.zip \
-            upload/flotillad-* upload/SHA256SUMS.txt
+            upload/flotillad-x86_64-unknown-linux-musl \
+            upload/flotillad-aarch64-unknown-linux-musl upload/SHA256SUMS.txt
           ls -l upload
       - name: Publish
         env:
@@ -297,8 +300,9 @@ jobs:
           sign=./scripts/fl-sign/target/release/fl-sign
           "$sign" verify "$FLOTILLA_SIGNING_PUBLIC_KEY" verify/latest.json \
             verify/Flotilla-Setup-x64.exe verify/flotilla-x64.exe \
-            verify/flotilla-windows-licenses.zip verify/flotillad-* \
-            verify/SHA256SUMS.txt
+            verify/flotilla-windows-licenses.zip \
+            verify/flotillad-x86_64-unknown-linux-musl \
+            verify/flotillad-aarch64-unknown-linux-musl verify/SHA256SUMS.txt
 
   signing:
     name: sign release manifest (dry run)
@@ -339,10 +343,13 @@ jobs:
           }
           "$sign" manifest --version "$version" --tag "dry-run" --dir upload --out upload/latest.json
           "$sign" sign upload/Flotilla-Setup-x64.exe upload/flotilla-x64.exe \
-            upload/flotilla-windows-licenses.zip upload/flotillad-* upload/SHA256SUMS.txt
+            upload/flotilla-windows-licenses.zip \
+            upload/flotillad-x86_64-unknown-linux-musl \
+            upload/flotillad-aarch64-unknown-linux-musl upload/SHA256SUMS.txt
           "$sign" verify "$pub" upload/latest.json upload/Flotilla-Setup-x64.exe \
             upload/flotilla-x64.exe upload/flotilla-windows-licenses.zip \
-            upload/flotillad-* upload/SHA256SUMS.txt
+            upload/flotillad-x86_64-unknown-linux-musl \
+            upload/flotillad-aarch64-unknown-linux-musl upload/SHA256SUMS.txt
           echo "signed manifest:" && cat upload/latest.json
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
