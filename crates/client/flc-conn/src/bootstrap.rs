@@ -167,10 +167,17 @@ pub fn parse_probe(stdout: &str) -> Result<Probe, BootstrapError> {
     })
 }
 
+/// The embedded daemon speaks this client's protocol. Two builds can share
+/// a version and build label (local builds are all `dev`), so a daemon on
+/// another protocol is replaced even when its labels match.
 pub fn should_install(installed: Option<&VersionInfo>, artifacts: &DaemonArtifacts) -> bool {
     match installed {
         None => true,
-        Some(v) => v.version != artifacts.version || v.build != artifacts.build,
+        Some(v) => {
+            v.version != artifacts.version
+                || v.build != artifacts.build
+                || v.proto != fl_proto::PROTO
+        }
     }
 }
 
@@ -443,6 +450,15 @@ mod tests {
         assert!(!should_install(Some(&version("0.1.0", "abc")), &a));
         assert!(should_install(Some(&version("0.1.0", "old")), &a));
         assert!(should_install(Some(&version("0.0.9", "abc")), &a));
+        // Same labels, older protocol: still replaced.
+        let older = VersionInfo {
+            proto: fl_proto::ProtoVersion {
+                major: fl_proto::PROTO.major,
+                minor: fl_proto::PROTO.minor - 1,
+            },
+            ..version("0.1.0", "abc")
+        };
+        assert!(should_install(Some(&older), &a));
     }
 
     /// Review Focus #5.
