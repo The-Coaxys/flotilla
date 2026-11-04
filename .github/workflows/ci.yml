@@ -38,9 +38,9 @@ jobs:
         # Alacritty/VTE path dependencies, which keep upstream's nightly style.
         run: cargo fmt --check
       - name: Clippy (non-UI crates)
-        run: cargo clippy --locked --workspace --exclude flc-ui --exclude flc-terminal --exclude flc-shell --exclude flotilla --all-targets -- -D warnings
+        run: cargo clippy --locked --workspace --exclude flc-ui --exclude flc-terminal --exclude flc-shell --exclude flc-editor --exclude flotilla --all-targets -- -D warnings
       - name: Test (non-UI crates)
-        run: cargo test --locked --workspace --exclude flc-ui --exclude flc-terminal --exclude flc-shell --exclude flotilla
+        run: cargo test --locked --workspace --exclude flc-ui --exclude flc-terminal --exclude flc-shell --exclude flc-editor --exclude flotilla
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: 0.14.1
@@ -77,9 +77,9 @@ jobs:
         with:
           key: ui-check
       - name: Clippy (UI crates)
-        run: cargo clippy --locked -p flc-ui -p flc-terminal -p flc-shell -p flotilla --all-targets -- -D warnings
+        run: cargo clippy --locked -p flc-ui -p flc-terminal -p flc-shell -p flc-editor -p flotilla --all-targets -- -D warnings
       - name: Test (UI crates)
-        run: cargo test --locked -p flc-ui -p flc-terminal -p flc-shell -p flotilla
+        run: cargo test --locked -p flc-ui -p flc-terminal -p flc-shell -p flc-editor -p flotilla
 
   windows:
     name: client — Windows build, self-test, installer
@@ -105,6 +105,7 @@ jobs:
           cargo test --locked --target x86_64-pc-windows-msvc -p flc-terminal --lib
           cargo test --locked --target x86_64-pc-windows-msvc -p flc-shell --lib
           cargo test --locked --target x86_64-pc-windows-msvc -p flc-sync --lib
+          cargo test --locked --target x86_64-pc-windows-msvc -p flc-editor --lib
       - name: Build flotilla.exe (daemons embedded)
         shell: pwsh
         env:

@@ -10,8 +10,9 @@ the client never ends a running agent or its shell.
 | Milestone | Scope | State |
 |---|---|---|
 | M0 | SSH + QUIC transports, bootstrap/upgrade, host registry, frameless client shell, nightly Windows release | released |
-| M1 | Durable PTYs, exact terminal checkpoints, reconnecting sync, native terminal surface, tabs/panes/views, predictive echo | implemented, pending installed-Windows acceptance against the VPS |
-| M2+ | worktrees, agent processes, files, search, ports | planned |
+| M1 | Durable PTYs, exact terminal checkpoints, reconnecting sync, native terminal surface, tabs/panes/views, predictive echo | released (v0.2.0) |
+| M2 | Projects and worktrees, live git status, file tree and editor, Changes diff view, setup/run scripts | implemented |
+| M3–M7 | Forge and Git actions, chat UI and agent adapters, orchestration and `fl`, polish | planned |
 
 M1 known limits are recorded at the end of
 [`docs/superpowers/plans/2026-11-02-flotilla-m1-terminals.md`](docs/superpowers/plans/2026-11-02-flotilla-m1-terminals.md):
@@ -44,6 +45,32 @@ writes a user unit running `flotillad serve`, which listens on a Unix socket
 for the SSH transport and on UDP 7443 for QUIC. The client races QUIC and SSH
 and keeps whichever connects first; on an SSH link it re-probes QUIC every
 30 seconds and moves over when UDP gets through.
+
+## What M2 delivers
+
+- **Projects.** Add any folder on the server through a remote folder picker, or
+  clone a URL there. Git repositories bring their existing worktrees; plain
+  folders get files and terminals.
+- **One worktree per task.** Create a worktree from the sidebar's **+**: it is
+  checked out under `~/.flotilla/worktrees/<project>/<branch>`, files listed in
+  `.worktreeinclude` (such as an ignored `.env`) are copied in, and the
+  repository's setup script runs. Deleting one runs teardown first and refuses
+  to drop uncommitted or unpushed work unless you confirm.
+- **Live +/− counts.** The daemon watches every worktree and pushes git status
+  (against the merge-base with its target branch) the moment files change; the
+  sidebar, bottom bar and **Changes** list update without polling.
+- **Terminals per worktree.** Each worktree has its own tabs, panes and views,
+  persisted on the daemon; its shells start in the worktree with
+  `FLOTILLA_ROOT_PATH`, `FLOTILLA_WORKTREE_PATH` and `FLOTILLA_WORKTREE_NAME`.
+- **Files and editor.** A lazy file tree (ignored files dimmed) and an editor
+  with syntax highlighting for 21 languages, find, undo, IME and
+  conflict-checked saves: a file changed on the server since it was opened is
+  never overwritten.
+- **Diffs.** Unified or side-by-side diffs with word-level highlights and
+  expandable unchanged regions.
+- **Scripts.** `setup`, `run` (or named run targets) and `teardown` from
+  `.flotilla/config.json` run as daemon terminals, so their output survives
+  reconnects and restarts.
 
 ## What M1 delivers
 
@@ -100,20 +127,22 @@ flowchart LR
   end
 ```
 
-Crates: `fl-proto` (wire protocol 0.2), `fl-prochost-proto` (frozen local
-process-host protocol), `fl-model` (typed layout and terminal model), `fl-term`
-(pinned Alacritty/VTE forks with complete checkpoints), `fl-transport` (framed
-streams, pinned-cert QUIC, SSH), `fl-testkit` (in-process SSH server and UDP
-relay for tests); daemon: `flotillad` (CLI), `fld-server` (sessions, terminal
-service, listeners), `fld-prochost` (PTY owner + journal), `fld-store` (SQLite
-+ checkpoints); client: `flc-conn`, `flc-sync`, `flc-terminal`, `flc-shell`,
-`flc-ui`, and the `flotilla` application.
+Crates: `fl-proto` (wire protocol 0.3), `fl-prochost-proto` (frozen local
+process-host protocol), `fl-model` (typed layout, terminal and workspace model),
+`fl-term` (pinned Alacritty/VTE forks with complete checkpoints),
+`fl-transport` (framed streams, pinned-cert QUIC, SSH), `fl-testkit`
+(in-process SSH server and UDP relay for tests); daemon: `flotillad` (CLI),
+`fld-server` (sessions, terminal and workspace services, listeners),
+`fld-prochost` (PTY owner + journal), `fld-store` (SQLite + checkpoints),
+`fld-git` (git, worktrees, files, watching); client: `flc-conn`, `flc-sync`,
+`flc-terminal`, `flc-shell`, `flc-editor` (editor and diff view), `flc-ui`, and
+the `flotilla` application.
 
 ## Development
 
 ```sh
-cargo test --locked --workspace --exclude flc-ui --exclude flc-terminal --exclude flc-shell --exclude flotilla
-cargo test --locked -p flc-ui -p flc-terminal -p flc-shell -p flotilla
+cargo test --locked --workspace --exclude flc-ui --exclude flc-terminal --exclude flc-shell --exclude flc-editor --exclude flotilla
+cargo test --locked -p flc-ui -p flc-terminal -p flc-shell -p flc-editor -p flotilla
 cargo clippy --locked --workspace --all-targets -- -D warnings
 cargo fmt --check
 ```
@@ -124,6 +153,10 @@ Windows), and the real build, self-test,
 installer and UI smoke run on `windows-latest`. The Rust toolchain is pinned in
 `rust-toolchain.toml`; the vendored parser crates are patched in `vendor/` and
 excluded from formatting.
+
+To run the client on Linux for development (an X11 build; releases ship for
+Windows only): `cargo run -p flotilla --features linux-x11`. Under a virtual
+display it needs Xvfb and a Vulkan driver such as Mesa's lavapipe.
 
 ## Licenses
 
