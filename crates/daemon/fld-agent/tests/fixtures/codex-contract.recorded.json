@@ -1,0 +1,240 @@
+{
+  "ClientRequest.json": {
+    "initialize": {
+      "required": [
+        "clientInfo"
+      ],
+      "properties": [
+        "capabilities",
+        "clientInfo"
+      ]
+    },
+    "thread/start": {
+      "required": [],
+      "properties": [
+        "approvalPolicy",
+        "approvalsReviewer",
+        "baseInstructions",
+        "config",
+        "cwd",
+        "developerInstructions",
+        "ephemeral",
+        "model",
+        "modelProvider",
+        "personality",
+        "sandbox",
+        "serviceName",
+        "serviceTier",
+        "sessionStartSource",
+        "threadSource"
+      ]
+    },
+    "thread/resume": {
+      "required": [
+        "threadId"
+      ],
+      "properties": [
+        "approvalPolicy",
+        "approvalsReviewer",
+        "baseInstructions",
+        "config",
+        "cwd",
+        "developerInstructions",
+        "excludeTurns",
+        "model",
+        "modelProvider",
+        "personality",
+        "sandbox",
+        "serviceTier",
+        "threadId"
+      ]
+    },
+    "thread/read": {
+      "required": [
+        "threadId"
+      ],
+      "properties": [
+        "includeTurns",
+        "threadId"
+      ]
+    },
+    "turn/start": {
+      "required": [
+        "input",
+        "threadId"
+      ],
+      "properties": [
+        "approvalPolicy",
+        "approvalsReviewer",
+        "clientUserMessageId",
+        "cwd",
+        "disabledPluginIds",
+        "effort",
+        "input",
+        "model",
+        "outputSchema",
+        "personality",
+        "sandboxPolicy",
+        "serviceTier",
+        "serviceTierForTurn",
+        "summary",
+        "threadId",
+        "toolOutput",
+        "turnTrigger"
+      ]
+    },
+    "turn/steer": {
+      "required": [
+        "expectedTurnId",
+        "input",
+        "threadId"
+      ],
+      "properties": [
+        "clientUserMessageId",
+        "expectedTurnId",
+        "input",
+        "threadId"
+      ]
+    },
+    "turn/interrupt": {
+      "required": [
+        "threadId",
+        "turnId"
+      ],
+      "properties": [
+        "threadId",
+        "turnId"
+      ]
+    }
+  },
+  "ServerRequest.json": {
+    "item/commandExecution/requestApproval": {
+      "required": [
+        "itemId",
+        "startedAtMs",
+        "threadId",
+        "turnId"
+      ],
+      "properties": [
+        "approvalId",
+        "command",
+        "commandActions",
+        "cwd",
+        "environmentId",
+        "itemId",
+        "kind",
+        "networkApprovalContext",
+        "proposedExecpolicyAmendment",
+        "proposedNetworkPolicyAmendments",
+        "reason",
+        "startedAtMs",
+        "threadId",
+        "turnId"
+      ]
+    },
+    "item/fileChange/requestApproval": {
+      "required": [
+        "itemId",
+        "startedAtMs",
+        "threadId",
+        "turnId"
+      ],
+      "properties": [
+        "grantRoot",
+        "itemId",
+        "reason",
+        "startedAtMs",
+        "threadId",
+        "turnId"
+      ]
+    },
+    "item/tool/requestUserInput": {
+      "required": [
+        "isBlocking",
+        "itemId",
+        "questions",
+        "threadId",
+        "turnId"
+      ],
+      "properties": [
+        "autoResolutionMs",
+        "isBlocking",
+        "itemId",
+        "questions",
+        "threadId",
+        "turnId"
+      ]
+    },
+    "mcpServer/elicitation/request": {
+      "required": [
+        "serverName",
+        "threadId"
+      ],
+      "properties": [
+        "serverName",
+        "threadId",
+        "turnId"
+      ]
+    },
+    "item/permissions/requestApproval": {
+      "required": [
+        "cwd",
+        "itemId",
+        "permissions",
+        "startedAtMs",
+        "threadId",
+        "turnId"
+      ],
+      "properties": [
+        "cwd",
+        "environmentId",
+        "itemId",
+        "permissions",
+        "reason",
+        "startedAtMs",
+        "threadId",
+        "turnId"
+      ]
+    }
+  },
+  "ServerNotification.json": {
+    "turn/completed": {
+      "required": [
+        "threadId",
+        "turn"
+      ],
+      "properties": [
+        "threadId",
+        "turn"
+      ]
+    },
+    "item/completed": {
+      "required": [
+        "completedAtMs",
+        "item",
+        "threadId",
+        "turnId"
+      ],
+      "properties": [
+        "completedAtMs",
+        "item",
+        "threadId",
+        "turnId"
+      ]
+    },
+    "item/agentMessage/delta": {
+      "required": [
+        "delta",
+        "itemId",
+        "threadId",
+        "turnId"
+      ],
+      "properties": [
+        "delta",
+        "itemId",
+        "threadId",
+        "turnId"
+      ]
+    }
+  }
+}

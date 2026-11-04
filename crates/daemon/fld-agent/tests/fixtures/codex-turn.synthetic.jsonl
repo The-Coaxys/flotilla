@@ -1,0 +1,9 @@
+{"method":"turn/started","params":{"threadId":"native","turn":{"id":"turn-1","items":[],"status":"inProgress","error":null}}}
+{"method":"item/started","params":{"threadId":"native","turnId":"turn-1","item":{"type":"commandExecution","id":"command-1","command":"pwd","cwd":"/tmp","status":"inProgress","aggregatedOutput":null}}}
+{"method":"item/commandExecution/outputDelta","params":{"threadId":"native","turnId":"turn-1","itemId":"command-1","delta":"/tmp\n"}}
+{"method":"item/completed","params":{"threadId":"native","turnId":"turn-1","item":{"type":"commandExecution","id":"command-1","command":"pwd","cwd":"/tmp","status":"completed","aggregatedOutput":"/tmp\n","exitCode":0,"durationMs":2}}}
+{"method":"item/completed","params":{"threadId":"native","turnId":"turn-1","item":{"type":"fileChange","id":"patch-1","status":"completed","changes":[{"path":"/tmp/example.rs","kind":{"type":"update","move_path":null},"diff":"--- a/example.rs\n+++ b/example.rs\n@@ -1 +1 @@\n-old\n+new\n"}]}}}
+{"method":"item/agentMessage/delta","params":{"threadId":"native","turnId":"turn-1","itemId":"message-1","delta":"Done"}}
+{"method":"item/completed","params":{"threadId":"native","turnId":"turn-1","item":{"type":"agentMessage","id":"message-1","phase":"final_answer","text":"Done"}}}
+{"method":"thread/tokenUsage/updated","params":{"threadId":"native","turnId":"turn-1","tokenUsage":{"last":{"inputTokens":22,"outputTokens":5,"cachedInputTokens":3,"cacheWriteInputTokens":0,"reasoningOutputTokens":0,"totalTokens":27},"total":{"inputTokens":22,"outputTokens":5,"cachedInputTokens":3,"reasoningOutputTokens":0,"totalTokens":27}}}}
+{"method":"turn/completed","params":{"threadId":"native","turn":{"id":"turn-1","items":[],"status":"completed","error":null,"durationMs":30}}}
