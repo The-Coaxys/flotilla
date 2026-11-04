@@ -2564,6 +2564,8 @@ name = "flc-ui"
 version = "0.2.0"
 dependencies = [
  "gpui",
+ "serde",
+ "serde_json",
  "unicode-segmentation",
 ]
 

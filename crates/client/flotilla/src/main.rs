@@ -8,6 +8,7 @@ mod hosts;
 mod runtime;
 mod secrets;
 mod selftest;
+mod settings;
 
 use std::path::PathBuf;
 

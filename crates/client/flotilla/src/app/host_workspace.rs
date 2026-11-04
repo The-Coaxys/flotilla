@@ -10,6 +10,8 @@ mod host_hover;
 mod host_launcher;
 #[path = "host_workspace/host_palette.rs"]
 mod host_palette;
+#[path = "host_workspace/host_settings.rs"]
+mod host_settings;
 #[path = "host_review.rs"]
 mod review;
 
@@ -172,6 +174,17 @@ pub struct HostWorkspace {
     palette: Option<host_palette::Ui>,
     /// A palette requested by an app-level keybinding; opened on next render.
     pending_palette: Option<crate::app::palette::Mode>,
+    /// Theme, fonts, terminal palettes and the keymap, shared with the app.
+    settings: Entity<crate::app::settings::Settings>,
+    /// Settings and keymap are kept live in step with the settings entity.
+    _settings: Subscription,
+    /// A settings overlay requested by the app-level keybinding.
+    pending_settings: bool,
+    /// The open settings overlay, if any.
+    settings_ui: Option<host_settings::Ui>,
+    /// Catches the chord a pending rebind is waiting for, ahead of the
+    /// terminal's own input interceptor.
+    _capture: Subscription,
     /// The hover card on screen, and the epoch that cancels pending ones.
     hover: Option<host_hover::Shown>,
     hover_pending: Option<host_hover::Target>,
@@ -245,7 +258,12 @@ fn join(dir: &str, name: &str) -> String {
 }
 
 impl HostWorkspace {
-    pub fn new(sync: Arc<Sync>, home_dir: String, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        sync: Arc<Sync>,
+        home_dir: String,
+        settings: Entity<crate::app::settings::Settings>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         // Process listings (for attaching script terminals) live in the home
         // layout's state.
         let mut processes = sync.workspace_changes();
@@ -295,6 +313,37 @@ impl HostWorkspace {
             }
         });
         let chat = host_chat::ChatUi::new(sync.chats());
+        let settings_watch = cx.observe(&settings, |view, _settings, cx| {
+            view.apply_presentation(cx);
+            cx.notify();
+        });
+        let capture_host = cx.weak_entity();
+        let capture = cx.intercept_keystrokes(move |event, _window, cx| {
+            let active = capture_host
+                .update(cx, |view, _| view.capturing())
+                .unwrap_or(false);
+            if !active {
+                return;
+            }
+            let key = event.keystroke.key.clone();
+            if matches!(key.as_str(), "shift" | "control" | "alt" | "platform") {
+                return;
+            }
+            let modifiers = event.keystroke.modifiers;
+            capture_host
+                .update(cx, |view, cx| {
+                    view.capture_chord(
+                        &key,
+                        modifiers.control,
+                        modifiers.shift,
+                        modifiers.alt,
+                        modifiers.platform,
+                        cx,
+                    );
+                })
+                .ok();
+            cx.stop_propagation();
+        });
         Self {
             state: sync.workspaces(),
             sync,
@@ -322,6 +371,11 @@ impl HostWorkspace {
             git_menu: false,
             palette: None,
             pending_palette: None,
+            settings,
+            _settings: settings_watch,
+            pending_settings: false,
+            settings_ui: None,
+            _capture: capture,
             hover: None,
             hover_pending: None,
             hover_epoch: 0,
@@ -727,8 +781,8 @@ impl HostWorkspace {
         }
         let sync = self.sync.clone();
         let layout = sync.layout(scope);
-        let shell =
-            cx.new(|cx| ShellView::new(sync, layout, ShellViewOptions::default(), window, cx));
+        let options = self.shell_options(cx);
+        let shell = cx.new(|cx| ShellView::new(sync, layout, options, window, cx));
         let rtt = self.rtt;
         shell.update(cx, |shell, _| shell.set_rtt(rtt));
         let events = cx.subscribe(&shell, |_, _, event: &ShellEvent, cx| match event {
@@ -1024,8 +1078,7 @@ impl HostWorkspace {
         };
         let handle = self.sync.attach(terminal, incarnation, ViewId::new());
         let source = MirrorSource::new(handle);
-        let view =
-            cx.new(|cx| TerminalView::new(source, TerminalViewOptions::default(), window, cx));
+        let view = cx.new(|cx| TerminalView::new(source, self.script_options(cx), window, cx));
         self.script_views.insert(key, view.clone());
         Some(view)
     }
@@ -2700,6 +2753,9 @@ impl Render for HostWorkspace {
         if let Some(mode) = self.pending_palette.take() {
             self.open_palette(mode, window, cx);
         }
+        if std::mem::take(&mut self.pending_settings) {
+            self.open_settings(window, cx);
+        }
         let strip = self
             .render_documents_strip(&t, cx)
             .map(IntoElement::into_any_element);
@@ -2735,6 +2791,11 @@ impl Render for HostWorkspace {
         let dispatches = self.render_dispatch_strip(&t, cx);
         div()
             .track_focus(&self.focus)
+            .on_key_down(cx.listener(|host, event: &gpui::KeyDownEvent, window, cx| {
+                if host.settings_key(event, window, cx) {
+                    cx.stop_propagation();
+                }
+            }))
             .relative()
             .size_full()
             .flex()
@@ -2771,5 +2832,6 @@ impl Render for HostWorkspace {
             .children(toasts)
             .children(dialog)
             .children(self.render_palette(&t, cx))
+            .children(self.render_settings(&t, window, cx))
     }
 }

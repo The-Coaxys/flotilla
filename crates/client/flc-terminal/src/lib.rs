@@ -24,3 +24,4 @@ mod view;
 pub use predict::{EchoPolicy, Prediction, PredictionContext, PredictionOutcome, Predictor};
 pub use source::{Exited, TerminalSource};
 pub use view::{SearchStatus, TerminalEvent, TerminalView, TerminalViewOptions};
+pub use view::{default_ansi, palette_with_ansi};

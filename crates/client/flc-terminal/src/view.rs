@@ -64,6 +64,10 @@ pub struct TerminalViewOptions {
     /// Multiplies the font's natural line box.
     pub line_height: f32,
     pub cursor_blink: bool,
+    /// Explicit palette override for rendering only (spec §8.2: terminal
+    /// palettes are independent of the theme; the engine palette in every
+    /// frame stays authoritative unless this is set).
+    pub palette: Option<Vec<u32>>,
 }
 
 impl Default for TerminalViewOptions {
@@ -74,6 +78,7 @@ impl Default for TerminalViewOptions {
             font_size: None,
             line_height: 1.0,
             cursor_blink: true,
+            palette: None,
         }
     }
 }
@@ -399,6 +404,15 @@ impl TerminalView {
 
     pub fn options(&self) -> &TerminalViewOptions {
         &self.options
+    }
+
+    /// The colors this view paints: the explicit override when one is set,
+    /// otherwise the engine palette that arrived with the frame.
+    fn colors(&self) -> &[u32] {
+        self.options
+            .palette
+            .as_deref()
+            .unwrap_or(&self.frame.colors)
     }
 
     /// Font family/size/line height take effect on the next frame; a grid
@@ -983,7 +997,7 @@ impl TerminalView {
                 .font_family
                 .clone()
                 .unwrap_or_else(|| theme.font_terminal.clone()),
-            size: self.options.font_size.unwrap_or(theme.mono_size),
+            size: self.options.font_size.unwrap_or(theme.terminal_size),
             line_height: self.options.line_height,
             scale: window.scale_factor(),
         };
@@ -1084,7 +1098,7 @@ impl TerminalView {
         if focused && self.options.cursor_blink && self.blink_task.is_none() {
             self.start_blink(cx);
         }
-        let colors = &frame.colors;
+        let colors = self.colors();
         let (_, default_bg) = default_colors(colors);
 
         // Cursor shape and the glyph drawn inside a block cursor.
@@ -1130,7 +1144,14 @@ impl TerminalView {
         }
 
         let mut cache = mem::take(&mut self.cache);
-        cache.prepare_rows(&frame, visible_rows, cursor_glyph, &fonts, window);
+        cache.prepare_rows(
+            &frame,
+            visible_rows,
+            cursor_glyph,
+            &fonts,
+            window,
+            self.colors(),
+        );
 
         // Backgrounds: merged non-default spans.
         merge_backgrounds(
@@ -1288,11 +1309,13 @@ impl RenderCache {
         cursor: Option<(u16, CursorGlyph)>,
         fonts: &Fonts,
         window: &mut Window,
+        colors: &[u32],
     ) {
         let columns = frame.size.columns as usize;
-        if self.font.as_ref() != Some(&fonts.key) || self.colors != frame.colors {
+        if self.font.as_ref() != Some(&fonts.key) || self.colors.as_slice() != colors {
             self.font = Some(fonts.key.clone());
-            self.colors.clone_from(&frame.colors);
+            self.colors.clear();
+            self.colors.extend_from_slice(colors);
             for row in &mut self.rows {
                 row.valid = false;
             }
@@ -1312,7 +1335,7 @@ impl RenderCache {
             cached.cells.clear();
             cached.cells.extend_from_slice(cells);
             cached.cursor = glyph;
-            layout_row(cells, &frame.colors, glyph, &mut cached.layout);
+            layout_row(cells, colors, glyph, &mut cached.layout);
             cached.shaped.clear();
             for run in &cached.layout.runs {
                 let style = run.style;
@@ -1456,7 +1479,7 @@ impl EntityInputHandler for TerminalView {
 
 impl Render for TerminalView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let background = hsla(default_colors(&self.frame.colors).1);
+        let background = hsla(default_colors(self.colors()).1);
         div()
             .key_context("Terminal")
             .track_focus(&self.focus_handle)
@@ -1676,5 +1699,39 @@ impl TerminalElement {
                 view.update(cx, |view, cx| view.scroll_wheel(event, geometry, cx));
             }
         });
+    }
+}
+
+/// Build a rendering palette from 16 explicit ANSI colors. The engine's
+/// remaining 253 colors (cube, greys, named foreground/background/cursor and
+/// dim variants) stay authoritative; this is only for an explicit override.
+pub fn default_ansi() -> [u32; 16] {
+    let palette = fl_term::palette::default_palette();
+    let mut ansi = [0u32; 16];
+    ansi.copy_from_slice(&palette[..16]);
+    ansi
+}
+
+pub fn palette_with_ansi(ansi: &[u32; 16]) -> Vec<u32> {
+    let mut colors = fl_term::palette::default_palette();
+    colors[..16].copy_from_slice(ansi);
+    colors
+}
+
+#[cfg(test)]
+mod palette_tests {
+    use super::*;
+
+    #[test]
+    fn an_explicit_ansi_override_keeps_the_engine_palette_for_the_rest() {
+        let engine = fl_term::palette::default_palette();
+        let mut ansi = [0u32; 16];
+        ansi[1] = 0xFF0000;
+        ansi[15] = 0xFFFFFF;
+        let colors = palette_with_ansi(&ansi);
+        assert_eq!(colors.len(), fl_term::palette::COLOR_COUNT);
+        assert_eq!(colors[1], 0xFF0000);
+        assert_eq!(colors[15], 0xFFFFFF);
+        assert_eq!(&colors[16..], &engine[16..]);
     }
 }

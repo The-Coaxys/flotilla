@@ -5,6 +5,7 @@ mod host_view;
 mod host_workspace;
 mod hover_card;
 mod palette;
+mod settings;
 mod sidebar;
 mod titlebar;
 
@@ -23,28 +24,57 @@ use gpui::{
 use crate::hosts::HostStore;
 use crate::secrets::SecretStore;
 
-actions!(flotilla, [Quit, AddHost, PaletteGlobal, PaletteFiles]);
+actions!(
+    flotilla,
+    [
+        Quit,
+        AddHost,
+        PaletteGlobal,
+        PaletteFiles,
+        SettingsOpen,
+        PipToggle,
+    ]
+);
 
 /// The networking runtime, reachable from every view.
 pub struct Tokio(pub tokio::runtime::Handle);
 
 impl Global for Tokio {}
 
+/// Rebuild every application key binding from `keymap`. GPUI keeps old
+/// bindings alive, so they are cleared first: a rebind must actually replace a
+/// chord, and the text-input editing keys are reinstalled afterwards.
+pub(crate) fn install_keymap(keymap: &flc_ui::keymap::Keymap, cx: &mut App) {
+    cx.clear_key_bindings();
+    flc_ui::input::bind_keys(cx);
+    let mut bindings = Vec::new();
+    for action in flc_ui::keymap::ACTIONS {
+        let Some(chord) = keymap.chord(action.id) else {
+            continue;
+        };
+        let stroke = chord.canonical();
+        match action.id {
+            "app.quit" => bindings.push(KeyBinding::new(&stroke, Quit, None)),
+            "host.add" => bindings.push(KeyBinding::new(&stroke, AddHost, None)),
+            "palette.global" => bindings.push(KeyBinding::new(&stroke, PaletteGlobal, None)),
+            "palette.files" => bindings.push(KeyBinding::new(&stroke, PaletteFiles, None)),
+            "settings.open" => bindings.push(KeyBinding::new(&stroke, SettingsOpen, None)),
+            "pip.toggle" => bindings.push(KeyBinding::new(&stroke, PipToggle, None)),
+            other => debug_assert!(false, "keymap action {other} has no GPUI binding"),
+        }
+    }
+    cx.bind_keys(bindings);
+}
+
 pub fn run(rt: tokio::runtime::Handle) {
     Application::new().run(move |cx: &mut App| {
         flc_ui::theme::init(cx);
-        flc_ui::input::bind_keys(cx);
+        // Load settings before the first window so the workspace theme and the
+        // user's keymap are the ones that first render.
+        let settings = cx.new(settings::Settings::new);
+        let keymap = settings.read(cx).keymap().clone();
+        install_keymap(&keymap, cx);
         cx.set_global(Tokio(rt));
-        cx.bind_keys([
-            KeyBinding::new("alt-f4", Quit, None),
-            KeyBinding::new("ctrl-shift-n", AddHost, None),
-            // Spec §8.3: Global on Ctrl+Shift+K; Ctrl+Shift+O goes straight to
-            // Files. Ctrl+Shift+P is the documented PiP key and opens the same
-            // palette until PiP lands.
-            KeyBinding::new("ctrl-shift-k", PaletteGlobal, None),
-            KeyBinding::new("ctrl-shift-p", PaletteGlobal, None),
-            KeyBinding::new("ctrl-shift-o", PaletteFiles, None),
-        ]);
         cx.on_action(|_: &Quit, cx: &mut App| cx.quit());
         let bounds = Bounds::centered(None, size(px(1200.), px(780.)), cx);
         let options = WindowOptions {
@@ -60,7 +90,7 @@ pub fn run(rt: tokio::runtime::Handle) {
             ..Default::default()
         };
         cx.open_window(options, |window, cx| {
-            let workspace = cx.new(|cx| Workspace::new(window, cx));
+            let workspace = cx.new(|cx| Workspace::new(settings.clone(), window, cx));
             window.focus(&workspace.read(cx).focus);
             workspace
         })
@@ -98,6 +128,8 @@ pub(crate) enum Center {
 
 pub struct Workspace {
     store: HostStore,
+    /// Theme, fonts, terminal palettes and the keymap; shared by every host.
+    pub(crate) settings: Entity<settings::Settings>,
     secrets: Arc<dyn SecretStore>,
     pub(crate) hosts: Vec<HostEntry>,
     pub(crate) selected: Option<usize>,
@@ -115,7 +147,11 @@ pub struct Workspace {
 }
 
 impl Workspace {
-    fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+    fn new(
+        settings: Entity<settings::Settings>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let path = HostStore::default_path()
             .unwrap_or_else(|| std::env::temp_dir().join("Flotilla").join("hosts.json"));
         let store = HostStore::new(path);
@@ -126,6 +162,7 @@ impl Workspace {
         };
         let mut ws = Self {
             store,
+            settings,
             secrets,
             hosts: profiles
                 .into_iter()
@@ -171,6 +208,7 @@ impl Workspace {
     /// Build the workspace view for a connected host on first display. Runs
     /// from the render path, where a window exists for its shells.
     pub(crate) fn ensure_shell(&mut self, index: usize, cx: &mut Context<Self>) {
+        let settings = self.settings.clone();
         let Some(entry) = self.hosts.get_mut(index) else {
             return;
         };
@@ -192,7 +230,8 @@ impl Workspace {
             .filter(|home| home.starts_with('/'))
             .unwrap_or("/")
             .to_string();
-        let workspace = cx.new(|cx| host_workspace::HostWorkspace::new(sync, home_dir, cx));
+        let workspace =
+            cx.new(|cx| host_workspace::HostWorkspace::new(sync, home_dir, settings, cx));
         // The phase already reached Connected, so no watch update will carry
         // the latency: publish it now or Auto prediction stays disabled.
         if let ConnPhase::Connected { rtt_ms, .. } = entry.phase {
@@ -439,6 +478,11 @@ async fn watch_phase(
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // The visible workspace owns the theme: switch the globals before any
+        // child renders with them.
+        let active = self.active_workspace_id(cx);
+        self.settings
+            .update(cx, |settings, cx| settings.set_active(active, cx));
         let theme = cx.theme().clone();
         // Focus is tracked below the title bar on purpose: GPUI's focus
         // transfer marks every mouse-down inside a focusable element as
@@ -455,6 +499,8 @@ impl Render for Workspace {
             .on_action(cx.listener(|ws, _: &PaletteFiles, _, cx| {
                 ws.request_palette(palette::Mode::Files, cx)
             }))
+            .on_action(cx.listener(|ws, _: &SettingsOpen, _, cx| ws.request_settings(cx)))
+            .on_action(cx.listener(|ws, _: &PipToggle, _, cx| ws.pip_reserved(cx)))
             .size_full()
             .flex()
             .flex_col()

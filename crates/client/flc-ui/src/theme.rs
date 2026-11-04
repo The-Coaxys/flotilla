@@ -38,6 +38,13 @@ pub struct Theme {
     pub text_size: Pixels,
     pub text_size_sm: Pixels,
     pub mono_size: Pixels,
+    /// Editor and diff font (per-surface setting, spec §8.2).
+    pub editor_font: SharedString,
+    pub editor_size: Pixels,
+    /// Terminal-tab font size; `font_terminal` is its family.
+    pub terminal_size: Pixels,
+    /// Chat text multiplier (per-surface setting).
+    pub chat_scale: f32,
 }
 
 impl Theme {
@@ -67,6 +74,44 @@ impl Theme {
             text_size: px(13.),
             text_size_sm: px(11.),
             mono_size: px(12.5),
+            editor_font: "JetBrains Mono".into(),
+            editor_size: px(12.5),
+            terminal_size: px(12.5),
+            chat_scale: 1.0,
+        }
+    }
+
+    /// The light theme derived from the same tokens (spec §8.2).
+    pub fn light() -> Self {
+        Self {
+            chrome_bg: rgb(0xE9E9ED).into(),
+            surface_bg: rgb(0xF7F7F9).into(),
+            surface_raised: rgb(0xFFFFFF).into(),
+            raised_hover: rgb(0xF1F1F5).into(),
+            row_selected: rgb(0xE3E3E9).into(),
+            row_selected_border: rgba(0x00000014).into(),
+            control_bg: rgb(0xDDDDE3).into(),
+            border: rgba(0x00000014).into(),
+            text_primary: rgb(0x1D1E21).into(),
+            text_secondary: rgb(0x5C5D63).into(),
+            text_tertiary: rgb(0x83848A).into(),
+            accent: rgb(0x2F6FDF).into(),
+            success: rgb(0x3C9B44).into(),
+            danger: rgb(0xD0453D).into(),
+            warning: rgb(0xB27E1E).into(),
+            radius_lg: px(10.),
+            radius_md: px(8.),
+            radius_sm: px(6.),
+            font_ui: "Inter".into(),
+            font_mono: "JetBrains Mono".into(),
+            font_terminal: "Cascadia Mono".into(),
+            text_size: px(13.),
+            text_size_sm: px(11.),
+            mono_size: px(12.5),
+            editor_font: "JetBrains Mono".into(),
+            editor_size: px(12.5),
+            terminal_size: px(12.5),
+            chat_scale: 1.0,
         }
     }
 }
