@@ -4,6 +4,7 @@ mod git_actions;
 mod host_view;
 mod host_workspace;
 mod hover_card;
+mod hud;
 mod palette;
 mod settings;
 mod sidebar;
@@ -33,6 +34,7 @@ actions!(
         PaletteFiles,
         SettingsOpen,
         PipToggle,
+        PerformanceToggle,
     ]
 );
 
@@ -60,6 +62,9 @@ pub(crate) fn install_keymap(keymap: &flc_ui::keymap::Keymap, cx: &mut App) {
             "palette.files" => bindings.push(KeyBinding::new(&stroke, PaletteFiles, None)),
             "settings.open" => bindings.push(KeyBinding::new(&stroke, SettingsOpen, None)),
             "pip.toggle" => bindings.push(KeyBinding::new(&stroke, PipToggle, None)),
+            "performance.toggle" => {
+                bindings.push(KeyBinding::new(&stroke, PerformanceToggle, None))
+            }
             other => debug_assert!(false, "keymap action {other} has no GPUI binding"),
         }
     }
@@ -144,6 +149,8 @@ pub struct Workspace {
     deferred_connect: Option<usize>,
     /// Window activation triggers an immediate reconnect attempt.
     activation: Option<Subscription>,
+    hud: Option<hud::Hud>,
+    hud_sampler: Option<gpui::Task<()>>,
 }
 
 impl Workspace {
@@ -185,6 +192,8 @@ impl Workspace {
             add_host_subscription: None,
             deferred_connect: None,
             activation: None,
+            hud: None,
+            hud_sampler: None,
         };
         // Waking the machine or returning to the window retries immediately
         // instead of waiting out the reconnect backoff.
@@ -501,7 +510,9 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|ws, _: &SettingsOpen, _, cx| ws.request_settings(cx)))
             .on_action(cx.listener(|ws, _: &PipToggle, _, cx| ws.pip_reserved(cx)))
+            .on_action(cx.listener(|ws, _: &PerformanceToggle, _, cx| ws.toggle_hud(cx)))
             .size_full()
+            .relative()
             .flex()
             .flex_col()
             .bg(theme.surface_bg)
@@ -542,5 +553,6 @@ impl Render for Workspace {
                     ),
             )
             .children(self.render_hover_card(cx))
+            .children(self.render_hud(window, cx))
     }
 }

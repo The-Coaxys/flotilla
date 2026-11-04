@@ -940,6 +940,9 @@ impl Actor {
                     engine.feed(offset, slice).map_err(engine_error)?;
                     offset += slice.len() as u64;
                 }
+                self.core
+                    .terminal_output_bytes
+                    .fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
             }
             TerminalRecordKind::Resize(size) => {
                 let mut engine = lock(&self.shared.engine);

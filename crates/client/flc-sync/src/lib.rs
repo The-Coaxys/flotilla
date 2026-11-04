@@ -94,6 +94,8 @@ pub(crate) struct Core {
     pub(crate) cache: Option<Cache>,
     pub(crate) config: Config,
     pub(crate) sequence: AtomicU64,
+    /// Output bytes successfully applied across this session's terminal mirrors.
+    pub(crate) terminal_output_bytes: AtomicU64,
     pub(crate) shutdown: CancellationToken,
 }
 
@@ -207,6 +209,7 @@ impl Sync {
             cache: cache_dir.map(Cache::new),
             config,
             sequence: AtomicU64::new(0),
+            terminal_output_bytes: AtomicU64::new(0),
             shutdown: CancellationToken::new(),
         });
         let (events, _) = broadcast::channel(256);
@@ -253,6 +256,14 @@ impl Sync {
             chats_tx,
             events,
         }
+    }
+
+    /// Decompressed terminal output applied locally, excluding snapshots and
+    /// duplicate records. This is not compressed transport traffic.
+    pub fn terminal_output_bytes(&self) -> u64 {
+        self.core
+            .terminal_output_bytes
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     fn remember_forge(&self, state: &ForgeState) {

@@ -174,3 +174,27 @@ every other app binding.
   chat scale and editor font, and per-workspace (worktree) theme selection — the live run
   edited the Home/default entry. Remaining in M7: the PiP window itself, Windows Mica tied to
   the alpha slider, and a repeated keymap save with reliable coordinates.
+
+### Slice: measured performance HUD
+
+- `Ctrl+Alt+Shift+P` toggles a native overlay; the keymap editor can rebind it.
+  Closing it cancels sampling and stops requesting diagnostic animation frames.
+- Frame cadence and mean frame interval come from actual root-view renders;
+  these are CPU-side observations, explicitly not GPU execution timing.
+- `Sync::terminal_output_bytes` counts output successfully applied by mirrors,
+  excluding duplicate records and snapshots. The HUD reports an elapsed-time
+  rate across hosts; removing a host cannot create a negative rate.
+- Process memory is Linux `VmRSS` or Windows `K32GetProcessMemoryInfo` working
+  set. OS queries run on the background executor every 500 ms. Display strings
+  are formatted per sample, not per animation frame.
+- Native smoke: `cargo build --locked --offline -p flotilla --features linux-x11`,
+  launch under Xvfb `DISPLAY=:99`, toggle while a terminal has focus, run a
+  4 KiB/50 ms shell-output workload, toggle off and close the client normally.
+  `/tmp/flotilla-hud-throughput-continuous.png` captured 11.4 FPS, 87.99 ms
+  mean interval, SSH/4 ms RTT, 69.3 KiB/s applied output and 154.0 MiB RSS.
+  This was a debug build under software rendering with concurrent builds on
+  this VPS, not a release benchmark or a Windows/reference-GPU performance claim.
+- Checks: two deterministic sampling/memory-parser tests passed; client,
+  sync and UI clippy passed with warnings denied. The Windows memory branch
+  requires the Windows build gate. Full release profiling remains open;
+  existing release settings already use thin LTO, one codegen unit and level 3.

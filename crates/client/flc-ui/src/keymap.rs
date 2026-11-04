@@ -79,6 +79,13 @@ pub const ACTIONS: &[ActionSpec] = &[
         note: "Theme editor and keyboard editor.",
     },
     ActionSpec {
+        id: "performance.toggle",
+        label: "Performance HUD",
+        group: Group::Navigation,
+        default: "ctrl-alt-shift-p",
+        note: "Live frame cadence, terminal output rate, connection and resident memory.",
+    },
+    ActionSpec {
         id: "pip.toggle",
         label: "Picture-in-picture",
         group: Group::Reserved,
