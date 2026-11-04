@@ -266,3 +266,27 @@ Verification:
   browser tabs, performance HUD, keymap editor, updater. This slice does not cover a native
   grouped-diff *tab* or command execution in a submit mode from the client editor (prepare
   mode only; the daemon path is complete and covered by the routed dispatch test).
+
+### Integrated verification (X11, flsmoke daemon, this host)
+
+- Command palette (Ctrl+Shift+K): Global mode with 28 ranked rows; command search for
+  `settings` and `hud` re-ranked live; the stale "nothing matches" banner no longer outlives
+  the search that produced it.
+- Settings overlay from the palette: Theme editor (System/Light/Dark per mode, per-mode
+  colors with hex entry and swatches, copy-from, intensity/prominence/alpha sliders, Save /
+  Reset / Set as default, config path) and Keyboard editor (click-to-record chords, conflict
+  warning, fixed surface handler list, Save / Reset all, keymap path). Switching to Dark
+  repainted every surface live (background hex `#27262B` shown in the editor).
+- Performance HUD from the palette: FPS and frame interval, transport QUIC with RTT, terminal
+  RX rate, resident memory, and the labels "CPU-side cadence · not GPU timing" and "Terminal
+  output · excludes snapshots". The measured Xvfb frame interval was 73 ms (software
+  rendering); it is reported as-is, not as a Windows number.
+- Chat surface with real provider discovery (Claude Code 2.1.316 stub, Codex 0.150.1,
+  Cursor/Oh My Pi unavailable with the concrete OS error, Pi 1.4.0), a live Codex session and
+  an honest failed turn — see the M4 plan's live-provider evidence.
+- The palette now also reaches Sections, Routes, the inbox and New chat, so every documented
+  overlay is reachable without hunting for its button.
+
+Not covered here: PiP (slice in progress), Windows toasts/Mica/Snap Layouts, WebView2 browser
+tabs, a signed upgrade against a previous release, and drag-and-drop of tabs.
+

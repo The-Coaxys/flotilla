@@ -140,3 +140,22 @@ Not exercised, and therefore not claimed: a real Claude/Codex CLI turn, a real q
 against a live provider, Windows toast activation (in-app toasts only), and a real routed
 dispatch against an installed provider. The stub proves the daemon <-> client <-> UI path,
 not model behaviour.
+
+## Live-provider evidence (this host, flsmoke daemon)
+
+`codex-cli 0.150.1` was discovered by the daemon and a real session was started from the
+native client (`Codex a5acc01d`, `status: structured`, `permission: ask`). Sending a prompt
+produced a real turn that failed with OpenAI `401 Unauthorized` (no credentials for that
+account): the UI showed the provider's `provider_error` rows, a `failed` turn with
+`14.4s · failed · gpt-5.6-sol` metadata, a `Turn failed` toast with `Open chat`, the session
+marked failed (`seq 28`), and the composer refusing further messages. Nothing was recorded as
+success or fabricated.
+
+That run also exposed a real adapter bug: Codex 0.160.1 emits `remoteControl/status/changed`,
+which the adapter reported as `unsupported_event`. Unknown app-server notifications are now
+`Diagnostic` rows (the upstream protocol adds notifications without a bump), and that method is
+explicitly ignored; a regression test covers both paths.
+
+Not exercised: an authenticated successful live turn with approvals, a live question card, and
+Windows toasts.
+

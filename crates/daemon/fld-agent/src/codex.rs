@@ -605,12 +605,15 @@ impl Machine {
             | "configWarning"
             | "deprecationNotice"
             | "mcpServer/startupStatus/updated"
-            | "mcpServer/tools/listChanged" => {}
+            | "mcpServer/tools/listChanged"
+            | "remoteControl/status/changed" => {}
             other if other.starts_with("codex/event/") => {} // Legacy duplicated v1 notifications.
-            other => self.emit(ChatEvent::Error {
-                code: "unsupported_event".into(),
-                message: format!("unrecognized Codex event {other}"),
-                fatal: false,
+            // App-server notifications are open-ended: upstream adds them
+            // without a protocol bump. Record the raw method as a diagnostic
+            // instead of failing the session over an unknown notification.
+            other => self.emit(ChatEvent::Diagnostic {
+                stream: format!("codex notification {other}"),
+                output: bounded(params.to_string()),
             })?,
         }
         Ok(Vec::new())
@@ -846,6 +849,32 @@ impl Machine {
 mod tests {
     use super::*;
     use crate::process::{Pending, test_machine};
+    #[test]
+    fn unknown_notifications_are_diagnostics_not_failures() {
+        let (mut machine, events) = test_machine(AdapterKind::CodexAppServer);
+        machine
+            .codex_notification("remoteControl/status/changed", &json!({"status":"on"}))
+            .unwrap();
+        machine
+            .codex_notification("experimental/thing/happened", &json!({"x":1}))
+            .unwrap();
+        let mut events = events;
+        let mut emitted = Vec::new();
+        while let Ok(record) = events.try_recv() {
+            emitted.push(record.event);
+        }
+        assert!(
+            emitted
+                .iter()
+                .all(|event| !matches!(event, ChatEvent::Error { .. })),
+            "{emitted:?}"
+        );
+        assert!(emitted.iter().any(|event| matches!(
+            event,
+            ChatEvent::Diagnostic { stream, .. } if stream.contains("experimental/thing/happened")
+        )));
+    }
+
     #[test]
     fn initialization_precedes_thread_start_and_resume_requires_read() {
         let (mut machine, _events) = test_machine(AdapterKind::CodexAppServer);
