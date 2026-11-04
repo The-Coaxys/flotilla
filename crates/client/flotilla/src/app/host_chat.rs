@@ -375,6 +375,16 @@ fn row_weight(kind: &RowKind) -> usize {
         RowKind::Structured { json } => json.len(),
         RowKind::Error { message, .. } => message.len(),
         RowKind::ProcessExited { .. } => 1,
+        RowKind::Hook { detail, .. } => detail.len() + 1,
+    }
+}
+
+fn hook_kind_label(kind: fl_model::coordination::HookFactKind) -> &'static str {
+    use fl_model::coordination::HookFactKind;
+    match kind {
+        HookFactKind::TurnStarted => "turn started",
+        HookFactKind::TurnEnded => "turn ended",
+        HookFactKind::Notification => "notification",
     }
 }
 
@@ -1691,6 +1701,21 @@ impl HostWorkspace {
                         .unwrap_or_default(),
                     if *expected { " (expected)" } else { "" }
                 )))
+                .into_any_element(),
+            RowKind::Hook { kind, detail } => div()
+                .w_full()
+                .px(px(16.))
+                .py(px(3.))
+                .flex()
+                .items_center()
+                .gap(px(6.))
+                .text_size(t.text_size_sm)
+                .text_color(t.text_tertiary)
+                .child(ui_chip("hook", t.text_tertiary, t))
+                .child(SharedString::from(hook_kind_label(*kind)))
+                .when(!detail.is_empty(), |d| {
+                    d.child(SharedString::from(detail.clone()))
+                })
                 .into_any_element(),
         }
     }

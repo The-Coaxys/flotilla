@@ -77,6 +77,11 @@ pub enum RowKind {
         code: Option<i32>,
         expected: bool,
     },
+    /// A provider hook reported a state fact (never a turn outcome).
+    Hook {
+        kind: fl_model::coordination::HookFactKind,
+        detail: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -393,6 +398,14 @@ fn build_rows(events: &[EventRecord], resolved: &HashSet<String>) -> Vec<Transcr
                 kind: RowKind::ProcessExited {
                     code: *code,
                     expected: *expected,
+                },
+            }),
+            ChatEvent::HookFact(fact) => rows.push(TranscriptRow {
+                seq,
+                at_ms,
+                kind: RowKind::Hook {
+                    kind: fact.kind,
+                    detail: fact.detail.clone(),
                 },
             }),
             ChatEvent::RequestResolved { .. }
@@ -1133,6 +1146,44 @@ mod tests {
             title: format!("item {id}"),
             created_ms,
         }
+    }
+
+    #[test]
+    fn hook_facts_render_as_status_rows_not_turns() {
+        use fl_model::coordination::{HookFact, HookFactKind};
+        let rows = build_transcript(&[
+            record(
+                1,
+                ChatEvent::HookFact(HookFact {
+                    kind: HookFactKind::TurnStarted,
+                    detail: "prompt submitted".into(),
+                }),
+            ),
+            record(
+                2,
+                ChatEvent::HookFact(HookFact {
+                    kind: HookFactKind::TurnEnded,
+                    detail: String::new(),
+                }),
+            ),
+        ]);
+        assert_eq!(rows.len(), 2);
+        assert!(matches!(
+            &rows[0].kind,
+            RowKind::Hook { kind: HookFactKind::TurnStarted, detail } if detail == "prompt submitted"
+        ));
+        assert!(matches!(
+            &rows[1].kind,
+            RowKind::Hook {
+                kind: HookFactKind::TurnEnded,
+                ..
+            }
+        ));
+        assert!(
+            !rows
+                .iter()
+                .any(|row| matches!(row.kind, RowKind::TurnEnd { .. }))
+        );
     }
 
     #[test]
