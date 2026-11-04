@@ -160,7 +160,13 @@ async fn control(
         tokio::select! {
             _ = lease.cancel.cancelled() => return Ok(SessionEnd::Finished),
             Some(event) = next_event(&mut subscription) => {
-                writer.send(&ServerMsg::Event(event)).await?;
+                // Forge events arrived with protocol 0.4.
+                let decodable = !matches!(event, fl_model::workspace::DaemonEvent::ForgeChanged(_))
+                    || hello.proto.major > 0
+                    || hello.proto.minor >= 4;
+                if decodable {
+                    writer.send(&ServerMsg::Event(event)).await?;
+                }
             }
             done = rpcs.join_next(), if !rpcs.is_empty() => {
                 if let Some(Ok((id, result))) = done {
@@ -342,6 +348,42 @@ async fn handle_request(
             .list_scripts(worktree)
             .await
             .map(Response::Scripts),
+        Request::GitCommit {
+            worktree,
+            message,
+            all,
+        } => workspace
+            .git_commit(worktree, message, all)
+            .await
+            .map(|head| Response::Committed { head }),
+        Request::GitPush { worktree } => {
+            workspace.git_push(worktree).await.map(|()| Response::Done)
+        }
+        Request::GitUpdate { worktree } => workspace
+            .git_update(worktree)
+            .await
+            .map(|()| Response::Done),
+        Request::ForgeStatus { worktree } => workspace
+            .forge_status(worktree)
+            .await
+            .map(Response::ForgeState),
+        Request::CreatePullRequest {
+            worktree,
+            title,
+            body,
+            draft,
+        } => workspace
+            .create_pull_request(worktree, title, body, draft)
+            .await
+            .map(Response::ForgeState),
+        Request::MarkPullRequestReady { worktree } => workspace
+            .mark_ready(worktree)
+            .await
+            .map(Response::ForgeState),
+        Request::MergePullRequest { worktree, method } => workspace
+            .merge_pull_request(worktree, method)
+            .await
+            .map(Response::ForgeState),
     }
 }
 

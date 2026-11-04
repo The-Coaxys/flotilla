@@ -12,7 +12,8 @@ the client never ends a running agent or its shell.
 | M0 | SSH + QUIC transports, bootstrap/upgrade, host registry, frameless client shell, nightly Windows release | released |
 | M1 | Durable PTYs, exact terminal checkpoints, reconnecting sync, native terminal surface, tabs/panes/views, predictive echo | released (v0.2.0) |
 | M2 | Projects and worktrees, live git status, file tree and editor, Changes diff view, setup/run scripts | implemented |
-| M3–M7 | Forge and Git actions, chat UI and agent adapters, orchestration and `fl`, polish | planned |
+| M3 | GitHub integration, adaptive Git actions, Checks | in progress |
+| M4–M7 | Chat UI and agent adapters, orchestration and `fl`, polish | planned |
 
 M1 known limits are recorded at the end of
 [`docs/superpowers/plans/2026-11-02-flotilla-m1-terminals.md`](docs/superpowers/plans/2026-11-02-flotilla-m1-terminals.md):
@@ -24,7 +25,7 @@ immediately instead).
 ## Install
 
 Windows: run `Flotilla-Setup-x64.exe` from the
-[nightly release](https://github.com/The-Coaxys/flotilla/releases/tag/nightly).
+[v0.2.0 release](https://github.com/The-Coaxys/flotilla/releases/tag/v0.2.0).
 The installer is per-user, needs no administrator rights, and the executable
 is statically linked against the C runtime, so no redistributable is required.
 
@@ -127,14 +128,14 @@ flowchart LR
   end
 ```
 
-Crates: `fl-proto` (wire protocol 0.3), `fl-prochost-proto` (frozen local
+Crates: `fl-proto` (wire protocol 0.4), `fl-prochost-proto` (frozen local
 process-host protocol), `fl-model` (typed layout, terminal and workspace model),
 `fl-term` (pinned Alacritty/VTE forks with complete checkpoints),
 `fl-transport` (framed streams, pinned-cert QUIC, SSH), `fl-testkit`
 (in-process SSH server and UDP relay for tests); daemon: `flotillad` (CLI),
 `fld-server` (sessions, terminal and workspace services, listeners),
 `fld-prochost` (PTY owner + journal), `fld-store` (SQLite + checkpoints),
-`fld-git` (git, worktrees, files, watching); client: `flc-conn`, `flc-sync`,
+`fld-git` (git, worktrees, files, watching), `fld-forge` (GitHub via `gh`); client: `flc-conn`, `flc-sync`,
 `flc-terminal`, `flc-shell`, `flc-editor` (editor and diff view), `flc-ui`, and
 the `flotilla` application.
 

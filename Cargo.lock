@@ -2545,6 +2545,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "fld-forge"
+version = "0.2.0"
+dependencies = [
+ "fl-model",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "fld-git"
 version = "0.2.0"
 dependencies = [
@@ -2593,6 +2604,7 @@ dependencies = [
  "fl-proto",
  "fl-term",
  "fl-transport",
+ "fld-forge",
  "fld-git",
  "fld-prochost",
  "fld-store",

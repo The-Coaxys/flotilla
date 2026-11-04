@@ -200,8 +200,15 @@ pub enum LayoutScope {
 /// Pushed by the daemon to every authenticated session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DaemonEvent {
-    WorkspaceTreeChanged { rev: u64 },
+    WorkspaceTreeChanged {
+        rev: u64,
+    },
     WorktreeStatus(WorktreeStatus),
     ScriptChanged(ScriptState),
-    LayoutChanged { scope: LayoutScope, rev: u64 },
+    LayoutChanged {
+        scope: LayoutScope,
+        rev: u64,
+    },
+    /// The forge state of a worktree changed (polled or after an action).
+    ForgeChanged(crate::forge::ForgeState),
 }

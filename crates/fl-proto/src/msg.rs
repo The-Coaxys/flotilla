@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::channel::{ChannelGrant, ChannelHello, ChannelReady, ChannelRole, TERMINAL_PROTOCOL};
 use crate::validation::{self, MAX_PROCESS_COUNT, MAX_TEXT_BYTES, ValidationError};
 use crate::{Frame, ProtoVersion};
+use fl_model::forge::{ForgeState, MergeMethod};
 use fl_model::layout::{Layout, LayoutOp};
 use fl_model::workspace::{
     DaemonEvent, DirListing, FileContent, FileDiff, LayoutScope, Project, ScriptKind, ScriptState,
@@ -218,6 +219,38 @@ pub enum Request {
     ListScripts {
         worktree: WorktreeId,
     },
+    // --- M3: git actions and the forge ---
+    /// Commit staged changes, or everything (including untracked) with `all`.
+    GitCommit {
+        worktree: WorktreeId,
+        message: String,
+        all: bool,
+    },
+    /// Push the branch, setting its upstream on the first push.
+    GitPush {
+        worktree: WorktreeId,
+    },
+    /// Merge the latest target branch from the remote into the worktree.
+    GitUpdate {
+        worktree: WorktreeId,
+    },
+    /// Refetch and return the worktree's forge state.
+    ForgeStatus {
+        worktree: WorktreeId,
+    },
+    CreatePullRequest {
+        worktree: WorktreeId,
+        title: String,
+        body: String,
+        draft: bool,
+    },
+    MarkPullRequestReady {
+        worktree: WorktreeId,
+    },
+    MergePullRequest {
+        worktree: WorktreeId,
+        method: MergeMethod,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -242,6 +275,12 @@ pub enum Response {
     Scripts(Vec<ScriptState>),
     /// Success with nothing to return (removals, stops).
     Done,
+    // --- M3 ---
+    ForgeState(ForgeState),
+    /// The new HEAD commit after a commit.
+    Committed {
+        head: String,
+    },
 }
 
 /// Returned on the authenticated control stream before requesting channels.
@@ -384,6 +423,19 @@ impl Request {
             Self::RunScript { kind, .. } | Self::StopScript { kind, .. } => {
                 validation::script_kind(kind)
             }
+            Self::GitCommit { message, .. } => {
+                if message.trim().is_empty() {
+                    return Err(ValidationError::Invalid("empty commit message"));
+                }
+                text("commit message", message, validation::MAX_MESSAGE_BYTES)
+            }
+            Self::CreatePullRequest { title, body, .. } => {
+                if title.trim().is_empty() {
+                    return Err(ValidationError::Invalid("empty pull request title"));
+                }
+                text("pull request title", title, MAX_TEXT_BYTES)?;
+                text("pull request body", body, validation::MAX_MESSAGE_BYTES)
+            }
             _ => Ok(()),
         }
     }
@@ -431,6 +483,8 @@ impl Response {
                     .iter()
                     .try_for_each(|value| validation::script_kind(&value.kind))
             }
+            Self::ForgeState(value) => validation::forge_state(value),
+            Self::Committed { head } => validation::text("commit", head, MAX_TEXT_BYTES),
             Self::Written(_) | Self::Done => Ok(()),
             Self::DaemonInfo(value) => {
                 for text in [

@@ -220,8 +220,32 @@ pub fn daemon_event(value: &fl_model::workspace::DaemonEvent) -> Result<(), Vali
     match value {
         DaemonEvent::WorktreeStatus(status) => worktree_status(status),
         DaemonEvent::ScriptChanged(state) => script_kind(&state.kind),
+        DaemonEvent::ForgeChanged(state) => forge_state(state),
         DaemonEvent::WorkspaceTreeChanged { .. } | DaemonEvent::LayoutChanged { .. } => Ok(()),
     }
+}
+
+/// Commit messages and pull request bodies.
+pub const MAX_MESSAGE_BYTES: usize = 64 * 1024;
+pub const MAX_CHECKS: usize = 512;
+
+pub fn forge_state(value: &fl_model::forge::ForgeState) -> Result<(), ValidationError> {
+    if let Some(reason) = &value.unavailable {
+        text("forge reason", reason, MAX_TEXT_BYTES)?;
+    }
+    if let Some(pr) = &value.pr {
+        for field in [&pr.url, &pr.title, &pr.base, &pr.head] {
+            text("pull request", field, MAX_TEXT_BYTES)?;
+        }
+        bound("checks", pr.checks.len(), MAX_CHECKS)?;
+        for check in &pr.checks {
+            text("check name", &check.name, MAX_TEXT_BYTES)?;
+            if let Some(url) = &check.url {
+                text("check url", url, MAX_TEXT_BYTES)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -17,6 +17,7 @@ use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::Duration;
 
+use fl_model::forge::{ForgeState, MergeMethod};
 use fl_model::layout::LayoutOp;
 use fl_model::workspace::{
     DirListing, FileContent, FileDiff, LayoutScope, Project, ScriptKind, ScriptState, Worktree,
@@ -108,6 +109,9 @@ pub struct Sync {
     layouts: Mutex<HashMap<LayoutScope, LayoutHandle>>,
     registry: workspaces::LayoutRegistry,
     workspaces: watch::Receiver<Arc<WorkspacesState>>,
+    /// Shared with the workspace task, so request results land in the
+    /// mirror at once (an unchanged forge state is never pushed).
+    workspaces_tx: Arc<watch::Sender<Arc<WorkspacesState>>>,
     events: broadcast::Sender<SyncEvent>,
 }
 
@@ -209,9 +213,10 @@ impl Sync {
         );
         let registry = workspaces::LayoutRegistry::default();
         let (workspaces_tx, workspaces) = watch::channel(Arc::new(WorkspacesState::default()));
+        let workspaces_tx = Arc::new(workspaces_tx);
         let workspaces_task = workspaces::run(
             links.clone(),
-            workspaces_tx,
+            workspaces_tx.clone(),
             registry.clone(),
             core.shutdown.clone(),
         );
@@ -228,8 +233,15 @@ impl Sync {
             layouts: Mutex::new(HashMap::new()),
             registry,
             workspaces,
+            workspaces_tx,
             events,
         }
+    }
+
+    fn remember_forge(&self, state: &ForgeState) {
+        workspaces::update(&self.workspaces_tx, |s| {
+            s.forges.insert(state.worktree, state.clone());
+        });
     }
 
     /// The layout of `scope`; its sync task starts on first use and runs for
@@ -391,6 +403,106 @@ impl Sync {
     ) -> Result<FileDiff, CallError> {
         match self.call(Request::FileDiff { worktree, path }).await? {
             Response::FileDiff(diff) => Ok(diff),
+            _ => Err(CallError::Unexpected),
+        }
+    }
+
+    /// Fetch the worktree's forge state now (and mark it active, so the
+    /// daemon polls it every 15 s for a while).
+    pub async fn forge_status(&self, worktree: WorktreeId) -> Result<ForgeState, CallError> {
+        match self.call(Request::ForgeStatus { worktree }).await? {
+            Response::ForgeState(state) => {
+                self.remember_forge(&state);
+                Ok(state)
+            }
+            _ => Err(CallError::Unexpected),
+        }
+    }
+
+    /// Commit (everything with `all`); returns the new HEAD.
+    pub async fn git_commit(
+        &self,
+        worktree: WorktreeId,
+        message: String,
+        all: bool,
+    ) -> Result<String, CallError> {
+        match self
+            .call(Request::GitCommit {
+                worktree,
+                message,
+                all,
+            })
+            .await?
+        {
+            Response::Committed { head } => Ok(head),
+            _ => Err(CallError::Unexpected),
+        }
+    }
+
+    pub async fn git_push(&self, worktree: WorktreeId) -> Result<(), CallError> {
+        match self.call(Request::GitPush { worktree }).await? {
+            Response::Done => Ok(()),
+            _ => Err(CallError::Unexpected),
+        }
+    }
+
+    pub async fn git_update(&self, worktree: WorktreeId) -> Result<(), CallError> {
+        match self.call(Request::GitUpdate { worktree }).await? {
+            Response::Done => Ok(()),
+            _ => Err(CallError::Unexpected),
+        }
+    }
+
+    pub async fn create_pull_request(
+        &self,
+        worktree: WorktreeId,
+        title: String,
+        body: String,
+        draft: bool,
+    ) -> Result<ForgeState, CallError> {
+        match self
+            .call(Request::CreatePullRequest {
+                worktree,
+                title,
+                body,
+                draft,
+            })
+            .await?
+        {
+            Response::ForgeState(state) => {
+                self.remember_forge(&state);
+                Ok(state)
+            }
+            _ => Err(CallError::Unexpected),
+        }
+    }
+
+    pub async fn mark_ready(&self, worktree: WorktreeId) -> Result<ForgeState, CallError> {
+        match self
+            .call(Request::MarkPullRequestReady { worktree })
+            .await?
+        {
+            Response::ForgeState(state) => {
+                self.remember_forge(&state);
+                Ok(state)
+            }
+            _ => Err(CallError::Unexpected),
+        }
+    }
+
+    pub async fn merge_pull_request(
+        &self,
+        worktree: WorktreeId,
+        method: MergeMethod,
+    ) -> Result<ForgeState, CallError> {
+        match self
+            .call(Request::MergePullRequest { worktree, method })
+            .await?
+        {
+            Response::ForgeState(state) => {
+                self.remember_forge(&state);
+                Ok(state)
+            }
             _ => Err(CallError::Unexpected),
         }
     }

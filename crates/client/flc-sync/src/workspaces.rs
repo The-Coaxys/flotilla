@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use fl_model::WorktreeId;
+use fl_model::forge::ForgeState;
 use fl_model::workspace::{DaemonEvent, LayoutScope, ScriptState, WorkspaceTree, WorktreeStatus};
 use fl_proto::{Request, Response};
 use flc_conn::broker::ControlLink;
@@ -23,6 +24,9 @@ pub struct WorkspacesState {
     pub tree: Option<WorkspaceTree>,
     pub statuses: HashMap<WorktreeId, WorktreeStatus>,
     pub scripts: HashMap<WorktreeId, Vec<ScriptState>>,
+    /// Forge state of worktrees the daemon has reported (pushed when it
+    /// changes; request [`crate::Sync::forge_status`] for a fresh one).
+    pub forges: HashMap<WorktreeId, ForgeState>,
     /// Connected and following daemon events.
     pub live: bool,
 }
@@ -38,7 +42,7 @@ pub(crate) type LayoutRegistry =
 
 pub(crate) async fn run(
     mut links: watch::Receiver<Option<ControlLink>>,
-    state: watch::Sender<Arc<WorkspacesState>>,
+    state: Arc<watch::Sender<Arc<WorkspacesState>>>,
     layouts: LayoutRegistry,
     shutdown: CancellationToken,
 ) {
@@ -60,7 +64,10 @@ pub(crate) async fn run(
     }
 }
 
-fn update(state: &watch::Sender<Arc<WorkspacesState>>, f: impl FnOnce(&mut WorkspacesState)) {
+pub(crate) fn update(
+    state: &watch::Sender<Arc<WorkspacesState>>,
+    f: impl FnOnce(&mut WorkspacesState),
+) {
     state.send_if_modified(|current| {
         let mut next = (**current).clone();
         f(&mut next);
@@ -109,6 +116,9 @@ async fn follow(
                     Some(known) => *known = script,
                     None => list.push(script),
                 }
+            }),
+            Ok(DaemonEvent::ForgeChanged(forge)) => update(state, |s| {
+                s.forges.insert(forge.worktree, forge);
             }),
             Ok(DaemonEvent::LayoutChanged { scope, .. }) => {
                 if let Some(commands) = layouts
@@ -175,6 +185,7 @@ async fn refetch_tree(link: &ControlLink, state: &watch::Sender<Arc<WorkspacesSt
         let live: Vec<WorktreeId> = tree.worktrees.iter().map(|w| w.id).collect();
         s.statuses.retain(|id, _| live.contains(id));
         s.scripts.retain(|id, _| live.contains(id));
+        s.forges.retain(|id, _| live.contains(id));
         s.statuses.extend(statuses);
         s.scripts.extend(scripts);
         s.tree = Some(tree);

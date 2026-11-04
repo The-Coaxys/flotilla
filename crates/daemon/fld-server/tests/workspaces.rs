@@ -509,35 +509,302 @@ async fn projects_worktrees_status_files_layouts_and_scripts() {
     daemon.shutdown().await;
 }
 
-/// A protocol 0.2 client cannot decode pushed events, so it never gets any;
-/// a current client sees the same change pushed.
+/// Peers outside the supported minor-version window are rejected before
+/// a control session can receive messages it cannot decode.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn events_are_only_pushed_to_peers_that_understand_them() {
+async fn incompatible_peer_is_rejected_before_workspace_events() {
     let fixture = Fixture::new().await;
-    let repo = fixture.repo();
     let daemon = fixture.start().await;
-    let mut old = Control::connect_as(
+    let stream = UnixStream::connect(&daemon.socket_path).await.unwrap();
+    let (r, w) = stream.into_split();
+    let (mut reader, mut writer) = framed(r, w);
+    writer
+        .send(&ClientMsg::Hello(Hello {
+            client_version: "workspace-test".into(),
+            proto: fl_proto::ProtoVersion { major: 0, minor: 2 },
+            device_id: None,
+            token: None,
+            client_session_id: *ClientSessionId::new().as_bytes(),
+        }))
+        .await
+        .unwrap();
+    let reply = tokio::time::timeout(WAIT, reader.recv::<ServerMsg>())
+        .await
+        .expect("handshake reply in time")
+        .unwrap();
+    assert_eq!(
+        reply,
+        ServerMsg::Rejected(fl_proto::RejectReason::ProtoMismatch { server: PROTO })
+    );
+    daemon.shutdown().await;
+}
+
+/// A stand-in for `gh` that keeps one pull request's state in files: it
+/// answers the PR query, and records `pr create` (title, body from stdin,
+/// draft), `pr ready` and `pr merge`.
+fn fake_gh(dir: &Path) -> PathBuf {
+    let state = dir.join("gh-state");
+    std::fs::create_dir_all(&state).unwrap();
+    let script = dir.join("gh");
+    std::fs::write(
+        &script,
+        format!(
+            r#"#!/bin/sh
+S={state}
+case "$1 $2" in
+  "api graphql")
+    if [ -f $S/number ]; then
+      printf '{{"data":{{"repository":{{"mergeCommitAllowed":false,"squashMergeAllowed":true,"rebaseMergeAllowed":false,"pullRequests":{{"nodes":[{{"number":7,"url":"https://github.com/acme/widgets/pull/7","title":"%s","state":"%s","isDraft":%s,"baseRefName":"main","headRefName":"feature","mergeable":"MERGEABLE","reviewDecision":null,"reviewThreads":{{"nodes":[]}},"commits":{{"nodes":[{{"commit":{{"statusCheckRollup":{{"state":"SUCCESS","contexts":{{"nodes":[{{"__typename":"CheckRun","name":"test","status":"COMPLETED","conclusion":"SUCCESS","detailsUrl":"https://ci/1"}}]}}}}}}}}]}}}}]}}}}}}}}' "$(cat $S/title)" "$(cat $S/state)" "$(cat $S/draft)"
+    else
+      printf '{{"data":{{"repository":{{"mergeCommitAllowed":false,"squashMergeAllowed":true,"rebaseMergeAllowed":false,"pullRequests":{{"nodes":[]}}}}}}}}'
+    fi ;;
+  "pr create")
+    shift 2
+    draft=false
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --title) echo "$2" > $S/title; shift ;;
+        --base) echo "$2" > $S/base; shift ;;
+        --head) echo "$2" > $S/head; shift ;;
+        --draft) draft=true ;;
+      esac
+      shift
+    done
+    cat > $S/body
+    echo $draft > $S/draft; echo OPEN > $S/state; echo 7 > $S/number
+    echo https://github.com/acme/widgets/pull/7 ;;
+  "pr ready") echo false > $S/draft ;;
+  "pr merge") echo "$4 $5 $6" > $S/merge; echo MERGED > $S/state ;;
+  *) echo "unexpected gh $*" >&2; exit 1 ;;
+esac
+"#,
+            state = state.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    script
+}
+
+/// Commit, push, pull request, ready, merge and update from the UI's
+/// requests, against a real bare origin that git reaches through a GitHub
+/// URL rewrite, and a scripted `gh`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn git_actions_and_the_pull_request_loop() {
+    let fixture = Fixture::new().await;
+    let root = fixture.dir.path();
+    let seed = fixture.repo();
+    let origin = root.join("origin.git");
+    git(
+        root,
+        &[
+            "clone",
+            "-q",
+            "--bare",
+            seed.to_str().unwrap(),
+            origin.to_str().unwrap(),
+        ],
+    );
+    let work = root.join("widgets");
+    git(
+        root,
+        &[
+            "clone",
+            "-q",
+            origin.to_str().unwrap(),
+            work.to_str().unwrap(),
+        ],
+    );
+    let github = "https://github.com/acme/widgets.git";
+    git(&work, &["remote", "set-url", "origin", github]);
+    git(
+        &work,
+        &[
+            "config",
+            &format!("url.{}.insteadOf", origin.display()),
+            github,
+        ],
+    );
+    let gh = fake_gh(root);
+    // SAFETY: set before the daemon starts; no other test in this binary
+    // reads FLOTILLA_GH.
+    unsafe { std::env::set_var("FLOTILLA_GH", &gh) };
+
+    let daemon = fixture.start().await;
+    let mut control = Control::connect(&daemon.socket_path).await;
+    let mut previous = Control::connect_as(
         &daemon.socket_path,
-        fl_proto::ProtoVersion { major: 0, minor: 2 },
+        fl_proto::ProtoVersion { major: 0, minor: 3 },
     )
     .await;
-    let mut current = Control::connect(&daemon.socket_path).await;
-    let Response::WorkspaceTree(tree) = current.ok(Request::GetWorkspaceTree).await else {
+    let Response::WorkspaceTree(tree) = control.ok(Request::GetWorkspaceTree).await else {
         panic!("expected tree")
     };
-    current
+    let Response::Project(project) = control
         .ok(Request::AddProject {
             workspace: tree.workspaces[0].id,
-            path: repo.display().to_string(),
+            path: work.display().to_string(),
+        })
+        .await
+    else {
+        panic!("expected project")
+    };
+    let Response::Worktree(task) = control
+        .ok(Request::CreateWorktree {
+            project: project.id,
+            branch: Some("feature".into()),
+            base: None,
+        })
+        .await
+    else {
+        panic!("expected worktree")
+    };
+    let path = PathBuf::from(&task.path);
+
+    // Commit everything.
+    std::fs::write(path.join("feature.txt"), "feature\n").unwrap();
+    let Response::Committed { head } = control
+        .ok(Request::GitCommit {
+            worktree: task.id,
+            message: "Add the feature".into(),
+            all: true,
+        })
+        .await
+    else {
+        panic!("expected commit")
+    };
+    assert_eq!(head.len(), 40);
+    let refused = control
+        .rpc(Request::GitCommit {
+            worktree: task.id,
+            message: "nothing".into(),
+            all: true,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code, RpcErrorCode::InvalidArgument);
+
+    // No pull request yet.
+    let Response::ForgeState(state) = control.ok(Request::ForgeStatus { worktree: task.id }).await
+    else {
+        panic!("expected forge state")
+    };
+    assert_eq!(state.unavailable, None);
+    assert!(state.pr.is_none());
+
+    // Open a draft: the branch is pushed first and the body reaches gh.
+    let Response::ForgeState(state) = control
+        .ok(Request::CreatePullRequest {
+            worktree: task.id,
+            title: "Add the feature".into(),
+            body: "Line one\nLine two".into(),
+            draft: true,
+        })
+        .await
+    else {
+        panic!("expected forge state")
+    };
+    let pr = state.pr.expect("a pull request");
+    assert!(pr.draft);
+    assert_eq!(pr.title, "Add the feature");
+    assert_eq!(
+        std::fs::read_to_string(root.join("gh-state/body")).unwrap(),
+        "Line one\nLine two"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("gh-state/base"))
+            .unwrap()
+            .trim(),
+        "main"
+    );
+    let pushed = Command::new("git")
+        .arg("-C")
+        .arg(&origin)
+        .args(["rev-parse", "feature"])
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&pushed.stdout).trim(), head);
+    control
+        .event("forge change", |e| match e {
+            DaemonEvent::ForgeChanged(s) if s.worktree == task.id && s.pr.is_some() => Some(()),
+            _ => None,
         })
         .await;
-    current
-        .event("tree change", |e| {
-            matches!(e, DaemonEvent::WorkspaceTreeChanged { .. }).then_some(())
+    // The adjacent minor supports workspace events, but cannot decode the
+    // newly appended forge event. It must stay connected without receiving it.
+    previous.ok(Request::DaemonInfo).await;
+    assert!(
+        previous
+            .events
+            .iter()
+            .all(|event| !matches!(event, DaemonEvent::ForgeChanged(_))),
+        "{:?}",
+        previous.events
+    );
+
+    // Ready, then merge with the only allowed method.
+    let Response::ForgeState(state) = control
+        .ok(Request::MarkPullRequestReady { worktree: task.id })
+        .await
+    else {
+        panic!("expected forge state")
+    };
+    assert!(!state.pr.unwrap().draft);
+    let disallowed = control
+        .rpc(Request::MergePullRequest {
+            worktree: task.id,
+            method: fl_model::forge::MergeMethod::Rebase,
         })
-        .await;
-    // Anything pushed to the old session would precede this reply.
-    old.ok(Request::DaemonInfo).await;
-    assert!(old.events.is_empty(), "{:?}", old.events);
+        .await
+        .unwrap_err();
+    assert_eq!(disallowed.code, RpcErrorCode::InvalidArgument);
+    let Response::ForgeState(state) = control
+        .ok(Request::MergePullRequest {
+            worktree: task.id,
+            method: fl_model::forge::MergeMethod::Squash,
+        })
+        .await
+    else {
+        panic!("expected forge state")
+    };
+    assert_eq!(state.pr.unwrap().state, fl_model::forge::PrState::Merged);
+    assert!(
+        std::fs::read_to_string(root.join("gh-state/merge"))
+            .unwrap()
+            .contains("--squash")
+    );
+
+    // Update: main moved on the origin; the worktree merges it in.
+    let other = root.join("other");
+    git(
+        root,
+        &[
+            "clone",
+            "-q",
+            origin.to_str().unwrap(),
+            other.to_str().unwrap(),
+        ],
+    );
+    std::fs::write(other.join("upstream.txt"), "u\n").unwrap();
+    git(&other, &["add", "."]);
+    git(&other, &["commit", "-q", "-m", "upstream"]);
+    git(&other, &["push", "-q", "origin", "main"]);
+    control.ok(Request::GitUpdate { worktree: task.id }).await;
+    assert!(path.join("upstream.txt").exists());
+
+    // Without gh the forge is unavailable, with the reason.
+    // SAFETY: as above.
+    unsafe { std::env::set_var("FLOTILLA_GH", root.join("no-such-gh")) };
+    let Response::ForgeState(state) = control.ok(Request::ForgeStatus { worktree: task.id }).await
+    else {
+        panic!("expected forge state")
+    };
+    assert!(
+        state
+            .unavailable
+            .as_deref()
+            .is_some_and(|r| r.contains("not installed")),
+        "{state:?}"
+    );
     daemon.shutdown().await;
 }

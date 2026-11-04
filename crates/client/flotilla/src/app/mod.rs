@@ -1,5 +1,6 @@
 //! The GPUI application: one window with a title bar, a host sidebar and a center pane.
 mod add_host;
+mod git_actions;
 mod host_view;
 mod host_workspace;
 mod sidebar;

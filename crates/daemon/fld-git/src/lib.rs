@@ -9,6 +9,7 @@ pub mod cmd;
 pub mod config;
 mod error;
 pub mod files;
+pub mod ops;
 pub mod repo;
 pub mod status;
 pub mod watch;

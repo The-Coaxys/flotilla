@@ -1,4 +1,5 @@
 //! Shared domain values. This crate has no terminal engine, transport or UI dependency.
+pub mod forge;
 pub mod layout;
 pub mod workspace;
 

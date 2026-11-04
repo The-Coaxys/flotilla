@@ -98,7 +98,7 @@ impl WorkspaceService {
 
     /// Recompute and publish one worktree's status if it changed; also keep
     /// the recorded branch in step with the checkout.
-    async fn refresh(&self, id: WorktreeId) {
+    pub(super) async fn refresh(&self, id: WorktreeId) {
         let Ok((worktree, project)) = self.worktree(id).await else {
             return;
         };

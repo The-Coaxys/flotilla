@@ -3,6 +3,7 @@
 //!
 //! Durable structure lives in `fld-store` (schema v3). Structural changes
 //! are serialized and each one publishes `WorkspaceTreeChanged`.
+mod forge;
 mod scripts;
 mod status;
 
@@ -40,6 +41,7 @@ pub(crate) struct WorkspaceService {
     watchers: Mutex<HashMap<WorktreeId, CancellationToken>>,
     /// Last published status per worktree (only changes are published).
     statuses: Mutex<HashMap<WorktreeId, WorktreeStatus>>,
+    forge: Mutex<forge::ForgeCache>,
     cancel: CancellationToken,
 }
 
@@ -117,10 +119,12 @@ impl WorkspaceService {
             structure: tokio::sync::Mutex::new(()),
             watchers: Mutex::default(),
             statuses: Mutex::default(),
+            forge: Mutex::default(),
             cancel,
         });
         service.reconcile().await?;
         service.clone().resume_scripts().await?;
+        service.start_forge_polling();
         Ok(service)
     }
 
@@ -186,6 +190,7 @@ impl WorkspaceService {
         for id in &removed.worktrees {
             self.unwatch(*id);
             self.statuses.lock().expect("statuses poisoned").remove(id);
+            self.forget_forge(*id);
         }
         self.terminals.close_all(removed.closed).await;
         self.tree_changed(removed.rev);

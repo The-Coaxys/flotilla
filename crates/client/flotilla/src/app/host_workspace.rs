@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
+use fl_model::forge::{CheckStatus, MergeMethod, Mergeable, PrState, ReviewDecision};
 use fl_model::workspace::{
     ChangeKind, DirListing, EntryKind, FileChange, LayoutScope, ProjectKind, ScriptKind,
     ScriptRunState, ScriptState, Worktree,
@@ -25,6 +26,7 @@ use gpui::{
     SharedString, Subscription, Task, WeakEntity, Window, div, px,
 };
 
+use super::git_actions::{self, GitAction};
 use super::host_view::{primary_button, secondary_button};
 
 /// Largest file the editor opens (the daemon's read limit).
@@ -40,6 +42,7 @@ pub enum HostWorkspaceEvent {
 enum Panel {
     Files,
     Changes,
+    Checks,
 }
 
 enum DocumentKind {
@@ -90,6 +93,31 @@ enum Dialog {
         needs_force: Option<SharedString>,
         busy: bool,
     },
+    Commit {
+        worktree: WorktreeId,
+        message: Entity<TextInput>,
+        all: bool,
+        error: Option<SharedString>,
+        busy: bool,
+        _events: Subscription,
+    },
+    CreatePr {
+        worktree: WorktreeId,
+        title: Entity<TextInput>,
+        body: Entity<EditorView>,
+        draft: bool,
+        error: Option<SharedString>,
+        busy: bool,
+        _events: Subscription,
+    },
+    Merge {
+        worktree: WorktreeId,
+        method: MergeMethod,
+        number: u64,
+        title: SharedString,
+        error: Option<SharedString>,
+        busy: bool,
+    },
 }
 
 pub struct HostWorkspace {
@@ -115,6 +143,11 @@ pub struct HostWorkspace {
     pending_select: Option<fl_model::ProjectId>,
     /// Script terminals already asked for in a process refresh.
     refreshed_for: HashSet<fl_model::TerminalId>,
+    /// A direct git or forge action in flight ("Pushing…").
+    git_busy: Option<&'static str>,
+    git_menu: bool,
+    /// Keeps the selected worktree's forge state fresh.
+    _forge_poll: Option<Task<()>>,
     _follow: Task<()>,
 }
 
@@ -236,6 +269,9 @@ impl HostWorkspace {
             rtt: None,
             pending_select: None,
             refreshed_for: HashSet::new(),
+            git_busy: None,
+            git_menu: false,
+            _forge_poll: None,
             _follow: follow,
         }
     }
@@ -293,12 +329,299 @@ impl HostWorkspace {
             self.scope = scope;
             self.expanded.clear();
             self.listings.clear();
-            if let Some(worktree) = self.selected_worktree() {
+            self.git_menu = false;
+            self._forge_poll = None;
+            if let Some(worktree) = self.selected_worktree().cloned() {
                 let root = worktree.path.clone();
                 self.expanded.insert(root.clone());
                 self.load_dir(root, cx);
+                if !self.is_folder(&worktree) {
+                    self._forge_poll = Some(self.poll_forge(worktree.id, cx));
+                }
             }
         }
+        cx.notify();
+    }
+
+    /// Ask for the forge state now and every 90 s while selected; asking
+    /// also keeps the daemon polling this worktree every 15 s.
+    fn poll_forge(&self, worktree: WorktreeId, cx: &mut Context<Self>) -> Task<()> {
+        let sync = self.sync.clone();
+        cx.spawn(async move |_: WeakEntity<Self>, cx: &mut AsyncApp| {
+            loop {
+                if let Err(error) = sync.forge_status(worktree).await {
+                    tracing::debug!("forge status: {error}");
+                }
+                cx.background_executor()
+                    .timer(Duration::from_secs(90))
+                    .await;
+            }
+        })
+    }
+
+    // ---- git actions ---------------------------------------------------------
+
+    fn git_context<'a>(&'a self, worktree: &'a Worktree) -> Option<git_actions::Context<'a>> {
+        let status = self.state.statuses.get(&worktree.id)?;
+        let default_branch = self.state.tree.as_ref().and_then(|tree| {
+            tree.projects
+                .iter()
+                .find(|p| p.id == worktree.project)
+                .and_then(|p| p.default_branch.clone())
+        });
+        Some(git_actions::Context {
+            summary: &status.summary,
+            has_changes: !status.files.is_empty()
+                || status.summary.added + status.summary.removed > 0,
+            on_base: status.summary.branch.is_some() && status.summary.branch == default_branch,
+            is_primary: worktree.is_primary,
+            forge: self.state.forges.get(&worktree.id),
+        })
+    }
+
+    fn run_git_action(&mut self, action: GitAction, window: &mut Window, cx: &mut Context<Self>) {
+        self.git_menu = false;
+        let Some(worktree) = self.selected_worktree().cloned() else {
+            return;
+        };
+        let id = worktree.id;
+        match action {
+            GitAction::Commit => self.open_commit(id, window, cx),
+            GitAction::CreatePr => self.open_create_pr(&worktree, window, cx),
+            GitAction::Merge(method) => {
+                let Some(pr) = self.state.forges.get(&id).and_then(|f| f.pr.clone()) else {
+                    return;
+                };
+                self.dialog = Some(Dialog::Merge {
+                    worktree: id,
+                    method,
+                    number: pr.number,
+                    title: pr.title.into(),
+                    error: None,
+                    busy: false,
+                });
+            }
+            GitAction::Checks => {
+                self.panel_open = true;
+                self.panel = Panel::Checks;
+            }
+            GitAction::DeleteWorktree => self.open_delete(id, cx),
+            GitAction::Push => self.git_call("Pushing…", cx, move |sync| async move {
+                sync.git_push(id).await
+            }),
+            GitAction::Update => self.git_call("Updating…", cx, move |sync| async move {
+                sync.git_update(id).await
+            }),
+            GitAction::MarkReady => self.git_call("Marking ready…", cx, move |sync| async move {
+                sync.mark_ready(id).await.map(|_| ())
+            }),
+            GitAction::AwaitingReview | GitAction::UpToDate => {}
+        }
+        cx.notify();
+    }
+
+    /// Run one direct action with a busy label, then refresh the forge.
+    fn git_call<F, Fut>(&mut self, label: &'static str, cx: &mut Context<Self>, call: F)
+    where
+        F: FnOnce(Arc<Sync>) -> Fut + 'static,
+        Fut: std::future::Future<Output = Result<(), CallError>> + 'static,
+    {
+        let Some(worktree) = self.selected_worktree().map(|w| w.id) else {
+            return;
+        };
+        self.git_busy = Some(label);
+        let sync = self.sync.clone();
+        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let result = call(sync.clone()).await;
+            let _ = sync.forge_status(worktree).await;
+            let _ = this.update(cx, |view, cx| {
+                view.git_busy = None;
+                if let Err(error) = result {
+                    view.show_error(error_text(&error), cx);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn open_commit(&mut self, worktree: WorktreeId, window: &mut Window, cx: &mut Context<Self>) {
+        let message = cx.new(|cx| TextInput::new(cx, "Commit message"));
+        let events = cx.subscribe_in(
+            &message,
+            window,
+            |view, _, event: &TextInputEvent, window, cx| match event {
+                TextInputEvent::Submitted(_) => view.commit(cx),
+                TextInputEvent::Cancelled => view.close_dialog(window, cx),
+            },
+        );
+        message.read(cx).focus_handle(cx).focus(window);
+        self.dialog = Some(Dialog::Commit {
+            worktree,
+            message,
+            all: true,
+            error: None,
+            busy: false,
+            _events: events,
+        });
+    }
+
+    fn commit(&mut self, cx: &mut Context<Self>) {
+        let Some(Dialog::Commit {
+            worktree,
+            message,
+            all,
+            busy,
+            error,
+            ..
+        }) = self.dialog.as_mut()
+        else {
+            return;
+        };
+        let text = message.read(cx).text().trim().to_string();
+        if text.is_empty() {
+            *error = Some("Write a commit message".into());
+            cx.notify();
+            return;
+        }
+        *busy = true;
+        let (worktree, all) = (*worktree, *all);
+        let sync = self.sync.clone();
+        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let result = sync.git_commit(worktree, text, all).await;
+            let _ = this.update(cx, |view, cx| {
+                match result {
+                    Ok(_) => view.dialog = None,
+                    Err(e) => {
+                        if let Some(Dialog::Commit { error, busy, .. }) = view.dialog.as_mut() {
+                            *error = Some(error_text(&e));
+                            *busy = false;
+                        }
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn open_create_pr(&mut self, worktree: &Worktree, window: &mut Window, cx: &mut Context<Self>) {
+        let title = cx.new(|cx| TextInput::new(cx, "Pull request title"));
+        // A readable default title from the branch name.
+        let suggested = worktree
+            .branch
+            .as_deref()
+            .unwrap_or(&worktree.label)
+            .rsplit('/')
+            .next()
+            .unwrap_or_default()
+            .replace(['-', '_'], " ");
+        let suggested = {
+            let mut chars = suggested.chars();
+            chars
+                .next()
+                .map(|first| first.to_uppercase().collect::<String>() + chars.as_str())
+                .unwrap_or_default()
+        };
+        title.update(cx, |input, cx| input.set_text(suggested, cx));
+        let body = cx.new(|cx| EditorView::new("Description.md", b"", None, cx));
+        let events = cx.subscribe_in(
+            &title,
+            window,
+            |view, _, event: &TextInputEvent, window, cx| match event {
+                TextInputEvent::Submitted(_) => view.create_pr(cx),
+                TextInputEvent::Cancelled => view.close_dialog(window, cx),
+            },
+        );
+        title.read(cx).focus_handle(cx).focus(window);
+        self.dialog = Some(Dialog::CreatePr {
+            worktree: worktree.id,
+            title,
+            body,
+            draft: false,
+            error: None,
+            busy: false,
+            _events: events,
+        });
+    }
+
+    fn create_pr(&mut self, cx: &mut Context<Self>) {
+        let Some(Dialog::CreatePr {
+            worktree,
+            title,
+            body,
+            draft,
+            busy,
+            error,
+            ..
+        }) = self.dialog.as_mut()
+        else {
+            return;
+        };
+        let title = title.read(cx).text().trim().to_string();
+        if title.is_empty() {
+            *error = Some("Give the pull request a title".into());
+            cx.notify();
+            return;
+        }
+        let body = body.read(cx).buffer().text();
+        *busy = true;
+        let (worktree, draft) = (*worktree, *draft);
+        let sync = self.sync.clone();
+        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let result = sync.create_pull_request(worktree, title, body, draft).await;
+            let _ = this.update(cx, |view, cx| {
+                match result {
+                    Ok(_) => {
+                        view.dialog = None;
+                        view.panel_open = true;
+                        view.panel = Panel::Checks;
+                    }
+                    Err(e) => {
+                        if let Some(Dialog::CreatePr { error, busy, .. }) = view.dialog.as_mut() {
+                            *error = Some(error_text(&e));
+                            *busy = false;
+                        }
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn merge(&mut self, cx: &mut Context<Self>) {
+        let Some(Dialog::Merge {
+            worktree,
+            method,
+            busy,
+            ..
+        }) = self.dialog.as_mut()
+        else {
+            return;
+        };
+        *busy = true;
+        let (worktree, method) = (*worktree, *method);
+        let sync = self.sync.clone();
+        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let result = sync.merge_pull_request(worktree, method).await;
+            let _ = this.update(cx, |view, cx| {
+                match result {
+                    Ok(_) => view.dialog = None,
+                    Err(e) => {
+                        if let Some(Dialog::Merge { error, busy, .. }) = view.dialog.as_mut() {
+                            *error = Some(error_text(&e));
+                            *busy = false;
+                        }
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
         cx.notify();
     }
 
@@ -1178,6 +1501,50 @@ impl HostWorkspace {
             .map(|s| s.summary.clone());
         let panel_open = self.panel_open;
         let hover = t.raised_hover;
+        let git_button = worktree
+            .filter(|w| !self.is_folder(w))
+            .and_then(|w| self.git_context(w))
+            .map(|context| {
+                let action = git_actions::primary(context);
+                let label: SharedString = self.git_busy.unwrap_or(action.label()).into();
+                let actionable = action.actionable() && self.git_busy.is_none();
+                div()
+                    .flex()
+                    .items_center()
+                    .h(px(22.))
+                    .rounded(px(11.))
+                    .bg(if actionable { t.accent } else { t.control_bg })
+                    .text_color(if actionable {
+                        gpui::white()
+                    } else {
+                        t.text_secondary
+                    })
+                    .child(
+                        div()
+                            .id("git-primary")
+                            .px(px(10.))
+                            .cursor_pointer()
+                            .child(label)
+                            .on_click(cx.listener(move |view, _, window, cx| {
+                                if view.git_busy.is_none() {
+                                    view.run_git_action(action, window, cx)
+                                }
+                            })),
+                    )
+                    .child(
+                        div()
+                            .id("git-menu")
+                            .px(px(6.))
+                            .border_l_1()
+                            .border_color(gpui::white().opacity(0.25))
+                            .cursor_pointer()
+                            .child("▾")
+                            .on_click(cx.listener(|view, _, _, cx| {
+                                view.git_menu = !view.git_menu;
+                                cx.notify();
+                            })),
+                    )
+            });
         div()
             .h(px(28.))
             .px(px(10.))
@@ -1209,6 +1576,7 @@ impl HostWorkspace {
                 )
             })
             .child(div().flex_1())
+            .children(git_button)
             .when(worktree.is_some(), |d| {
                 d.child(
                     div()
@@ -1291,12 +1659,19 @@ impl HostWorkspace {
                     self.panel == Panel::Changes,
                     cx,
                 ))
+                .child(segment(
+                    "Checks".into(),
+                    Panel::Checks,
+                    self.panel == Panel::Checks,
+                    cx,
+                ))
             });
         let body: AnyElement = match self.panel {
             Panel::Files => self
                 .render_file_tree(&worktree.path, &t, cx)
                 .into_any_element(),
             Panel::Changes => self.render_changes(id, &changes, &t, cx).into_any_element(),
+            Panel::Checks => self.render_checks(id, &t, cx).into_any_element(),
         };
         let scripts = self.render_scripts(id, &t, window, cx);
         div()
@@ -1405,6 +1780,190 @@ impl HostWorkspace {
             .flex()
             .flex_col()
             .children(rows)
+            .into_any_element()
+    }
+
+    fn render_git_menu(&self, t: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.git_menu {
+            return None;
+        }
+        let worktree = self.selected_worktree()?;
+        let actions = git_actions::available(self.git_context(worktree)?);
+        let hover = t.raised_hover;
+        let pr_url = self
+            .state
+            .forges
+            .get(&worktree.id)
+            .and_then(|f| f.pr.as_ref())
+            .map(|pr| pr.url.clone());
+        let mut menu = div()
+            .id("git-actions-menu")
+            .absolute()
+            .occlude()
+            .bottom(px(32.))
+            .right(px(if self.panel_open { 330. } else { 10. }))
+            .w(px(220.))
+            .py(px(4.))
+            .flex()
+            .flex_col()
+            .rounded(t.radius_md)
+            .bg(t.surface_raised)
+            .border_1()
+            .border_color(t.border)
+            .shadow_lg();
+        for (index, action) in actions.into_iter().enumerate() {
+            menu = menu.child(
+                div()
+                    .id(("git-action", index))
+                    .h(px(26.))
+                    .px(px(12.))
+                    .flex()
+                    .items_center()
+                    .cursor_pointer()
+                    .hover(move |s| s.bg(hover))
+                    .when(!action.actionable(), |d| d.text_color(t.text_tertiary))
+                    .child(action.label())
+                    .on_click(cx.listener(move |view, _, window, cx| {
+                        view.run_git_action(action, window, cx)
+                    })),
+            );
+        }
+        if let Some(url) = pr_url {
+            menu = menu.child(
+                div()
+                    .id("git-open-pr")
+                    .h(px(26.))
+                    .px(px(12.))
+                    .flex()
+                    .items_center()
+                    .cursor_pointer()
+                    .hover(move |s| s.bg(hover))
+                    .child("Open pull request")
+                    .on_click(cx.listener(move |view, _, _, cx| {
+                        view.git_menu = false;
+                        cx.open_url(&url);
+                    })),
+            );
+        }
+        Some(menu.into_any_element())
+    }
+
+    fn render_checks(
+        &self,
+        worktree: WorktreeId,
+        t: &Theme,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let message = |text: SharedString| {
+            div()
+                .p(px(12.))
+                .text_color(t.text_tertiary)
+                .child(text)
+                .into_any_element()
+        };
+        let Some(forge) = self.state.forges.get(&worktree) else {
+            return message("Loading…".into());
+        };
+        if let Some(reason) = &forge.unavailable {
+            return message(reason.clone().into());
+        }
+        let Some(pr) = &forge.pr else {
+            return message("No pull request for this branch yet".into());
+        };
+        let hover = t.raised_hover;
+        let url = pr.url.clone();
+        let state: SharedString = match (pr.state, pr.draft) {
+            (PrState::Open, true) => "Draft".into(),
+            (PrState::Open, false) => "Open".into(),
+            (PrState::Merged, _) => "Merged".into(),
+            (PrState::Closed, _) => "Closed".into(),
+        };
+        let mut column = div().py(px(4.)).flex().flex_col().child(
+            div()
+                .id("pr-link")
+                .px(px(10.))
+                .py(px(6.))
+                .flex()
+                .flex_col()
+                .gap(px(2.))
+                .cursor_pointer()
+                .hover(move |s| s.bg(hover))
+                .on_click(cx.listener(move |_, _, _, cx| cx.open_url(&url)))
+                .child(
+                    div()
+                        .font_weight(FontWeight::MEDIUM)
+                        .child(SharedString::from(format!("#{} {}", pr.number, pr.title))),
+                )
+                .child(
+                    div()
+                        .text_size(t.text_size_sm)
+                        .text_color(t.text_secondary)
+                        .child(SharedString::from(format!(
+                            "{state} · {} → {}{}{}",
+                            pr.head,
+                            pr.base,
+                            match pr.review {
+                                Some(ReviewDecision::Approved) => " · approved",
+                                Some(ReviewDecision::ChangesRequested) => " · changes requested",
+                                Some(ReviewDecision::ReviewRequired) => " · review required",
+                                None => "",
+                            },
+                            if pr.unresolved_threads > 0 {
+                                format!(" · {} unresolved", pr.unresolved_threads)
+                            } else {
+                                String::new()
+                            }
+                        ))),
+                ),
+        );
+        if pr.mergeable == Mergeable::Conflicting {
+            column = column.child(
+                div()
+                    .px(px(10.))
+                    .py(px(4.))
+                    .text_size(t.text_size_sm)
+                    .text_color(t.danger)
+                    .child("Conflicts with the base branch"),
+            );
+        }
+        if pr.checks.is_empty() {
+            return column
+                .child(message("No checks reported".into()))
+                .into_any_element();
+        }
+        column
+            .children(pr.checks.iter().enumerate().map(|(index, check)| {
+                let color = match check.status {
+                    CheckStatus::Success => t.success,
+                    CheckStatus::Failure => t.danger,
+                    CheckStatus::Pending => t.warning,
+                    CheckStatus::Neutral => t.text_tertiary,
+                };
+                let url = check.url.clone();
+                div()
+                    .id(("check", index))
+                    .h(px(24.))
+                    .px(px(10.))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .when(url.is_some(), |d| {
+                        d.cursor_pointer().hover(move |s| s.bg(hover))
+                    })
+                    .child(div().size(px(8.)).rounded_full().bg(color))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .truncate()
+                            .child(SharedString::from(check.name.clone())),
+                    )
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        if let Some(url) = &url {
+                            cx.open_url(url);
+                        }
+                    }))
+            }))
             .into_any_element()
     }
 
@@ -1752,6 +2311,149 @@ impl HostWorkspace {
                                 .on_click(cx.listener(|view, _, _, cx| view.create_worktree(cx))),
                         ),
                 ),
+            Dialog::Commit {
+                message,
+                all,
+                error,
+                busy,
+                ..
+            } => {
+                let all = *all;
+                card.child(title("Commit"))
+                    .child(message.clone())
+                    .child(
+                        div()
+                            .id("commit-all")
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .cursor_pointer()
+                            .text_size(t.text_size_sm)
+                            .text_color(t.text_secondary)
+                            .child(
+                                div()
+                                    .size(px(14.))
+                                    .rounded(px(3.))
+                                    .border_1()
+                                    .border_color(t.border)
+                                    .when(all, |d| d.bg(t.accent)),
+                            )
+                            .child("Include every change, including new files")
+                            .on_click(cx.listener(|view, _, _, cx| {
+                                if let Some(Dialog::Commit { all, .. }) = view.dialog.as_mut() {
+                                    *all = !*all;
+                                }
+                                cx.notify();
+                            })),
+                    )
+                    .children(error_row(error))
+                    .child(
+                        div()
+                            .flex()
+                            .justify_end()
+                            .gap(px(8.))
+                            .child(secondary_button("cancel-dialog", "Cancel", t).on_click(
+                                cx.listener(|view, _, window, cx| view.close_dialog(window, cx)),
+                            ))
+                            .child(
+                                primary_button("commit", if *busy { "Committing…" } else { "Commit" }, t)
+                                    .on_click(cx.listener(|view, _, _, cx| view.commit(cx))),
+                            ),
+                    )
+            }
+            Dialog::CreatePr {
+                title: pr_title,
+                body,
+                draft,
+                error,
+                busy,
+                ..
+            } => {
+                let draft = *draft;
+                card.child(title("Create pull request"))
+                    .child(
+                        div()
+                            .text_size(t.text_size_sm)
+                            .text_color(t.text_secondary)
+                            .child("The branch is pushed first, then the pull request opens against the target branch."),
+                    )
+                    .child(pr_title.clone())
+                    .child(
+                        div()
+                            .h(px(160.))
+                            .rounded(t.radius_md)
+                            .overflow_hidden()
+                            .border_1()
+                            .border_color(t.border)
+                            .child(body.clone()),
+                    )
+                    .child(
+                        div()
+                            .id("pr-draft")
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .cursor_pointer()
+                            .text_size(t.text_size_sm)
+                            .text_color(t.text_secondary)
+                            .child(
+                                div()
+                                    .size(px(14.))
+                                    .rounded(px(3.))
+                                    .border_1()
+                                    .border_color(t.border)
+                                    .when(draft, |d| d.bg(t.accent)),
+                            )
+                            .child("Open as a draft")
+                            .on_click(cx.listener(|view, _, _, cx| {
+                                if let Some(Dialog::CreatePr { draft, .. }) = view.dialog.as_mut() {
+                                    *draft = !*draft;
+                                }
+                                cx.notify();
+                            })),
+                    )
+                    .children(error_row(error))
+                    .child(
+                        div()
+                            .flex()
+                            .justify_end()
+                            .gap(px(8.))
+                            .child(secondary_button("cancel-dialog", "Cancel", t).on_click(
+                                cx.listener(|view, _, window, cx| view.close_dialog(window, cx)),
+                            ))
+                            .child(
+                                primary_button("create-pr", if *busy { "Creating…" } else { "Create pull request" }, t)
+                                    .on_click(cx.listener(|view, _, _, cx| view.create_pr(cx))),
+                            ),
+                    )
+            }
+            Dialog::Merge {
+                method,
+                number,
+                title: pr_title,
+                error,
+                busy,
+                ..
+            } => card
+                .child(title("Merge pull request"))
+                .child(SharedString::from(format!(
+                    "{} #{number} “{pr_title}” into its base branch?",
+                    GitAction::Merge(*method).label()
+                )))
+                .children(error_row(error))
+                .child(
+                    div()
+                        .flex()
+                        .justify_end()
+                        .gap(px(8.))
+                        .child(secondary_button("cancel-dialog", "Cancel", t).on_click(
+                            cx.listener(|view, _, window, cx| view.close_dialog(window, cx)),
+                        ))
+                        .child(
+                            primary_button("confirm-merge", if *busy { "Merging…" } else { "Merge" }, t)
+                                .on_click(cx.listener(|view, _, _, cx| view.merge(cx))),
+                        ),
+                ),
             Dialog::DeleteWorktree {
                 label,
                 needs_force,
@@ -1794,8 +2496,11 @@ impl HostWorkspace {
         };
         Some(
             div()
+                .id("dialog-overlay")
                 .absolute()
                 .inset_0()
+                // Clicks never reach the terminals behind a dialog.
+                .occlude()
                 .flex()
                 .items_center()
                 .justify_center()
@@ -1833,6 +2538,7 @@ impl Render for HostWorkspace {
         };
         let banner = self.banner.clone();
         let dialog = self.render_dialog(&t, cx);
+        let git_menu = self.render_git_menu(&t, cx);
         div()
             .track_focus(&self.focus)
             .relative()
@@ -1866,6 +2572,7 @@ impl Render for HostWorkspace {
                     .child(bottom),
             )
             .children(panel)
+            .children(git_menu)
             .children(dialog)
     }
 }
