@@ -5,9 +5,9 @@ use std::path::PathBuf;
 use fl_proto::{EnrollResponse, PRODUCT_VERSION, build_id};
 use fl_transport::quic::parse_fingerprint;
 use fl_transport::ssh::{HostKeyPolicy, SshAuth, SshTarget};
-use flc_conn::bootstrap::BootstrapStep;
+use flc_conn::bootstrap::{BootstrapOptions, BootstrapStep};
 use flc_conn::profile::{HostProfile, QuicEndpoint};
-use flc_conn::supervisor::{ConnPhase, ConnectSpec, QuicSpec, Timings};
+use flc_conn::supervisor::{ConnPhase, ConnectSpec, DaemonUpgrade, QuicSpec, Timings};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Draft {
@@ -107,6 +107,7 @@ pub fn profile_from_enrollment(
         }),
         device_id: Some(enrollment.device_id.clone()),
         socket_path: Some(enrollment.socket_path.clone()),
+        clipboard_consent: None,
     }
 }
 
@@ -135,6 +136,12 @@ pub fn connect_spec(profile: &HostProfile, token: Option<String>) -> Option<Conn
         token,
         client_version: client_version(),
         timings: Timings::default(),
+        // A remembered host upgrades an older daemon in place over the pinned
+        // SSH session, keeping its enrollment and running shells.
+        upgrade: Some(DaemonUpgrade {
+            artifacts: crate::embedded::artifacts(),
+            options: BootstrapOptions::new(device_name()),
+        }),
     })
 }
 
@@ -167,6 +174,9 @@ pub fn status_line(phase: &ConnPhase) -> (Tone, String) {
         }
         ConnPhase::Reconnecting { attempt, .. } => {
             (Tone::Busy, format!("Reconnecting… (attempt {attempt})"))
+        }
+        ConnPhase::Upgrading { daemon_version } => {
+            (Tone::Busy, format!("Upgrading daemon {daemon_version}…"))
         }
         ConnPhase::Failed { .. } => (Tone::Bad, "Connection failed".into()),
     }

@@ -13,6 +13,8 @@ use fld_server::{DaemonConfig, DaemonHandle, FlotillaHome, ServerError};
 use tokio::net::UnixStream;
 use tokio_util::codec::Encoder;
 
+mod support;
+
 fn home_in(dir: &Path) -> FlotillaHome {
     FlotillaHome::new(dir.join(".flotilla"))
 }
@@ -25,10 +27,20 @@ async fn start_daemon_with_hello_timeout(
     dir: &Path,
     hello_timeout: Duration,
 ) -> Result<DaemonHandle, ServerError> {
-    let mut config = DaemonConfig::new(home_in(dir));
+    let mut config = test_config(dir).await;
     config.quic_bind = Some("127.0.0.1:0".parse().unwrap());
     config.hello_timeout = hello_timeout;
     fld_server::start(config).await
+}
+
+/// The daemon connects to a real, externally managed process host.
+async fn test_config(dir: &Path) -> DaemonConfig {
+    let home = home_in(dir);
+    home.ensure_dirs().unwrap();
+    support::ensure_prochost(home.root()).await;
+    let mut config = DaemonConfig::new(home);
+    config.prochost_executable = None;
+    config
 }
 
 async fn local(d: &DaemonHandle) -> (FrameReader, FrameWriter) {
@@ -399,7 +411,7 @@ async fn runtime_info_describes_the_running_daemon() {
 async fn quic_port_in_use_disables_quic_but_daemon_runs() {
     let dir = tempfile::tempdir().unwrap();
     let blocker = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-    let mut config = DaemonConfig::new(home_in(dir.path()));
+    let mut config = test_config(dir.path()).await;
     config.quic_bind = Some(blocker.local_addr().unwrap());
     let d = fld_server::start(config).await.unwrap();
     assert!(d.quic_addr.is_none());

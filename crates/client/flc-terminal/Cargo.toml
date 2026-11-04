@@ -1,0 +1,22 @@
+[package]
+name = "flc-terminal"
+description = "Flotilla native terminal surface: GPUI cell renderer, keyboard/IME/mouse input, selection, search and links"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+fl-model.workspace = true
+fl-term.workspace = true
+flc-ui.workspace = true
+# Same width table as the engine's alacritty_terminal, so search hits map to
+# the cells the engine actually occupied.
+unicode-width.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+gpui = "0.2.2"
+
+[target.'cfg(not(windows))'.dependencies]
+gpui = { version = "0.2.2", default-features = false }

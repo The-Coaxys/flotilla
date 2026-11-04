@@ -28,6 +28,10 @@ pub struct HostProfile {
     pub device_id: Option<String>,
     /// Remote daemon socket path, e.g. `/root/.flotilla/run/daemon.sock`.
     pub socket_path: Option<String>,
+    /// Whether programs on this host may replace the local clipboard through
+    /// OSC 52: `None` until the user is asked once, then their answer.
+    #[serde(default)]
+    pub clipboard_consent: Option<bool>,
 }
 
 #[cfg(test)]
@@ -55,9 +59,18 @@ mod tests {
             }),
             device_id: Some("dev-1".into()),
             socket_path: Some("/root/.flotilla/run/daemon.sock".into()),
+            clipboard_consent: None,
         };
         let json = serde_json::to_string(&p).unwrap();
         let back: HostProfile = serde_json::from_str(&json).unwrap();
         assert_eq!(p, back);
+
+        // Hosts saved before the clipboard question existed still load, and
+        // load as "not asked yet" rather than as a granted permission.
+        let mut legacy: serde_json::Value = serde_json::from_str(&json).unwrap();
+        legacy.as_object_mut().unwrap().remove("clipboard_consent");
+        let loaded: HostProfile = serde_json::from_value(legacy).unwrap();
+        assert_eq!(loaded.clipboard_consent, None);
+        assert_eq!(loaded, p);
     }
 }

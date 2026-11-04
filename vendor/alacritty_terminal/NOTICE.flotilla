@@ -1,0 +1,13 @@
+Flotilla M1 terminal checkpoint patches (2026-11-03)
+
+Based on alacritty_terminal 0.26.0. Original Apache-2.0/MIT notices and license files remain unchanged.
+
+Modified files: Cargo.toml; src/event.rs; src/grid/mod.rs; src/term/mod.rs; src/term/cell.rs. Added: src/term/snapshot.rs; src/term/snapshot_tests.rs.
+
+Changes: complete logical terminal and grid checkpoint export/import with explicit current and saved cursors on both screens; direct validated restore without event replay; transient damage/listener reconstruction; OSC 7 and OSC 133 metadata; query-time palette capture; corrected keyboard-stack overflow; per-terminal deterministic checked-u64 implicit hyperlink IDs and persisted creation budget.
+
+Live and restore limits: 1024 columns; 512 screen lines; 100000 history lines, further limited so each grid has at most 2097152 cells; 4096 UTF-8 bytes for titles, semantic escape configuration, hyperlink URI and hyperlink ID; 16384 bytes for cwd URI; 16 combining characters per cell; 128 title and keyboard stack entries. Excess title/cwd sequences are ignored, combining characters beyond the limit are ignored, stack overflow drops the oldest entry, and geometry/history configuration is clamped. Oversized semantic escape configuration uses the default configuration. Hyperlink creation charges ID plus URI bytes against a persisted 16777216-byte per-terminal-generation budget; overlong/exhausted links clear the active hyperlink. Implicit ID exhaustion never wraps. Full terminal reset discards both grids/caches, clears shell metadata and starts a fresh hyperlink generation.
+
+Checkpoints retain logical rows including occupied-prefix metadata, both cursor templates/charsets/wrap flags, tabs, margins, mode bits, palette overrides, cursor style, configuration, title/keyboard stacks, hyperlink identity/budget, cwd and prompt phase. Hyperlinks are interned once in a checkpoint-local table and cells use validated integer references; restore shares link allocations rather than allocating a URI per cell. They omit ring allocation/cache position, viewport offset, focus, selection, vi mode/cursor and damage. Restore rebuilds full damage and installs the caller's listener without emitting effects. Callers must enforce a serialized-byte/allocation budget before serde deserialization; semantic validation cannot bound allocations already made by a generic serde decoder.
+
+The source/header comments identify individual patched files. This notice does not replace upstream licensing.

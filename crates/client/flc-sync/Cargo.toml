@@ -1,0 +1,30 @@
+[package]
+name = "flc-sync"
+description = "Flotilla client session sync: terminal mirrors, exactly-once input, layout reconciliation and offline cache"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+fl-model.workspace = true
+fl-proto.workspace = true
+fl-term.workspace = true
+fl-transport.workspace = true
+flc-conn.workspace = true
+postcard.workspace = true
+serde.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+
+# The in-process daemon, process host and SSH server only run on Unix.
+[target.'cfg(unix)'.dev-dependencies]
+fl-prochost-proto.workspace = true
+fl-testkit.workspace = true
+fld-prochost.workspace = true
+fld-server.workspace = true
+tempfile.workspace = true

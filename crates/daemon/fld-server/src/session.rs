@@ -1,15 +1,24 @@
-//! One control session: Hello → (auth) → Welcome, then Ping/Pong and RPCs.
+//! One logical stream. Its first message selects the stream kind:
+//! `Hello` → authenticated control session (Welcome, Ping/Pong, RPCs), or
+//! `BindChannel` → a terminal/bulk channel proven by a one-use session ticket.
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use fl_model::ClientSessionId;
 use fl_proto::{
-    ClientMsg, DaemonInfo, Hello, PRODUCT_VERSION, PROTO, RejectReason, Request, Response,
-    RpcError, ServerMsg, Welcome, build_id,
+    ChannelHello, ChannelReady, ClientMsg, DaemonInfo, Hello, PRODUCT_VERSION, PROTO, RejectReason,
+    Request, Response, RpcError, RpcErrorCode, ServerMsg, Welcome, build_id,
 };
 use fl_transport::conn::{ConnError, FrameReader, FrameWriter};
+use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
+use crate::channels::Channels;
 use crate::devices::DeviceRegistry;
+use crate::terminal::TerminalService;
+
+/// Concurrent RPCs per control session; further requests wait to be read.
+const MAX_INFLIGHT_RPCS: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PeerKind {
@@ -33,6 +42,8 @@ pub struct SessionCtx {
     pub info: InfoSource,
     /// Cancelled when the daemon shuts down; every session then ends.
     pub shutdown: CancellationToken,
+    pub(crate) channels: Arc<Channels>,
+    pub(crate) terminals: Arc<TerminalService>,
 }
 
 /// Allow a best-effort timeout rejection without letting an unresponsive peer
@@ -47,6 +58,11 @@ pub enum SessionEnd {
     HelloTimeout,
 }
 
+enum Opening {
+    Control(Hello),
+    Channel(ChannelHello),
+}
+
 pub async fn serve_connection(
     ctx: Arc<SessionCtx>,
     mut reader: FrameReader,
@@ -54,7 +70,7 @@ pub async fn serve_connection(
     peer: PeerKind,
     hello_deadline: tokio::time::Instant,
 ) -> Result<SessionEnd, ConnError> {
-    let rejection = tokio::select! {
+    let opening = tokio::select! {
         biased;
         _ = ctx.shutdown.cancelled() => return Ok(SessionEnd::Finished),
         _ = tokio::time::sleep_until(hello_deadline) => {
@@ -68,35 +84,81 @@ pub async fn serve_connection(
         }
         result = authenticate(&ctx, &mut reader, peer) => result?,
     };
-    if let Some(reason) = rejection {
-        reject(&mut writer, reason).await?;
-        return Ok(SessionEnd::Finished);
+    match opening {
+        Err(reason) => {
+            reject(&mut writer, reason).await?;
+            Ok(SessionEnd::Finished)
+        }
+        Ok(Opening::Control(hello)) => control(ctx, hello, reader, writer).await,
+        Ok(Opening::Channel(hello)) => {
+            let lease = match ctx.channels.bind(&hello) {
+                Ok(lease) => lease,
+                Err(reason) => {
+                    reject(&mut writer, reason).await?;
+                    return Ok(SessionEnd::Finished);
+                }
+            };
+            writer
+                .send(&ServerMsg::ChannelReady(ChannelReady {
+                    server_session_id: lease.session,
+                    role: lease.role,
+                }))
+                .await?;
+            ctx.terminals
+                .serve_channel(lease, reader, writer)
+                .await
+                .map(|()| SessionEnd::Finished)
+        }
     }
-    let mut server_session_id = [0u8; 16];
-    let _ = getrandom::fill(&mut server_session_id);
+}
+
+async fn control(
+    ctx: Arc<SessionCtx>,
+    hello: Hello,
+    mut reader: FrameReader,
+    mut writer: FrameWriter,
+) -> Result<SessionEnd, ConnError> {
+    let lease = match ctx.channels.register(
+        ClientSessionId::from_bytes(hello.client_session_id),
+        &ctx.shutdown,
+    ) {
+        Ok(lease) => lease,
+        Err(error) => {
+            tracing::warn!("refusing control session: {error}");
+            let _ = writer.shutdown().await;
+            return Ok(SessionEnd::Finished);
+        }
+    };
     writer
         .send(&ServerMsg::Welcome(Welcome {
             daemon_version: PRODUCT_VERSION.to_string(),
             build: build_id().to_string(),
             proto: PROTO,
             hostname: ctx.info.hostname.clone(),
-            server_session_id,
+            server_session_id: lease.id,
         }))
         .await?;
+    let mut rpcs = JoinSet::new();
     loop {
-        let msg = tokio::select! {
-            _ = ctx.shutdown.cancelled() => return Ok(SessionEnd::Finished),
-            m = reader.recv::<ClientMsg>() => m,
-        };
-        match msg {
-            Ok(ClientMsg::Ping { nonce }) => writer.send(&ServerMsg::Pong { nonce }).await?,
-            Ok(ClientMsg::Rpc { id, req }) => {
-                let result = handle_request(&ctx, req);
-                writer.send(&ServerMsg::RpcResult { id, result }).await?;
+        tokio::select! {
+            _ = lease.cancel.cancelled() => return Ok(SessionEnd::Finished),
+            done = rpcs.join_next(), if !rpcs.is_empty() => {
+                if let Some(Ok((id, result))) = done {
+                    writer.send(&ServerMsg::RpcResult { id, result }).await?;
+                }
             }
-            Ok(ClientMsg::Hello(_)) => {} // a repeated Hello is harmless; ignore it
-            Err(ConnError::Closed) => return Ok(SessionEnd::Finished),
-            Err(e) => return Err(e),
+            message = reader.recv::<ClientMsg>(), if rpcs.len() < MAX_INFLIGHT_RPCS => match message {
+                Ok(ClientMsg::Ping { nonce }) => writer.send(&ServerMsg::Pong { nonce }).await?,
+                Ok(ClientMsg::Rpc { id, req }) => {
+                    let ctx = ctx.clone();
+                    let session = lease.id;
+                    rpcs.spawn(async move { (id, handle_request(&ctx, session, req).await) });
+                }
+                // A repeated Hello/BindChannel on a control stream is ignored.
+                Ok(ClientMsg::Hello(_) | ClientMsg::BindChannel(_)) => {}
+                Err(ConnError::Closed) => return Ok(SessionEnd::Finished),
+                Err(e) => return Err(e),
+            },
         }
     }
 }
@@ -105,18 +167,21 @@ async fn authenticate(
     ctx: &SessionCtx,
     reader: &mut FrameReader,
     peer: PeerKind,
-) -> Result<Option<RejectReason>, ConnError> {
+) -> Result<Result<Opening, RejectReason>, ConnError> {
     let hello = match reader.recv::<ClientMsg>().await? {
         ClientMsg::Hello(hello) => hello,
-        _ => return Ok(Some(RejectReason::ExpectedHello)),
+        // The one-use ticket, issued to an authenticated control session,
+        // is the credential; the channel needs no separate Hello.
+        ClientMsg::BindChannel(hello) => return Ok(Ok(Opening::Channel(hello))),
+        _ => return Ok(Err(RejectReason::ExpectedHello)),
     };
     if !PROTO.is_compatible_with(hello.proto) {
-        return Ok(Some(RejectReason::ProtoMismatch { server: PROTO }));
+        return Ok(Err(RejectReason::ProtoMismatch { server: PROTO }));
     }
     if peer == PeerKind::Quic && !token_ok(ctx, &hello).await {
-        return Ok(Some(RejectReason::BadToken));
+        return Ok(Err(RejectReason::BadToken));
     }
-    Ok(None)
+    Ok(Ok(Opening::Control(hello)))
 }
 
 async fn reject(writer: &mut FrameWriter, reason: RejectReason) -> Result<(), ConnError> {
@@ -137,7 +202,12 @@ async fn token_ok(ctx: &SessionCtx, hello: &Hello) -> bool {
         .unwrap_or(false)
 }
 
-fn handle_request(ctx: &SessionCtx, req: Request) -> Result<Response, RpcError> {
+async fn handle_request(
+    ctx: &SessionCtx,
+    session: [u8; 16],
+    req: Request,
+) -> Result<Response, RpcError> {
+    let terminals = &ctx.terminals;
     match req {
         Request::DaemonInfo => Ok(Response::DaemonInfo(DaemonInfo {
             version: PRODUCT_VERSION.to_string(),
@@ -148,6 +218,31 @@ fn handle_request(ctx: &SessionCtx, req: Request) -> Result<Response, RpcError> 
             quic_port: ctx.info.quic_port,
             socket_path: ctx.info.socket_path.clone(),
         })),
+        Request::Capabilities => terminals.capabilities().map(Response::Capabilities),
+        Request::GetLayout => terminals.get_layout().await.map(Response::Layout),
+        Request::ApplyLayout {
+            operation,
+            base_rev,
+            op,
+        } => terminals
+            .apply_layout(operation, base_rev, op)
+            .await
+            .map(Response::Layout),
+        Request::ProcessInfo {
+            terminal,
+            incarnation,
+        } => terminals
+            .process_info(terminal, incarnation)
+            .map(Response::ProcessInfo),
+        Request::ListProcesses => Ok(Response::Processes(terminals.list_processes())),
+        Request::OpenChannel { role } => ctx
+            .channels
+            .grant(session, role)
+            .map(Response::ChannelGrant)
+            .map_err(|error| RpcError {
+                code: RpcErrorCode::InvalidCapability,
+                message: error.to_string(),
+            }),
     }
 }
 

@@ -2,7 +2,7 @@
 use flc_conn::supervisor::ConnPhase;
 use flc_ui::theme::{ActiveTheme, Theme};
 use gpui::prelude::*;
-use gpui::{AnyElement, Context, Div, FontWeight, SharedString, Stateful, div, px};
+use gpui::{AnyElement, Context, Div, FontWeight, SharedString, Stateful, Window, div, px};
 
 use super::titlebar::tone_color;
 use super::{Center, Workspace};
@@ -52,25 +52,88 @@ fn kv(label: &'static str, value: impl Into<SharedString>, t: &Theme) -> impl In
 }
 
 impl Workspace {
-    pub(super) fn render_center(&self, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_center(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        if let Some(index) = self.deferred_connect.take() {
+            self.connect(index, window, cx);
+        }
+        if let Center::Host = self.center
+            && let Some(index) = self.selected
+        {
+            self.ensure_shell(index, window, cx);
+        }
         let t = cx.theme().clone();
         let body: AnyElement = match &self.center {
             Center::AddHost(form) => form.clone().into_any_element(),
+            // A connected host shows its live terminal workspace; the host card
+            // stays available while connecting or when the link has failed.
             Center::Host => match self.selected {
-                Some(i) if i < self.hosts.len() => self.render_host(i, cx).into_any_element(),
+                Some(i) if i < self.hosts.len() => match &self.hosts[i].shell {
+                    Some(shell) => div()
+                        .size_full()
+                        .flex()
+                        .flex_col()
+                        .when_some(self.render_clipboard_request(i, cx), |d, prompt| {
+                            d.child(prompt)
+                        })
+                        .child(div().flex_1().min_h(px(0.)).child(shell.clone()))
+                        .into_any_element(),
+                    None => self.render_host(i, cx).into_any_element(),
+                },
                 _ => self.render_empty(cx).into_any_element(),
             },
             Center::Empty => self.render_empty(cx).into_any_element(),
         };
         div()
             .flex_1()
+            .min_w(px(0.))
             .h_full()
+            .overflow_hidden()
             .flex()
             .items_center()
             .justify_center()
             .bg(t.surface_bg)
             .child(body)
             .into_any_element()
+    }
+
+    /// The one-time OSC 52 question for this host, shown above its terminals.
+    fn render_clipboard_request(&self, index: usize, cx: &mut Context<Self>) -> Option<Div> {
+        let host = &self.hosts[index];
+        let text = host.clipboard_request.as_ref()?;
+        let t = cx.theme().clone();
+        let chars = text.chars().count();
+        Some(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(10.))
+                .px(px(12.))
+                .py(px(8.))
+                .bg(t.chrome_bg)
+                .border_b_1()
+                .border_color(t.border)
+                .child(
+                    div().flex_1().child(SharedString::from(format!(
+                        "A program on {} wants to copy {chars} character{} to your clipboard. Allow programs on this host to set the clipboard?",
+                        host.profile.name,
+                        if chars == 1 { "" } else { "s" },
+                    ))),
+                )
+                .child(
+                    secondary_button("clipboard-deny", "Don't allow", &t).on_click(cx.listener(
+                        move |ws, _, _, cx| ws.answer_clipboard(index, false, cx),
+                    )),
+                )
+                .child(
+                    primary_button("clipboard-allow", "Allow", &t).on_click(cx.listener(
+                        move |ws, _, _, cx| ws.answer_clipboard(index, true, cx),
+                    )),
+                ),
+        )
     }
 
     fn render_empty(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -165,10 +228,9 @@ impl Workspace {
                     .flex()
                     .gap(px(8.))
                     .pt(px(4.))
-                    .child(
-                        secondary_button("reconnect", "Reconnect", &t)
-                            .on_click(cx.listener(move |ws, _, _, cx| ws.connect(index, cx))),
-                    )
+                    .child(secondary_button("reconnect", "Reconnect", &t).on_click(
+                        cx.listener(move |ws, _, window, cx| ws.connect(index, window, cx)),
+                    ))
                     .child(
                         secondary_button("remove", "Remove", &t)
                             .text_color(t.danger)

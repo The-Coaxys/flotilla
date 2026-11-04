@@ -17,6 +17,7 @@ clap.workspace = true
 fl-proto.workspace = true
 fl-transport.workspace = true
 fld-server.workspace = true
+fld-prochost.workspace = true
 libc.workspace = true
 serde.workspace = true
 serde_json.workspace = true

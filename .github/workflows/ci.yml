@@ -34,11 +34,13 @@ jobs:
         with:
           key: daemon
       - name: Format
-        run: cargo fmt --all --check
+        # Without --all: checks every workspace member but not the vendored
+        # Alacritty/VTE path dependencies, which keep upstream's nightly style.
+        run: cargo fmt --check
       - name: Clippy (non-UI crates)
-        run: cargo clippy --locked --workspace --exclude flc-ui --exclude flotilla --all-targets -- -D warnings
+        run: cargo clippy --locked --workspace --exclude flc-ui --exclude flc-terminal --exclude flc-shell --exclude flotilla --all-targets -- -D warnings
       - name: Test (non-UI crates)
-        run: cargo test --locked --workspace --exclude flc-ui --exclude flotilla
+        run: cargo test --locked --workspace --exclude flc-ui --exclude flc-terminal --exclude flc-shell --exclude flotilla
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: 0.14.1
@@ -75,9 +77,9 @@ jobs:
         with:
           key: ui-check
       - name: Clippy (UI crates)
-        run: cargo clippy --locked -p flc-ui -p flotilla --all-targets -- -D warnings
+        run: cargo clippy --locked -p flc-ui -p flc-terminal -p flc-shell -p flotilla --all-targets -- -D warnings
       - name: Test (UI crates)
-        run: cargo test --locked -p flc-ui -p flotilla
+        run: cargo test --locked -p flc-ui -p flc-terminal -p flc-shell -p flotilla
 
   windows:
     name: client — Windows build, self-test, installer
@@ -100,6 +102,9 @@ jobs:
         run: |
           cargo test --locked --target x86_64-pc-windows-msvc -p fl-proto -p fl-transport --lib
           cargo test --locked --target x86_64-pc-windows-msvc -p flotilla --bins
+          cargo test --locked --target x86_64-pc-windows-msvc -p flc-terminal --lib
+          cargo test --locked --target x86_64-pc-windows-msvc -p flc-shell --lib
+          cargo test --locked --target x86_64-pc-windows-msvc -p flc-sync --lib
       - name: Build flotilla.exe (daemons embedded)
         shell: pwsh
         env:
@@ -216,7 +221,10 @@ jobs:
         run: |
           set -euo pipefail
           if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
-            gh release create "$GITHUB_REF_NAME" upload/* --title "Flotilla $GITHUB_REF_NAME" --generate-notes
+            # A tag with a pre-release suffix (v0.2.0-rc.1) publishes a pre-release.
+            prerelease=()
+            [[ "$GITHUB_REF_NAME" == *-* ]] && prerelease=(--prerelease)
+            gh release create "$GITHUB_REF_NAME" upload/* --title "Flotilla $GITHUB_REF_NAME" --generate-notes "${prerelease[@]}"
           else
             gh release delete nightly --yes --cleanup-tag || true
             gh release create nightly upload/* --prerelease --target "$GITHUB_SHA" \

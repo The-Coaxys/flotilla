@@ -93,19 +93,62 @@ mod tests {
         );
     }
 
+    /// A payload above the compression threshold, incompressible and far
+    /// larger than the duplex buffer, must arrive intact.
+    #[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    struct Blob {
+        data: Vec<u8>,
+    }
+
+    impl WireMessage for Blob {
+        const KIND: u16 = 0x7f01;
+    }
+
+    /// Deterministic bytes that zstd cannot shrink (xorshift64).
+    fn noise(n: usize) -> Vec<u8> {
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        (0..n)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x as u8
+            })
+            .collect()
+    }
+
     #[tokio::test]
-    async fn large_message_survives_compression() {
+    async fn large_incompressible_message_survives_backpressure() {
         let ((_ar, mut aw), (mut br, _bw)) = pipe();
-        let big = ClientMsg::Hello(fl_proto::Hello {
-            client_version: "x".repeat(200_000),
+        let big = Blob {
+            data: noise(200_000),
+        };
+        let send = tokio::spawn(async move { aw.send(&big).await.map(|_| big) });
+        let got = tokio::time::timeout(std::time::Duration::from_secs(5), br.recv::<Blob>())
+            .await
+            .expect("frame did not arrive")
+            .unwrap();
+        assert_eq!(got, send.await.unwrap().unwrap());
+    }
+
+    /// Payload validation happens before a single byte is written, so a peer
+    /// that rejects a message cannot leave the other side waiting for a frame.
+    #[tokio::test]
+    async fn invalid_payload_is_rejected_before_any_bytes_are_written() {
+        let ((_ar, mut aw), (mut br, _bw)) = pipe();
+        let too_long = ClientMsg::Hello(fl_proto::Hello {
+            client_version: "x".repeat(fl_proto::validation::MAX_TEXT_BYTES + 1),
             proto: fl_proto::PROTO,
             device_id: None,
             token: None,
             client_session_id: [0; 16],
         });
-        let send = tokio::spawn(async move { aw.send(&big).await.map(|_| big) });
-        let got = br.recv::<ClientMsg>().await.unwrap();
-        assert_eq!(got, send.await.unwrap().unwrap());
+        assert!(matches!(aw.send(&too_long).await, Err(ConnError::Msg(_))));
+        aw.shutdown().await.unwrap();
+        assert!(matches!(
+            br.recv::<ClientMsg>().await,
+            Err(ConnError::Closed)
+        ));
     }
 
     #[tokio::test]

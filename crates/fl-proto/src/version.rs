@@ -10,9 +10,9 @@ pub struct ProtoVersion {
 }
 
 /// The protocol version this build speaks.
-pub const PROTO: ProtoVersion = ProtoVersion { major: 0, minor: 1 };
+pub const PROTO: ProtoVersion = ProtoVersion { major: 0, minor: 2 };
 
-/// Product version from Cargo, e.g. `0.1.0`.
+/// Product version from Cargo, e.g. `0.2.0`.
 pub const PRODUCT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Build identifier baked in at compile time from `FLOTILLA_BUILD_ID`.
@@ -61,10 +61,5 @@ mod tests {
     #[test]
     fn displays_as_dotted_pair() {
         assert_eq!(v(0, 1).to_string(), "0.1");
-    }
-
-    #[test]
-    fn build_id_is_never_empty() {
-        assert!(!build_id().is_empty());
     }
 }

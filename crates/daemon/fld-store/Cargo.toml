@@ -1,0 +1,25 @@
+[package]
+name = "fld-store"
+description = "Transactional layouts and crash-safe terminal checkpoints"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+fl-model.workspace = true
+fl-prochost-proto.workspace = true
+fl-term.workspace = true
+hex.workspace = true
+libc.workspace = true
+postcard.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+sha2.workspace = true
+smallvec.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+fld-prochost.workspace = true
