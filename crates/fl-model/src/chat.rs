@@ -470,9 +470,7 @@ pub fn search_text(event: &ChatEvent) -> String {
                 text.push(&path.to_string_lossy());
                 text.bounded(unified_diff);
             }
-            ChatEvent::ApprovalRequest {
-                tool, details, ..
-            } => {
+            ChatEvent::ApprovalRequest { tool, details, .. } => {
                 text.push(tool);
                 text.bounded(details);
             }
@@ -505,4 +503,3 @@ pub fn search_text(event: &ChatEvent) -> String {
     walk(&mut text, event, 0);
     text.0
 }
-

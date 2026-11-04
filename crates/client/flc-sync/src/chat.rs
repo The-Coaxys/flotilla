@@ -78,15 +78,10 @@ impl ChatState {
 
     /// Adopt the authoritative session list of one worktree, forgetting
     /// sessions (and their events) that the daemon no longer has.
-    pub fn replace_worktree_sessions(
-        &mut self,
-        worktree: WorktreeId,
-        incoming: Vec<ChatSession>,
-    ) {
+    pub fn replace_worktree_sessions(&mut self, worktree: WorktreeId, incoming: Vec<ChatSession>) {
         let live: Vec<uuid::Uuid> = incoming.iter().map(|session| session.id).collect();
-        self.sessions.retain(|id, session| {
-            session.worktree != worktree || live.contains(id)
-        });
+        self.sessions
+            .retain(|id, session| session.worktree != worktree || live.contains(id));
         self.events.retain(|id, _| self.sessions.contains_key(id));
         for session in incoming {
             self.merge_session(session);
@@ -139,9 +134,7 @@ impl ChatState {
         if list.len() > MAX_MIRRORED_EVENTS {
             list.drain(..list.len() - MAX_MIRRORED_EVENTS);
         }
-        if appended
-            && let Some(session) = self.sessions.get_mut(&page.session)
-        {
+        if appended && let Some(session) = self.sessions.get_mut(&page.session) {
             let newest = list.last().map(|event| event.sequence).unwrap_or(0);
             if newest > session.seq {
                 session.seq = newest;
@@ -179,10 +172,7 @@ impl ChatState {
     }
 }
 
-pub(crate) fn update(
-    state: &watch::Sender<Arc<ChatState>>,
-    f: impl FnOnce(&mut ChatState),
-) {
+pub(crate) fn update(state: &watch::Sender<Arc<ChatState>>, f: impl FnOnce(&mut ChatState)) {
     state.send_if_modified(|current| {
         let mut next = (**current).clone();
         f(&mut next);
@@ -225,7 +215,10 @@ pub(crate) async fn run(
     shutdown: CancellationToken,
 ) {
     loop {
-        let link = links.borrow_and_update().clone().filter(|link| !link.is_closed());
+        let link = links
+            .borrow_and_update()
+            .clone()
+            .filter(|link| !link.is_closed());
         if let Some(link) = link {
             let mut events = link.events();
             if supports_chat(link.daemon_proto()) {
@@ -286,9 +279,7 @@ async fn follow_event(
             fetch_missing(link, state, id).await;
         }
         DaemonEvent::ChatEventAppended {
-            session,
-            worktree,
-            ..
+            session, worktree, ..
         } => {
             let known = state.borrow().sessions.contains_key(&session);
             if !known {
@@ -405,9 +396,7 @@ async fn resync(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fl_model::chat::{
-        ChatEvent, PermissionMode, SessionState, StatusSource, TextUpdate,
-    };
+    use fl_model::chat::{ChatEvent, PermissionMode, SessionState, StatusSource, TextUpdate};
     use uuid::Uuid;
 
     fn session(worktree: WorktreeId, seq: u64) -> ChatSession {
@@ -449,7 +438,9 @@ mod tests {
         ChatEventPage {
             session,
             incarnation: Uuid::new_v4(),
-            events: sequences.map(|sequence| record(session, sequence)).collect(),
+            events: sequences
+                .map(|sequence| record(session, sequence))
+                .collect(),
             more,
         }
     }

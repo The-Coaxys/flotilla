@@ -19,6 +19,7 @@ use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::Duration;
 
+pub use chat::{ChatState, MergeError};
 use fl_model::forge::{ForgeState, MergeMethod};
 use fl_model::layout::LayoutOp;
 use fl_model::sections::{SectionMutation, SectionsState};
@@ -34,7 +35,6 @@ use fl_proto::{Request, Response};
 use flc_conn::broker::{ControlLink, RpcCallError};
 pub use input::{Discard, DiscardReason};
 pub use layout::{LayoutApplyError, LayoutTicket, PendingLayoutOp, WorkspaceState};
-pub use chat::{ChatState, MergeError};
 pub use mirror::{EndReason, MirrorEvent, MirrorHandle, MirrorState, MirrorStatus};
 use tokio::runtime::Handle;
 use tokio::sync::{broadcast, mpsc, watch};

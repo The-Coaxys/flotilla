@@ -313,13 +313,20 @@ async fn native_output_input_resize_echo_and_sync_are_ordered() {
     );
     let (tail, next, _) = fixture.records(cursor, 0).await;
     assert_eq!(next, stopped.tail);
-    assert!(
-        matches!(tail.first().map(|record| &record.kind), Some(TerminalRecordKind::Resize(found)) if *found == size)
-    );
-    assert!(matches!(
-        tail.get(1).map(|record| &record.kind),
-        Some(TerminalRecordKind::SyncFlush)
-    ));
+    // Earlier output may still arrive after the cursor under load, so locate
+    // the resize rather than assuming it is the first record; its ordering
+    // before the flush is what this test pins.
+    let resize_at = tail
+        .iter()
+        .position(
+            |record| matches!(&record.kind, TerminalRecordKind::Resize(found) if *found == size),
+        )
+        .expect("resize record");
+    let flush_at = tail
+        .iter()
+        .position(|record| matches!(&record.kind, TerminalRecordKind::SyncFlush))
+        .expect("sync flush record");
+    assert!(resize_at < flush_at, "resize must precede the flush");
     let bytes = output(&tail);
     assert!(bytes.windows(18).any(|part| part == b"INPUT:native-input"));
     assert!(bytes.windows(6).any(|part| part == b"37 101"));

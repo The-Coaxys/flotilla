@@ -388,12 +388,7 @@ impl Database {
 
     /// Page durable events from `from` (inclusive). `more` means at least one
     /// later event exists; the page is additionally bounded by encoded bytes.
-    pub fn chat_event_page(
-        &self,
-        id: uuid::Uuid,
-        from: u64,
-        limit: u16,
-    ) -> Result<ChatEventPage> {
+    pub fn chat_event_page(&self, id: uuid::Uuid, from: u64, limit: u16) -> Result<ChatEventPage> {
         let transaction = self.connection.unchecked_transaction()?;
         let _ = load_chat(&transaction, id)?
             .ok_or_else(|| StoreError::Missing("chat session not found".into()))?;
@@ -600,11 +595,7 @@ impl Database {
     }
 
     /// Add one inbox card for a session. `dedupe` makes replays idempotent.
-    pub fn add_chat_inbox(
-        &mut self,
-        session: uuid::Uuid,
-        item: NewInboxItem,
-    ) -> Result<()> {
+    pub fn add_chat_inbox(&mut self, session: uuid::Uuid, item: NewInboxItem) -> Result<()> {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -718,10 +709,7 @@ impl Database {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let changed = transaction.execute(
             "UPDATE chat_sessions SET resume=?2 WHERE id=?1",
-            params![
-                id.as_bytes().as_slice(),
-                postcard::to_stdvec(resume)?
-            ],
+            params![id.as_bytes().as_slice(), postcard::to_stdvec(resume)?],
         )?;
         if changed == 0 {
             return Err(StoreError::Missing("chat session not found".into()));
@@ -826,7 +814,11 @@ fn validate_session(session: &ChatSession) -> Result<()> {
 }
 
 fn validate_resume(resume: &ResumeTarget) -> Result<()> {
-    validate_chat_text("resume provider", &resume.provider_id, MAX_CHAT_PROVIDER_BYTES)?;
+    validate_chat_text(
+        "resume provider",
+        &resume.provider_id,
+        MAX_CHAT_PROVIDER_BYTES,
+    )?;
     let native = &resume.native_id;
     if native.is_empty() || native.len() > 512 {
         return Err(StoreError::Invalid(
@@ -837,7 +829,9 @@ fn validate_resume(resume: &ResumeTarget) -> Result<()> {
         return Err(StoreError::Invalid("resume cwd is not UTF-8".into()));
     }
     if postcard::to_stdvec(resume)?.len() > MAX_CHAT_RESUME_BYTES {
-        return Err(StoreError::Invalid("resume target exceeds byte limit".into()));
+        return Err(StoreError::Invalid(
+            "resume target exceeds byte limit".into(),
+        ));
     }
     Ok(())
 }
@@ -937,12 +931,13 @@ fn decode_session(row: &Row<'_>) -> rusqlite::Result<Result<ChatSession>> {
             model: row.get(6)?,
             thinking: row.get(7)?,
             permission_mode: postcard::from_bytes(&permission)?,
-            resume: resume.map(|bytes| postcard::from_bytes(&bytes)).transpose()?,
+            resume: resume
+                .map(|bytes| postcard::from_bytes(&bytes))
+                .transpose()?,
             seq: sequence_u64(&sequence)?,
             created_ms: u64::try_from(created)
                 .map_err(|_| corrupt("negative chat creation time"))?,
-            updated_ms: u64::try_from(updated)
-                .map_err(|_| corrupt("negative chat update time"))?,
+            updated_ms: u64::try_from(updated).map_err(|_| corrupt("negative chat update time"))?,
         })
     })())
 }
@@ -960,8 +955,7 @@ fn decode_inbox(row: &Row<'_>) -> rusqlite::Result<Result<InboxItem>> {
             kind: inbox_kind(row.get::<_, i64>(3)?)?,
             state: inbox_state(row.get::<_, i64>(4)?)?,
             title: row.get(5)?,
-            created_ms: u64::try_from(created)
-                .map_err(|_| corrupt("negative inbox time"))?,
+            created_ms: u64::try_from(created).map_err(|_| corrupt("negative inbox time"))?,
         })
     })())
 }
@@ -994,11 +988,7 @@ fn load_inbox(connection: &Connection, id: uuid::Uuid) -> Result<Option<InboxIte
 }
 
 fn to_sqlite(error: StoreError) -> rusqlite::Error {
-    rusqlite::Error::FromSqlConversionFailure(
-        0,
-        rusqlite::types::Type::Blob,
-        Box::new(error),
-    )
+    rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Blob, Box::new(error))
 }
 
 fn chat_incarnation(connection: &Connection, id: uuid::Uuid) -> Result<uuid::Uuid> {
@@ -1181,11 +1171,7 @@ fn inbox_state(code: i64) -> Result<InboxState> {
 fn fts_phrase(query: &str) -> String {
     let mut phrase = String::new();
     for term in query.split_whitespace().take(16) {
-        let term: String = term
-            .chars()
-            .filter(|c| !c.is_control())
-            .take(64)
-            .collect();
+        let term: String = term.chars().filter(|c| !c.is_control()).take(64).collect();
         if term.is_empty() {
             continue;
         }
@@ -1251,7 +1237,10 @@ mod tests {
             .execute(
                 "INSERT INTO projects(id,workspace,name,path,kind,default_branch,worktree_root,ord)
                  VALUES(?1,?2,'repo','/repo','git','main','/root',0)",
-                params![project.as_bytes().as_slice(), workspace.as_bytes().as_slice()],
+                params![
+                    project.as_bytes().as_slice(),
+                    workspace.as_bytes().as_slice()
+                ],
             )
             .unwrap();
         // Every project has exactly one primary checkout; the chat session
@@ -1335,7 +1324,10 @@ mod tests {
         append(&mut db, id, record(id, incarnation, 1)).unwrap();
         append(&mut db, id, record(id, incarnation, 2)).unwrap();
         let gap = append(&mut db, id, record(id, incarnation, 4)).unwrap_err();
-        assert!(matches!(&gap, StoreError::Invalid(message) if message.contains("gap")), "{gap:?}");
+        assert!(
+            matches!(&gap, StoreError::Invalid(message) if message.contains("gap")),
+            "{gap:?}"
+        );
         drop(db);
         let db = Database::open(dir.path()).unwrap();
         let stored = db.chat_session(id).unwrap();

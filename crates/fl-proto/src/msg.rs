@@ -555,11 +555,7 @@ impl Request {
             Self::ListChatSessions { worktree } => {
                 validation::non_nil_id("chat worktree", worktree.as_bytes())
             }
-            Self::GetChatEvents {
-                session,
-                limit,
-                ..
-            } => {
+            Self::GetChatEvents { session, limit, .. } => {
                 validation::non_nil("chat session", *session)?;
                 if *limit == 0 {
                     return Err(ValidationError::Invalid("chat page limit"));
@@ -588,19 +584,21 @@ impl Request {
                     return Err(ValidationError::Invalid("chat provider"));
                 }
                 for value in [model, thinking].into_iter().flatten() {
-                    text(
-                        "chat setting",
-                        value,
-                        validation::MAX_CHAT_MODEL_BYTES,
-                    )?;
+                    text("chat setting", value, validation::MAX_CHAT_MODEL_BYTES)?;
                 }
                 if let Some(resume) = resume {
                     validation::chat_resume(resume)?;
                 }
                 Ok(())
             }
-            Self::SendChat { session, text: value }
-            | Self::SteerChat { session, text: value } => {
+            Self::SendChat {
+                session,
+                text: value,
+            }
+            | Self::SteerChat {
+                session,
+                text: value,
+            } => {
                 validation::non_nil("chat session", *session)?;
                 if value.trim().is_empty() {
                     return Err(ValidationError::Invalid("empty chat message"));

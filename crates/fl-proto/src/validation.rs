@@ -280,7 +280,11 @@ pub(crate) fn non_nil_id(field: &'static str, value: &[u8; 16]) -> Result<(), Va
 }
 
 pub fn chat_resume(value: &fl_model::chat::ResumeTarget) -> Result<(), ValidationError> {
-    text("resume provider", &value.provider_id, MAX_CHAT_PROVIDER_BYTES)?;
+    text(
+        "resume provider",
+        &value.provider_id,
+        MAX_CHAT_PROVIDER_BYTES,
+    )?;
     if value.provider_id.trim().is_empty() {
         return Err(ValidationError::Invalid("resume provider"));
     }
@@ -293,11 +297,7 @@ pub fn chat_resume(value: &fl_model::chat::ResumeTarget) -> Result<(), Validatio
 
 pub fn chat_session(value: &fl_model::chat::ChatSession) -> Result<(), ValidationError> {
     non_nil("chat session", value.id)?;
-    text(
-        "chat provider",
-        &value.provider,
-        MAX_CHAT_PROVIDER_BYTES,
-    )?;
+    text("chat provider", &value.provider, MAX_CHAT_PROVIDER_BYTES)?;
     if value.provider.trim().is_empty() {
         return Err(ValidationError::Invalid("chat provider"));
     }
@@ -318,7 +318,11 @@ pub fn chat_session(value: &fl_model::chat::ChatSession) -> Result<(), Validatio
 }
 
 fn chat_event_text(value: &fl_model::chat::BoundedText) -> Result<(), ValidationError> {
-    text("chat event text", &value.text, fl_model::chat::MAX_CHAT_TEXT)
+    text(
+        "chat event text",
+        &value.text,
+        fl_model::chat::MAX_CHAT_TEXT,
+    )
 }
 
 pub fn chat_event(value: &fl_model::chat::EventRecord) -> Result<(), ValidationError> {
@@ -335,17 +339,13 @@ pub fn chat_event(value: &fl_model::chat::EventRecord) -> Result<(), ValidationE
     chat_content(&value.event, 0)
 }
 
-fn chat_content(
-    event: &fl_model::chat::ChatEvent,
-    depth: usize,
-) -> Result<(), ValidationError> {
+fn chat_content(event: &fl_model::chat::ChatEvent, depth: usize) -> Result<(), ValidationError> {
     use fl_model::chat::ChatEvent;
     if depth > MAX_CHAT_EVENT_DEPTH {
         return Err(ValidationError::Invalid("chat event nesting"));
     }
-    let event_text = |field: &'static str, value: &str| {
-        text(field, value, fl_model::chat::MAX_CHAT_TEXT)
-    };
+    let event_text =
+        |field: &'static str, value: &str| text(field, value, fl_model::chat::MAX_CHAT_TEXT);
     match event {
         ChatEvent::SessionReady(info) => {
             non_nil("chat session", info.id)?;
@@ -392,10 +392,7 @@ fn chat_content(
             event_text("tool id", id)?;
             chat_event_text(delta)
         }
-        ChatEvent::FileEdit {
-            path,
-            unified_diff,
-        } => {
+        ChatEvent::FileEdit { path, unified_diff } => {
             event_text("chat path", &path.to_string_lossy())?;
             chat_event_text(unified_diff)
         }
@@ -432,7 +429,10 @@ fn chat_content(
             Ok(())
         }
         ChatEvent::RequestResolved { id } => event_text("approval id", id),
-        ChatEvent::Subagent { parent_tool_id, events } => {
+        ChatEvent::Subagent {
+            parent_tool_id,
+            events,
+        } => {
             event_text("subagent tool id", parent_tool_id)?;
             bound("subagent events", events.len(), MAX_CHAT_EVENT_ITEMS)?;
             for event in events {
@@ -487,11 +487,7 @@ pub fn chat_events(value: &fl_model::chat::ChatEventPage) -> Result<(), Validati
 }
 
 pub fn chat_hits(values: &[fl_model::chat::ChatHit]) -> Result<(), ValidationError> {
-    bound(
-        "chat hits",
-        values.len(),
-        fl_model::chat::MAX_CHAT_HISTORY,
-    )?;
+    bound("chat hits", values.len(), fl_model::chat::MAX_CHAT_HISTORY)?;
     for hit in values {
         non_nil("chat session", hit.session)?;
         text("chat snippet", &hit.snippet, fl_model::chat::MAX_CHAT_TEXT)?;
@@ -516,9 +512,7 @@ pub fn inbox_items(values: &[fl_model::chat::InboxItem]) -> Result<(), Validatio
     Ok(())
 }
 
-pub fn question_response(
-    value: &fl_model::chat::QuestionResponse,
-) -> Result<(), ValidationError> {
+pub fn question_response(value: &fl_model::chat::QuestionResponse) -> Result<(), ValidationError> {
     bound("answers", value.answers.len(), MAX_CHAT_ANSWERS)?;
     for (question, answers) in &value.answers {
         text("answer question", question, MAX_CHAT_ANSWER_BYTES)?;
@@ -532,7 +526,6 @@ pub fn question_response(
     }
     Ok(())
 }
-
 
 /// A routed dispatch carries its rendered prompt; bound it like a message.
 pub fn task_dispatch(value: &fl_model::routing::TaskDispatch) -> Result<(), ValidationError> {
