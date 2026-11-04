@@ -9,7 +9,7 @@ use fl_model::workspace::{ChangeKind, WorktreeStatus};
 use fl_proto::{Request, Response};
 use uuid::Uuid;
 
-use super::{resolve_worktree, unexpected};
+use super::{find_worktree, resolve_worktree, tree, unexpected};
 use crate::cli::{Cli, ReviewOriginArg, ReviewStatusArg, WorktreeCommand};
 use crate::client::DaemonClient;
 use crate::error::CliError;
@@ -49,7 +49,144 @@ pub async fn run(
         WorktreeCommand::SetTargetBranch { branch, clear } => {
             set_target_branch(client, reporter, cli, branch.as_deref(), *clear).await
         }
+        WorktreeCommand::EnsureChild { repo } => {
+            ensure_child(client, reporter, cli, repo.as_deref()).await
+        }
+        WorktreeCommand::GroupDiff => group_diff(client, reporter, cli).await,
     }
+}
+
+/// The worktree a project selector names: a project's primary checkout, else
+/// a worktree id, label or path.
+async fn resolve_group_root(
+    client: &mut DaemonClient,
+    needle: &str,
+) -> Result<fl_model::workspace::Worktree, CliError> {
+    let tree = tree(client).await?;
+    let projects: Vec<_> = tree
+        .projects
+        .iter()
+        .filter(|project| {
+            project.name == needle
+                || project.path == needle
+                || project.name.eq_ignore_ascii_case(needle)
+        })
+        .collect();
+    match projects.as_slice() {
+        [project] => tree
+            .worktrees
+            .iter()
+            .find(|worktree| worktree.project == project.id && worktree.is_primary)
+            .cloned()
+            .ok_or_else(|| {
+                CliError::not_found(format!("project {} has no primary worktree", project.name))
+            }),
+        [] => find_worktree(&tree, needle),
+        many => Err(CliError::invalid(format!(
+            "`{needle}` matches {} projects; use a worktree id: {}",
+            many.len(),
+            many.iter()
+                .map(|project| project.name.clone())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))),
+    }
+}
+
+async fn ensure_child(
+    client: &mut DaemonClient,
+    reporter: &Reporter,
+    cli: &Cli,
+    repo: Option<&str>,
+) -> Result<(), CliError> {
+    let root = match repo {
+        Some(needle) => resolve_group_root(client, needle).await?,
+        None => resolve_worktree(client, cli).await?.0,
+    };
+    let child = match client
+        .rpc(Request::EnsureWorktreeChild { worktree: root.id })
+        .await?
+    {
+        Response::WorktreeChild(child) => child,
+        other => return Err(unexpected("worktree child", &other)),
+    };
+    if reporter.json {
+        return reporter.value(&serde_json::json!({
+            "root": root,
+            "created": child.created,
+            "worktree": child.worktree,
+            "shared": child.shared,
+        }));
+    }
+    reporter.text(format!(
+        "{} branch-group child {} [{}] at {}",
+        if child.created { "created" } else { "reused" },
+        child.worktree.label,
+        child.worktree.branch.as_deref().unwrap_or("(detached)"),
+        child.worktree.path
+    ));
+    reporter.text(format!(
+        "shared context: {} present, {} missing",
+        child.shared.present.len(),
+        child.shared.missing.len()
+    ));
+    for present in &child.shared.present {
+        reporter.text(format!("  present {present}"));
+    }
+    for missing in &child.shared.missing {
+        reporter.text(format!("  missing {missing}"));
+    }
+    Ok(())
+}
+
+async fn group_diff(
+    client: &mut DaemonClient,
+    reporter: &Reporter,
+    cli: &Cli,
+) -> Result<(), CliError> {
+    let (worktree, _project) = resolve_worktree(client, cli).await?;
+    let diff = match client
+        .rpc(Request::WorktreeGroupDiff {
+            worktree: worktree.id,
+        })
+        .await?
+    {
+        Response::GroupDiff(diff) => diff,
+        other => return Err(unexpected("group diff", &other)),
+    };
+    if reporter.json {
+        return reporter.value(&serde_json::json!({
+            "worktree": worktree,
+            "diff": diff,
+        }));
+    }
+    reporter.text(format!(
+        "branch group {} against {}: {}+ {}-  {} changed file(s)",
+        diff.group.label,
+        diff.group.base.as_deref().unwrap_or("(no base)"),
+        diff.added,
+        diff.removed,
+        diff.changed_files
+    ));
+    for child in &diff.children {
+        reporter.text(format!(
+            "  {}{} [{}] {}+ {}-  {} file(s){}",
+            if child.is_root { "* " } else { "  " },
+            child.label,
+            child.branch.as_deref().unwrap_or("(detached)"),
+            child.added,
+            child.removed,
+            child.files.len(),
+            if child.conflicted {
+                "  conflicted"
+            } else if child.dirty {
+                "  dirty"
+            } else {
+                ""
+            }
+        ));
+    }
+    Ok(())
 }
 
 async fn worktree_status(

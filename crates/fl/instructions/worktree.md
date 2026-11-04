@@ -27,6 +27,26 @@ fl worktree set-target-branch --clear
 real git operation, not a display setting. The target branch is the merge base
 for diffs and status; clearing it falls back to the project default.
 
+## Branch groups and shared context
+
+A branch group is one root worktree plus one lazily created child. The root
+holds `FEATURE.md`, `AGENTS.md`/`CLAUDE.md` and a `context/` directory; creating
+the child copies that context into it, and grouped diffs compare every member
+against the group base (the root's target, else the project default).
+
+```sh
+fl worktree ensure-child --json            # caller becomes the root
+fl worktree ensure-child my-project --json # a project's primary checkout
+fl worktree group-diff --json              # repository summary + per child
+```
+
+`ensure-child` is idempotent: a second call returns the existing child with
+`created: false`. The first call writes a `FEATURE.md` template, a guidance
+`AGENTS.md` (unless `AGENTS.md`/`CLAUDE.md` exists) and `context/` into the
+root when they are missing, then copies everything into the child without
+overwriting a file that is already there. An edit made in a child is part of
+the group diff.
+
 ## Reviews
 
 Reviews are app-managed threads anchored to a file or an inclusive 1-based
@@ -60,6 +80,7 @@ parse errors and the configured targets without running anything.
 
 ## Not implemented in this build
 
-`worktree select|close|delete|open|create|ensure-child|review-checklist` are
-not implemented. Deleting or creating worktrees is refused with a clear
-message instead of a partial action.
+`worktree select|close|open|create|review-checklist` are not implemented.
+They are refused with a clear message instead of a partial action. Worktrees
+are created from the client or by `worktree ensure-child`; deletion is a
+client action because it needs the force decision.

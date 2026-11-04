@@ -1050,3 +1050,221 @@ async fn team_runs_coordination_locks_hooks_and_instructions() {
 
     fixture.shutdown().await;
 }
+/// Custom commands, prompt templates and branch groups through the built
+/// `fl` binary: create/get/update/delete/list, duplicate and invalid
+/// refusals that exit non-zero, durability across a daemon restart, and the
+/// shared context plus grouped diff of a lazily created child.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn commands_templates_and_branch_groups_are_durable() {
+    let mut fixture = Fixture::new().await;
+
+    // Create at the caller's project scope (the default) and globally.
+    let created = fixture
+        .fl_json(&[
+            "commands",
+            "create",
+            "deploy",
+            "--body",
+            "Ship {{branch}} to {{base}}",
+            "--description",
+            "Ship the branch",
+            "--json",
+        ])
+        .await;
+    assert_eq!(created["action"], "created");
+    assert_eq!(created["rev"], 1);
+    let global = fixture
+        .fl_json(&[
+            "commands",
+            "create",
+            "audit",
+            "--body",
+            "Audit {{branch}}",
+            "--scope",
+            "global",
+            "--json",
+        ])
+        .await;
+    assert_eq!(global["rev"], 2);
+
+    let listed = fixture.fl_json(&["commands", "list", "--json"]).await;
+    let names: Vec<&str> = listed["commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|command| command["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, vec!["audit", "deploy"], "{listed}");
+    assert_eq!(listed["scope"], "the caller");
+
+    let got = fixture
+        .fl_json(&["commands", "get", "deploy", "--json"])
+        .await;
+    assert_eq!(got["command"]["body"], "Ship {{branch}} to {{base}}");
+    assert_eq!(
+        got["command"]["scope"]["Project"].as_str().unwrap(),
+        fixture.project.to_string()
+    );
+
+    // Duplicate and invalid definitions are refusals, not silent upserts.
+    let duplicate = fixture
+        .fl(&["commands", "create", "deploy", "--body", "again", "--json"])
+        .await;
+    assert!(!duplicate.status.success());
+    let duplicate_json: Value = serde_json::from_slice(&duplicate.stdout).unwrap();
+    assert_eq!(duplicate_json["error"]["code"], "invalid_argument");
+    assert!(
+        duplicate_json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("already exists"),
+        "{duplicate_json}"
+    );
+    let invalid = fixture
+        .fl(&["commands", "create", "bad name", "--body", "x", "--json"])
+        .await;
+    assert!(!invalid.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&invalid.stdout).unwrap()["error"]["code"],
+        "invalid_argument"
+    );
+    let unknown = fixture.fl(&["commands", "get", "absent", "--json"]).await;
+    assert!(!unknown.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&unknown.stdout).unwrap()["error"]["code"],
+        "not_found"
+    );
+
+    // Update and delete prove their durable effect through a restart.
+    let updated = fixture
+        .fl_json(&[
+            "commands",
+            "update",
+            "deploy",
+            "--body",
+            "Ship {{branch}} now",
+            "--json",
+        ])
+        .await;
+    assert_eq!(updated["rev"], 3);
+    let after_update = fixture
+        .fl_json(&["commands", "get", "deploy", "--json"])
+        .await;
+    assert_eq!(after_update["command"]["body"], "Ship {{branch}} now");
+
+    // --- prompt templates at every scope --------------------------------
+    let template = fixture
+        .fl_json(&[
+            "prompt-template",
+            "set",
+            "fix_ci",
+            "--body",
+            "Fix {{branch}} checks",
+            "--scope",
+            "global",
+            "--json",
+        ])
+        .await;
+    assert_eq!(template["action"], "fix_ci");
+    let templates = fixture
+        .fl_json(&["prompt-template", "list", "--json"])
+        .await;
+    assert_eq!(templates["templates"].as_array().unwrap().len(), 1);
+    let effective = fixture
+        .fl_json(&["prompt-template", "get", "fix_ci", "--json"])
+        .await;
+    assert_eq!(effective["template"], "Fix {{branch}} checks");
+    assert_eq!(effective["stored"], true);
+    let bad_action = fixture
+        .fl(&["prompt-template", "set", "nope", "--body", "x", "--json"])
+        .await;
+    assert!(!bad_action.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&bad_action.stdout).unwrap()["error"]["code"],
+        "invalid_argument"
+    );
+
+    // --- branch group: shared context and grouped diff -------------------
+    let child = fixture
+        .fl_json(&["worktree", "ensure-child", "--json"])
+        .await;
+    assert_eq!(child["created"], true);
+    assert_eq!(child["root"]["is_primary"], true);
+    let child_path = PathBuf::from(string(&child["worktree"], "path"));
+    for name in ["FEATURE.md", "AGENTS.md"] {
+        assert!(
+            child_path.join(name).is_file(),
+            "{name} missing from {}",
+            child_path.display()
+        );
+    }
+    assert!(child_path.join("context").is_dir());
+    assert!(child["shared"]["missing"].as_array().unwrap().is_empty());
+
+    let again = fixture
+        .fl_json(&["worktree", "ensure-child", "--json"])
+        .await;
+    assert_eq!(again["created"], false);
+    assert_eq!(again["worktree"]["id"], child["worktree"]["id"]);
+
+    // A child edit lands in the grouped diff.
+    std::fs::write(child_path.join("FEATURE.md"), "# Feature\nlocal\n").unwrap();
+    std::fs::write(child_path.join("extra.txt"), "a\nb\n").unwrap();
+    let diff = fixture.fl_json(&["worktree", "group-diff", "--json"]).await;
+    let child_id = string(&child["worktree"], "id");
+    let entry = diff["diff"]["children"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["worktree"] == serde_json::json!(child_id))
+        .expect("child in group diff");
+    let paths: Vec<&str> = entry["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|file| file["path"].as_str().unwrap())
+        .collect();
+    assert!(paths.contains(&"extra.txt"), "{paths:?}");
+    assert!(paths.contains(&"FEATURE.md"), "{paths:?}");
+    assert!(diff["diff"]["changed_files"].as_u64().unwrap() >= 2);
+    assert_eq!(diff["diff"]["group"]["base"], "main");
+
+    // --- restart: commands and templates survive ------------------------
+    fixture.restart().await;
+    let listed = fixture.fl_json(&["commands", "list", "--json"]).await;
+    assert!(
+        listed["commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|command| command["name"] == "deploy")
+    );
+    let templates = fixture
+        .fl_json(&["prompt-template", "list", "--json"])
+        .await;
+    assert_eq!(templates["templates"].as_array().unwrap().len(), 1);
+
+    let deleted = fixture
+        .fl_json(&["commands", "delete", "deploy", "--json"])
+        .await;
+    assert_eq!(deleted["action"], "deleted");
+    let gone = fixture.fl(&["commands", "get", "deploy", "--json"]).await;
+    assert!(!gone.status.success());
+    let removed_template = fixture
+        .fl_json(&[
+            "prompt-template",
+            "remove",
+            "fix_ci",
+            "--scope",
+            "global",
+            "--json",
+        ])
+        .await;
+    assert!(removed_template["templates"].as_array().unwrap().is_empty());
+    let default = fixture
+        .fl_json(&["prompt-template", "get", "fix_ci", "--json"])
+        .await;
+    assert_eq!(default["stored"], false);
+
+    fixture.shutdown().await;
+}

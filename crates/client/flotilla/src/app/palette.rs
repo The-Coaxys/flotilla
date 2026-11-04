@@ -121,6 +121,10 @@ pub(crate) enum Action {
         worktree: WorktreeId,
         kind: ScriptKind,
     },
+    /// Open the scoped custom-command and prompt-template editor.
+    OpenCommands,
+    /// Open the selected worktree's branch group diff.
+    OpenGroupDiff,
     Git {
         worktree: WorktreeId,
         action: GitAction,

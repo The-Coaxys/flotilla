@@ -113,6 +113,16 @@ pub enum Command {
         #[command(subcommand)]
         command: TeamCommand,
     },
+    /// Custom commands at global, workspace and project scopes.
+    Commands {
+        #[command(subcommand)]
+        command: CommandsCommand,
+    },
+    /// Prompt templates for routed Git actions, at every scope.
+    PromptTemplate {
+        #[command(subcommand)]
+        command: PromptTemplateCommand,
+    },
     /// Record one normalized provider hook event for a chat session.
     Hook {
         /// Hook name, e.g. PreToolUse, PostToolUse, Stop or notify.
@@ -123,6 +133,95 @@ pub enum Command {
         /// Hook JSON payload; `-` reads stdin (the default when stdin is piped).
         #[arg(long, value_name = "JSON")]
         payload: Option<String>,
+    },
+}
+
+/// Where a command or prompt template is stored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Default)]
+pub enum CommandScopeArg {
+    /// The Flotilla home.
+    Global,
+    /// The caller's workspace, or the selected workspace.
+    Workspace,
+    /// The caller's project (default).
+    #[default]
+    Project,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum CommandsCommand {
+    /// List commands visible to the caller, or one scope's commands.
+    List {
+        /// Only definitions stored at this scope.
+        #[arg(long, value_enum)]
+        scope: Option<CommandScopeArg>,
+    },
+    /// Define a command; a duplicate name at that scope is refused.
+    Create {
+        name: String,
+        /// Command body; `-` reads stdin (the default when stdin is piped).
+        #[arg(long, value_name = "TEXT", conflicts_with = "body_file")]
+        body: Option<String>,
+        /// Read the body from a file.
+        #[arg(long, value_name = "PATH", conflicts_with = "body")]
+        body_file: Option<String>,
+        /// One-line description.
+        #[arg(long)]
+        description: Option<String>,
+        #[arg(long, value_enum, default_value = "project")]
+        scope: CommandScopeArg,
+    },
+    /// Print one command's definition.
+    Get { name: String },
+    /// Replace a command's body and description.
+    Update {
+        name: String,
+        /// New body; omit to keep the stored body.
+        #[arg(long, value_name = "TEXT", conflicts_with = "body_file")]
+        body: Option<String>,
+        /// Read the new body from a file.
+        #[arg(long, value_name = "PATH", conflicts_with = "body")]
+        body_file: Option<String>,
+        /// New description; omit to keep the stored one.
+        #[arg(long)]
+        description: Option<String>,
+        #[arg(long, value_enum, default_value = "project")]
+        scope: CommandScopeArg,
+    },
+    /// Delete a command; a missing definition is refused.
+    Delete {
+        name: String,
+        #[arg(long, value_enum, default_value = "project")]
+        scope: CommandScopeArg,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum PromptTemplateCommand {
+    /// Templates at every scope, or one scope's templates.
+    List {
+        #[arg(long, value_enum)]
+        scope: Option<CommandScopeArg>,
+    },
+    /// The effective template for one routed action.
+    Get { action: String },
+    /// Store a template for one routed action at a scope.
+    Set {
+        action: String,
+        /// Template body; `-` reads stdin.
+        #[arg(long, value_name = "TEXT", conflicts_with = "body_file")]
+        body: Option<String>,
+        /// Read the template from a file.
+        #[arg(long, value_name = "PATH", conflicts_with = "body")]
+        body_file: Option<String>,
+        #[arg(long, value_enum, default_value = "project")]
+        scope: CommandScopeArg,
+    },
+    /// Remove a stored template; a missing definition is refused.
+    Remove {
+        action: String,
+        #[arg(long, value_enum, default_value = "project")]
+        scope: CommandScopeArg,
     },
 }
 
@@ -380,6 +479,16 @@ pub enum WorktreeCommand {
         #[arg(long, conflicts_with = "branch")]
         clear: bool,
     },
+    /// Create the branch group's child lazily and copy the shared context.
+    ///
+    /// The caller becomes the group root when it is not in a group yet.
+    EnsureChild {
+        /// Group root: a project name or path, or a worktree id, label or
+        /// path (default: the caller's worktree).
+        repo: Option<String>,
+    },
+    /// The branch group's diff: a repository summary with per-child detail.
+    GroupDiff,
 }
 
 #[derive(Debug, Subcommand)]

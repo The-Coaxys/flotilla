@@ -97,3 +97,70 @@ holds; no new wire calls.
 - Not covered by this slice: theme editor, PiP, browser tabs, Shared Context, custom command
   CRUD, performance HUD, keymap editor. Ctrl+Shift+P currently opens the palette; it is the
   documented PiP key and should move when PiP lands.
+
+### Slice: Shared Context, custom commands and prompt templates
+
+Governing spec: §6 (Shared Context), §7 (`commands` surface, prompt templates). Scope: the
+daemon, the protocol and the `fl` surface end to end, plus one isolated client editor.
+
+- **Branch groups (Shared Context).** A group is one root worktree plus lazily created
+  children, stored in schema v10 (`worktree_groups`, `worktree_group_members`) so the M2
+  `Worktree` wire shape is unchanged. `fl worktree ensure-child [repo]` /
+  `Request::EnsureWorktreeChild` registers the caller as the root when needed, writes the
+  `FEATURE.md` template, the guidance `AGENTS.md` (skipped when `AGENTS.md`/`CLAUDE.md`
+  exists) and `context/` into the root without replacing anything, creates one child on a
+  temporary branch from the group base, and copies the shared context into it (bounded to
+  256 entries, 8 MiB per file, 16 MiB total; symlinks skipped). A second call returns the
+  same child with `created: false`.
+- **Grouped diffs.** `Request::WorktreeGroupDiff` / `fl worktree group-diff` computes every
+  member's status against the group base (root target, else project default) and returns a
+  repository summary (`added`, `removed`, `changed_files`) plus per-child labels, branches,
+  dirty/conflicted flags and file lists (512 files per child, 4000 total).
+  `Request::GetWorktreeGroup` returns the normalized group (root first).
+- **Custom commands.** `fl_model::command` defines `CustomCommand{scope,name,description,body}`,
+  a compare-and-set `CommandState` and `CommandMutation::{Create,Update,Delete}`; names are
+  ASCII `[A-Za-z0-9][A-Za-z0-9._-]{0,127}`, bodies 1–32768 bytes, descriptions ≤1024 bytes.
+  Persisted in schema v10 (`commands` snapshot) with the same self-contained migration backup
+  as every earlier version. Duplicate/missing/invalid definitions and stale revisions are
+  refusals with the daemon's reason. `Request::ListCommands`/`MutateCommand` carry the state
+  and revision.
+- **Dispatch.** A stored command dispatches through the routed prompt pipeline:
+  `Request::DispatchCommand` resolves project → workspace → global, renders
+  `{{branch}}`/`{{base}}`/`{{diff}}`/`{{task}}`, resolves the route for
+  `GitTask::Command` (Thorough group fallback) and reports a `TaskDispatch`; prepare modes
+  return the rendered prompt without running anything.
+- **Prompt templates** stay in `RoutingState.templates` (no second store); `fl
+  prompt-template list|get|set|remove` edits them per scope with compare-and-set and
+  `get` reports the winning scope or the built-in default.
+- **`fl` surface.** `worktree ensure-child [repo]`, `worktree group-diff`,
+  `commands list|create|get|update|delete` (`--scope global|workspace|project`, default
+  project), `prompt-template list|get|set|remove`. Every mutation prints the resulting
+  revision; refusals exit non-zero with the daemon's reason. `fl instructions worktree` and
+  `fl instructions orchestration` document branch groups, commands and templates.
+- **Client.** `app/host_commands.rs` (scoped command CRUD, prompt-template editing,
+  prepare-mode dispatch with the daemon's prompt shown) and `app/host_group_diff.rs`
+  (repository summary, per-child files, `Ensure child`, shared-context report) are opened
+  from the command palette ("Commands and prompt templates", "Branch group diff"). All state
+  lives in those modules; `host_workspace.rs` gains two fields, two module declarations,
+  the `close_dialog` guard and two render-chain lines.
+
+Verification:
+
+- `cargo test -p fld-store --locked` — schema v10 migration, group membership/pruning and
+  command compare-and-set/refusal unit tests.
+- `cargo test -p fl-proto --locked` — `shared_context_and_commands_round_trip_and_validate`
+  (append-only request/response variants, wire bounds, duplicate refusal).
+- `cargo test -p fld-server --locked --test workspaces branch_groups_share_context_and_report_a_grouped_diff`
+  — real daemon, git and shells: root skeleton, child context copy, idempotent ensure-child,
+  child edit in the grouped diff, refusal outside a group.
+- `cargo test -p fld-server --locked --test workspaces custom_commands_are_edited_and_routed`
+  — create/duplicate/stale/invalid/update/delete, scoped resolution, routed prepare dispatch
+  using the stored body.
+- `cargo test -p fl --locked --test cli commands_templates_and_branch_groups_are_durable` —
+  the built `fl` binary: create/list/get/update/delete, `--scope global`, prompt-template
+  set/get/list/remove, duplicate/invalid/missing refusals exiting non-zero, durability across
+  a daemon restart, `ensure-child` + shared files + `group-diff` with the child edit.
+- Remaining for M7 as a whole: palette/launcher/hover (landed earlier), theme editor, PiP,
+  browser tabs, performance HUD, keymap editor, updater. This slice does not cover a native
+  grouped-diff *tab* or command execution in a submit mode from the client editor (prepare
+  mode only; the daemon path is complete and covered by the routed dispatch test).

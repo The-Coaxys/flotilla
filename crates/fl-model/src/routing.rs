@@ -40,6 +40,8 @@ pub enum GitTask {
     FixChanges,
     FixComments,
     Investigate,
+    /// A stored custom command dispatched by name (spec §6, §7).
+    Command,
 }
 
 impl GitTask {
@@ -54,7 +56,8 @@ impl GitTask {
             | Self::FixCi
             | Self::FixChanges
             | Self::FixComments
-            | Self::Investigate => RouteGroup::Thorough,
+            | Self::Investigate
+            | Self::Command => RouteGroup::Thorough,
         }
     }
 
@@ -70,6 +73,7 @@ impl GitTask {
             Self::FixChanges => "Fix changes",
             Self::FixComments => "Fix comments",
             Self::Investigate => "Investigate",
+            Self::Command => "Custom command",
         }
     }
 
@@ -86,6 +90,7 @@ impl GitTask {
             Self::FixChanges => "fix_changes",
             Self::FixComments => "fix_comments",
             Self::Investigate => "investigate",
+            Self::Command => "command",
         }
     }
 
@@ -93,7 +98,9 @@ impl GitTask {
         Self::ALL.into_iter().find(|task| task.id() == id)
     }
 
-    /// Every task, in menu order.
+    /// Every routable Git action, in menu order. A stored custom command
+    /// (`Command`) is configured through its own scope store, so it is not a
+    /// Git action here; it resolves through its group route.
     pub const ALL: [Self; 10] = [
         Self::NameWorktree,
         Self::Commit,
@@ -355,6 +362,8 @@ pub fn default_template(action: GitTask) -> &'static str {
         GitTask::Investigate => {
             "Investigate these failing checks and report what is wrong.\n\n{{checks}}"
         }
+        // Custom commands carry their own body; this text is only a fallback.
+        GitTask::Command => "{{task}}",
     }
 }
 
@@ -476,6 +485,23 @@ impl RoutingState {
             })
             .or_else(|| repo_prompt.map(str::to_owned))
             .unwrap_or_else(|| default_template(action).to_owned())
+    }
+
+    /// The scope whose stored template wins for `action`, if any.
+    pub fn template_scope(
+        &self,
+        action: GitTask,
+        project: ProjectId,
+        workspace: WorkspaceId,
+    ) -> Option<Scope> {
+        self.scopes(project, workspace)
+            .into_iter()
+            .flatten()
+            .find(|scope| {
+                self.templates
+                    .iter()
+                    .any(|template| template.scope == *scope && template.action == action)
+            })
     }
 
     /// The prompt template for `action`, most specific first.

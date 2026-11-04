@@ -37,6 +37,10 @@ use gpui::{
 use super::git_actions::{self, GitAction};
 use super::host_view::{primary_button, secondary_button};
 
+#[path = "host_commands.rs"]
+mod commands_ui;
+#[path = "host_group_diff.rs"]
+mod group_diff;
 #[path = "host_chat.rs"]
 mod host_chat;
 #[path = "host_routes.rs"]
@@ -157,6 +161,8 @@ pub struct HostWorkspace {
     review: review::ReviewUi,
     sections_ui: sections::SectionsUi,
     routes_ui: routes::RoutesUi,
+    commands_ui: commands_ui::CommandsUi,
+    group_diff_ui: group_diff::GroupDiffUi,
     chat: host_chat::ChatUi,
     banner: Option<SharedString>,
     rtt: Option<Duration>,
@@ -313,6 +319,8 @@ impl HostWorkspace {
             review: review::ReviewUi::default(),
             sections_ui: sections::SectionsUi::default(),
             routes_ui: routes::RoutesUi::default(),
+            commands_ui: commands_ui::CommandsUi::default(),
+            group_diff_ui: group_diff::GroupDiffUi::default(),
             chat,
             banner: None,
             rtt: None,
@@ -1306,11 +1314,17 @@ impl HostWorkspace {
     }
 
     fn close_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.sections_ui.busy || self.routes_ui.busy {
+        if self.sections_ui.busy
+            || self.routes_ui.busy
+            || self.commands_ui.busy
+            || self.group_diff_ui.busy
+        {
             return;
         }
         self.sections_ui.close();
         self.routes_ui.close();
+        self.commands_ui.close();
+        self.group_diff_ui.close();
         self.dialog = None;
         window.focus(&self.focus);
         cx.notify();
@@ -2342,6 +2356,12 @@ impl HostWorkspace {
             return Some(dialog);
         }
         if let Some(dialog) = self.render_routes_dialog(t, cx) {
+            return Some(dialog);
+        }
+        if let Some(dialog) = self.render_commands_dialog(t, cx) {
+            return Some(dialog);
+        }
+        if let Some(dialog) = self.render_group_diff_dialog(t, cx) {
             return Some(dialog);
         }
         let dialog = self.dialog.as_ref()?;
