@@ -4,6 +4,8 @@
 //!
 //! Every page is appended by durable sequence; a gap never advances the
 //! mirror, so the next fetch starts at the last sequence the UI actually has.
+//! The mirror keeps a bounded window: a long transcript starts from its recent
+//! tail and the daemon remains the source for older history.
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -26,8 +28,12 @@ use crate::workspaces::WorkspacesState;
 pub const MAX_MIRRORED_EVENTS: usize = MAX_CHAT_HISTORY;
 /// Worktrees whose session lists are fetched concurrently after a reconnect.
 const FETCH_CONCURRENCY: usize = 8;
-/// Pages fetched for one push hint before leaving the rest for the next hint.
+/// Pages fetched for one push hint before jumping to the recent tail.
 const MAX_HINT_PAGES: usize = 16;
+/// Events re-fetched when a session is too long to catch up page by page.
+const TAIL_WINDOW: u64 = 4096;
+/// A dropped hint is recovered by this periodic check.
+const RECOVERY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum MergeError {
@@ -109,6 +115,9 @@ impl ChatState {
             }
         }
         let mut list = self.events.remove(&page.session).unwrap_or_default();
+        // The mirror keeps a bounded window: the first page may start above 1
+        // (a long transcript is shown from its recent tail), and every later
+        // page must be contiguous with what the mirror has.
         let last = list.last().map(|event| event.sequence).unwrap_or(0);
         let mut appended = false;
         for record in &page.events {
@@ -119,7 +128,10 @@ impl ChatState {
             {
                 continue;
             }
-            let expected = list.last().map(|event| event.sequence + 1).unwrap_or(1);
+            let expected = list
+                .last()
+                .map(|event| event.sequence + 1)
+                .unwrap_or(record.sequence);
             if record.sequence != expected {
                 self.events.insert(page.session, list);
                 return Err(MergeError::Gap {
@@ -225,10 +237,25 @@ pub(crate) async fn run(
                 let snapshot = workspaces.borrow().clone();
                 resync(&link, &snapshot, &state).await;
                 let mut workspace_changes = workspaces.clone();
+                let mut recovery = tokio::time::interval(RECOVERY_INTERVAL);
+                recovery.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 loop {
                     tokio::select! {
                         _ = shutdown.cancelled() => return,
                         () = link.closed() => break,
+                        _ = recovery.tick() => {
+                            // The daemon may drop a hint for a slow session, so
+                            // re-check every cursor on a slow timer.
+                            let behind: Vec<uuid::Uuid> = state
+                                .borrow()
+                                .behind()
+                                .into_iter()
+                                .map(|(session, ..)| session)
+                                .collect();
+                            for session in behind {
+                                fetch_missing(&link, &state, session).await;
+                            }
+                        },
                         event = events.recv() => match event {
                             Ok(event) => follow_event(&link, &state, event).await,
                             Err(broadcast::error::RecvError::Lagged(_)) => {
@@ -279,13 +306,18 @@ async fn follow_event(
             fetch_missing(link, state, id).await;
         }
         DaemonEvent::ChatEventAppended {
-            session, worktree, ..
+            session,
+            worktree,
+            sequence,
+            ..
         } => {
             let known = state.borrow().sessions.contains_key(&session);
             if !known {
                 fetch_sessions(link, state, worktree).await;
             }
-            fetch_missing(link, state, session).await;
+            // The hint names a sequence the daemon already stored: that is the
+            // only trustworthy "more exists" signal, so fetch through it.
+            fetch_through(link, state, session, sequence).await;
         }
         DaemonEvent::InboxChanged => fetch_inbox(link, state).await,
         _ => {}
@@ -312,24 +344,49 @@ async fn fetch_inbox(link: &ControlLink, state: &watch::Sender<Arc<ChatState>>) 
     }
 }
 
-/// Fetch pages from the mirror's first missing sequence until the daemon has
-/// nothing more (bounded per call so one hint cannot monopolize the task).
-async fn fetch_missing(
+/// Fetch pages up to `target` (inclusive), jumping to the recent tail when a
+/// transcript is too long to catch up page by page.
+async fn fetch_through(
     link: &ControlLink,
     state: &watch::Sender<Arc<ChatState>>,
     session: uuid::Uuid,
+    target: u64,
 ) {
+    if fetch_pages(link, state, session, target).await {
+        return;
+    }
+    // Still behind after the page budget: keep the newest bounded window.
+    let end = state
+        .borrow()
+        .session(session)
+        .map(|known| known.seq)
+        .unwrap_or(0);
+    let from = end.saturating_sub(TAIL_WINDOW).max(1);
+    update(state, |state| {
+        state.events.remove(&session);
+    });
+    fetch_pages(link, state, session, target.max(from)).await;
+}
+
+/// Fetch pages from the mirror's first missing sequence through `target`.
+/// Returns whether the mirror caught up.
+async fn fetch_pages(
+    link: &ControlLink,
+    state: &watch::Sender<Arc<ChatState>>,
+    session: uuid::Uuid,
+    target: u64,
+) -> bool {
     for _ in 0..MAX_HINT_PAGES {
         let (from, behind) = {
             let state = state.borrow();
-            let Some(known) = state.session(session) else {
-                return;
+            let Some(_known) = state.session(session) else {
+                return true;
             };
             let from = state.missing_from(session);
-            (from, known.seq >= from)
+            (from, target >= from)
         };
         if !behind {
-            return;
+            return true;
         }
         let page = match link
             .rpc(Request::GetChatEvents {
@@ -340,20 +397,36 @@ async fn fetch_missing(
             .await
         {
             Ok(Response::ChatEvents(page)) => page,
-            Err(error) if error.code() == Some(fl_proto::RpcErrorCode::NotFound) => return,
-            _ => return,
+            Err(error) if error.code() == Some(fl_proto::RpcErrorCode::NotFound) => return true,
+            _ => return false,
         };
         let mut merged = Ok(false);
         update(state, |state| {
             merged = state.append_page(&page);
         });
         if merged.is_err() {
-            return;
+            return false;
         }
         if !page.more || page.events.is_empty() {
-            return;
+            return true;
         }
     }
+    false
+}
+
+/// Fetch everything the daemon has, driven by the stored cursor rather than a
+/// hint (used after a reconnect and by the periodic recovery tick).
+async fn fetch_missing(
+    link: &ControlLink,
+    state: &watch::Sender<Arc<ChatState>>,
+    session: uuid::Uuid,
+) {
+    let target = state
+        .borrow()
+        .session(session)
+        .map(|known| known.seq)
+        .unwrap_or(0);
+    fetch_through(link, state, session, target).await;
 }
 
 async fn resync(
@@ -584,5 +657,28 @@ mod tests {
         }]);
         state.dismiss(id);
         assert!(state.inbox.is_empty());
+    }
+    #[test]
+    fn the_mirror_windows_a_long_transcript_and_still_rejects_gaps() {
+        let worktree = WorktreeId::new();
+        let id = Uuid::new_v4();
+        let mut state = ChatState::default();
+        let mut known = session(worktree, 10_000);
+        known.id = id;
+        state.merge_session(known);
+        // A first page near the tail becomes the window start.
+        assert_eq!(state.append_page(&page(id, 9_990..=9_994, false)), Ok(true));
+        assert_eq!(state.session_events(id)[0].sequence, 9_990);
+        assert_eq!(state.missing_from(id), 9_995);
+        // Contiguous pages continue; a gap is refused and does not advance.
+        assert_eq!(state.append_page(&page(id, 9_995..=9_996, false)), Ok(true));
+        assert!(matches!(
+            state.append_page(&page(id, 10_000..=10_000, false)),
+            Err(MergeError::Gap {
+                expected: 9_997,
+                got: 10_000
+            })
+        ));
+        assert_eq!(state.missing_from(id), 9_997);
     }
 }
