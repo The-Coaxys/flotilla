@@ -543,6 +543,16 @@ impl HostWorkspace {
 
     // ---- setup and providers ---------------------------------------------
 
+    /// Start the chat setup flow (palette entry point).
+    pub(super) fn open_chat_setup_public(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_chat_setup(window, cx);
+    }
+
+    /// Open the inbox overlay (palette and Ctrl+Shift+I entry point).
+    pub(super) fn open_inbox_panel(&mut self, cx: &mut Context<Self>) {
+        self.open_chat_inbox(cx);
+    }
+
     fn open_chat_setup(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.chat.setup.is_some() {
             self.chat.setup = None;

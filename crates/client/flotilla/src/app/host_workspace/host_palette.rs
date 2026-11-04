@@ -19,7 +19,7 @@ use gpui::{
     Subscription, WeakEntity, Window, div, px,
 };
 
-use super::{DocumentKind, HostWorkspace, Panel, join};
+use super::{DocumentKind, HostWorkspace, HostWorkspaceEvent, Panel, join};
 use crate::app::git_actions;
 use crate::app::palette::{
     self, Action, Listing, MAX_VISIBLE, MODES, Mode, Panel as PalettePanel, Source,
@@ -46,6 +46,9 @@ impl HostWorkspace {
     }
 
     pub(super) fn open_palette(&mut self, mode: Mode, window: &mut Window, cx: &mut Context<Self>) {
+        // A stale "nothing matches" banner from the previous search must not
+        // outlive the search that caused it.
+        self.banner = None;
         let input = cx.new(|cx| TextInput::new(cx, mode.placeholder()));
         let events = cx.subscribe_in(
             &input,
@@ -219,6 +222,19 @@ impl HostWorkspace {
         }
     }
 
+    /// The workspace the selected scope belongs to.
+    fn selected_workspace(&self) -> Option<fl_model::WorkspaceId> {
+        let tree = self.state.tree.as_ref()?;
+        match self.selected_worktree() {
+            Some(worktree) => tree
+                .projects
+                .iter()
+                .find(|project| project.id == worktree.project)
+                .map(|project| project.workspace),
+            None => tree.workspaces.first().map(|workspace| workspace.id),
+        }
+    }
+
     fn push_commands(&self, out: &mut Listing) {
         out.push(
             "Add project",
@@ -260,6 +276,46 @@ impl HostWorkspace {
             Source::Command,
             Action::OpenGroupDiff,
         );
+        out.push(
+            "Settings and theme",
+            "Theme, keyboard and notification policy",
+            Source::Command,
+            Action::OpenSettings,
+        );
+        out.push(
+            "Toggle performance HUD",
+            "Frame time, RTT, transport, throughput",
+            Source::Command,
+            Action::ToggleHud,
+        );
+        out.push(
+            "Inbox",
+            "Approvals, questions and finished runs",
+            Source::Command,
+            Action::OpenInbox,
+        );
+        if let Some(workspace) = self.selected_workspace() {
+            out.push(
+                "Sections",
+                "Organize worktrees into manual and filter sections",
+                Source::Command,
+                Action::OpenSections(workspace),
+            );
+            out.push(
+                "Routes",
+                "Providers, profiles and dispatch modes per action",
+                Source::Command,
+                Action::OpenRoutes(workspace),
+            );
+        }
+        if self.selected_worktree().is_some() {
+            out.push(
+                "New chat",
+                "Start a provider conversation in this worktree",
+                Source::Command,
+                Action::NewChat,
+            );
+        }
         for (panel, title, detail) in [
             (
                 PalettePanel::Files,
@@ -527,6 +583,12 @@ impl HostWorkspace {
             Action::CloseTab { view, tab } => {
                 self.apply_layout(LayoutOp::CloseTab { view, tab }, cx)
             }
+            Action::OpenSettings => cx.emit(HostWorkspaceEvent::OpenSettings),
+            Action::ToggleHud => cx.emit(HostWorkspaceEvent::ToggleHud),
+            Action::OpenInbox => self.open_inbox_panel(cx),
+            Action::NewChat => self.open_chat_setup_public(window, cx),
+            Action::OpenSections(workspace) => self.open_sections_editor(workspace, cx),
+            Action::OpenRoutes(workspace) => self.open_routes(workspace, cx),
             Action::RunScript { worktree, kind } => {
                 self.select(LayoutScope::Worktree(worktree), cx);
                 self.run_script(worktree, kind, false, cx);

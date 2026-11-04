@@ -285,7 +285,17 @@ impl Workspace {
         event: &host_workspace::HostWorkspaceEvent,
         cx: &mut Context<Self>,
     ) {
-        let host_workspace::HostWorkspaceEvent::ClipboardStore(text) = event;
+        if matches!(event, host_workspace::HostWorkspaceEvent::OpenSettings) {
+            self.request_settings(cx);
+            return;
+        }
+        if matches!(event, host_workspace::HostWorkspaceEvent::ToggleHud) {
+            self.toggle_hud(cx);
+            return;
+        }
+        let host_workspace::HostWorkspaceEvent::ClipboardStore(text) = event else {
+            return;
+        };
         let Some(entry) = self.hosts.iter_mut().find(|h| h.profile.id == host_id) else {
             return;
         };

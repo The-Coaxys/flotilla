@@ -93,6 +93,11 @@ impl HostWorkspace {
         self.state.live && self.state.sections.is_some() && !self.sections_ui.busy
     }
 
+    /// Open the section editor for one workspace (palette entry point).
+    pub(super) fn open_sections_editor(&mut self, workspace: WorkspaceId, cx: &mut Context<Self>) {
+        self.section_dialog(SectionsDialog::Manage(workspace), cx);
+    }
+
     fn section_dialog(&mut self, dialog: SectionsDialog, cx: &mut Context<Self>) {
         if !self.sections_enabled() {
             return;

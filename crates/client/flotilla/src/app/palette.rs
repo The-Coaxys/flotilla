@@ -4,7 +4,7 @@
 //! the actions it can run live in `host_workspace/host_palette.rs`, where the
 //! selected host's mirrors and model methods are reachable.
 use fl_model::workspace::{LayoutScope, ScriptKind};
-use fl_model::{ProjectId, TabId, ViewId, WorktreeId};
+use fl_model::{ProjectId, TabId, ViewId, WorkspaceId, WorktreeId};
 use gpui::SharedString;
 use uuid::Uuid;
 
@@ -123,6 +123,18 @@ pub(crate) enum Action {
     },
     /// Open the scoped custom-command and prompt-template editor.
     OpenCommands,
+    /// Settings: theme editor, keyboard editor and notification policy.
+    OpenSettings,
+    /// Toggle the performance HUD.
+    ToggleHud,
+    /// Open the sidebar section editor for a workspace.
+    OpenSections(WorkspaceId),
+    /// Open the routed-action editor for a workspace.
+    OpenRoutes(WorkspaceId),
+    /// Open the chat inbox.
+    OpenInbox,
+    /// Start a new chat in the selected worktree.
+    NewChat,
     /// Open the selected worktree's branch group diff.
     OpenGroupDiff,
     Git {

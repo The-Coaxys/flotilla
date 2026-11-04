@@ -57,6 +57,10 @@ const READ_LIMIT: u32 = 8 * 1024 * 1024;
 pub enum HostWorkspaceEvent {
     /// A terminal asked (OSC 52) to set the clipboard; consent is the app's.
     ClipboardStore(String),
+    /// The palette asked for the settings overlay (app-level entity).
+    OpenSettings,
+    /// The palette asked to toggle the performance HUD.
+    ToggleHud,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
