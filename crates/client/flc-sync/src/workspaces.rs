@@ -1,11 +1,12 @@
 //! The daemon's workspaces as the client sees them: the project/worktree
-//! tree, live git status per worktree and script states, kept current from
-//! pushed daemon events and refetched on every new link.
+//! tree, live git status per worktree, script states and sidebar sections,
+//! kept current from pushed daemon events and refetched on every new link.
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use fl_model::WorktreeId;
 use fl_model::forge::ForgeState;
+use fl_model::sections::SectionsState;
 use fl_model::workspace::{DaemonEvent, LayoutScope, ScriptState, WorkspaceTree, WorktreeStatus};
 use fl_proto::{Request, Response};
 use flc_conn::broker::ControlLink;
@@ -27,6 +28,9 @@ pub struct WorkspacesState {
     /// Forge state of worktrees the daemon has reported (pushed when it
     /// changes; request [`crate::Sync::forge_status`] for a fresh one).
     pub forges: HashMap<WorktreeId, ForgeState>,
+    /// Last sections snapshot; `None` until a supporting daemon answers.
+    /// Older daemons never receive section requests or imply support.
+    pub sections: Option<SectionsState>,
     /// Connected and following daemon events.
     pub live: bool,
 }
@@ -80,6 +84,22 @@ pub(crate) fn update(
     });
 }
 
+pub(crate) fn supports_sections(proto: fl_proto::ProtoVersion) -> bool {
+    proto.major > 0 || proto.minor >= 4
+}
+
+/// RPC replies and pushed snapshots can race; neither may move revisions back.
+pub(crate) fn remember_sections(
+    state: &watch::Sender<Arc<WorkspacesState>>,
+    sections: SectionsState,
+) {
+    update(state, |s| {
+        if s.sections.as_ref().is_none_or(|known| sections.rev > known.rev) {
+            s.sections = Some(sections);
+        }
+    });
+}
+
 /// Follow one link until it closes.
 async fn follow(
     link: &ControlLink,
@@ -120,6 +140,7 @@ async fn follow(
             Ok(DaemonEvent::ForgeChanged(forge)) => update(state, |s| {
                 s.forges.insert(forge.worktree, forge);
             }),
+            Ok(DaemonEvent::SectionsChanged(sections)) => remember_sections(state, sections),
             Ok(DaemonEvent::LayoutChanged { scope, .. }) => {
                 if let Some(commands) = layouts
                     .lock()
@@ -144,13 +165,31 @@ async fn fetch_tree(link: &ControlLink) -> Option<WorkspaceTree> {
     }
 }
 
-/// Fetch the tree plus every worktree's status and scripts.
+async fn refetch_sections(link: &ControlLink, state: &watch::Sender<Arc<WorkspacesState>>) {
+    if !supports_sections(link.daemon_proto()) {
+        update(state, |s| s.sections = None);
+        return;
+    }
+    match link.rpc(Request::ListSections).await {
+        Ok(Response::SectionsState(sections)) => remember_sections(state, sections),
+        Err(error) if error.code() == Some(fl_proto::RpcErrorCode::Unsupported) => {
+            update(state, |s| s.sections = None);
+        }
+        _ => {}
+    }
+}
+
+/// Fetch the tree, sections and every worktree's status and scripts.
 async fn resync(link: &ControlLink, state: &watch::Sender<Arc<WorkspacesState>>) -> bool {
+    if !supports_sections(link.daemon_proto()) {
+        update(state, |s| s.sections = None);
+    }
     let Some(tree) = fetch_tree(link).await else {
         return false;
     };
     let ids: Vec<WorktreeId> = tree.worktrees.iter().map(|w| w.id).collect();
-    let (statuses, scripts) = fetch_details(link, &ids).await;
+    let ((statuses, scripts), ()) =
+        tokio::join!(fetch_details(link, &ids), refetch_sections(link, state));
     update(state, |s| {
         s.tree = Some(tree);
         s.statuses = statuses;
@@ -224,4 +263,50 @@ async fn fetch_details(link: &ControlLink, ids: &[WorktreeId]) -> Details {
         }
     }
     (statuses, scripts)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fl_model::sections::{Section, SectionKind};
+    use fl_model::{SectionId, WorkspaceId};
+
+    #[test]
+    fn sections_are_unknown_until_supported_snapshots_arrive() {
+        assert!(WorkspacesState::default().sections.is_none());
+        for minor in 0..4 {
+            assert!(!supports_sections(fl_proto::ProtoVersion { major: 0, minor }));
+        }
+        assert!(supports_sections(fl_proto::ProtoVersion { major: 0, minor: 4 }));
+        assert!(supports_sections(fl_proto::ProtoVersion { major: 1, minor: 0 }));
+    }
+
+    #[test]
+    fn section_replies_and_events_never_replace_newer_snapshots() {
+        let (state, mut changes) = watch::channel(Arc::new(WorkspacesState::default()));
+        let section = Section {
+            id: SectionId::new(),
+            workspace: WorkspaceId::new(),
+            name: "Mine".into(),
+            order: 0,
+            priority: 0,
+            kind: SectionKind::Manual,
+        };
+        let snapshot = SectionsState { rev: 8, sections: vec![section], memberships: vec![] };
+        remember_sections(&state, snapshot.clone());
+        assert!(changes.has_changed().unwrap());
+        let published = changes.borrow_and_update().clone();
+        assert_eq!(published.sections.as_ref(), Some(&snapshot));
+        for rev in [7, 8] {
+            remember_sections(&state, SectionsState { rev, ..Default::default() });
+            assert!(!changes.has_changed().unwrap());
+            assert!(Arc::ptr_eq(&changes.borrow(), &published));
+        }
+        // A newer empty snapshot clears deleted sections without forgetting
+        // that this daemon supports the feature.
+        let empty = SectionsState { rev: 9, ..Default::default() };
+        remember_sections(&state, empty.clone());
+        assert!(changes.has_changed().unwrap());
+        assert_eq!(changes.borrow().sections.as_ref(), Some(&empty));
+    }
 }

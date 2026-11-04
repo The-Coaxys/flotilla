@@ -211,4 +211,6 @@ pub enum DaemonEvent {
     },
     /// The forge state of a worktree changed (polled or after an action).
     ForgeChanged(crate::forge::ForgeState),
+    /// Section definitions, assignments or pins changed (protocol 0.4).
+    SectionsChanged(crate::sections::SectionsState),
 }

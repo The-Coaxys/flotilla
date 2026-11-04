@@ -160,8 +160,12 @@ async fn control(
         tokio::select! {
             _ = lease.cancel.cancelled() => return Ok(SessionEnd::Finished),
             Some(event) = next_event(&mut subscription) => {
-                // Forge events arrived with protocol 0.4.
-                let decodable = !matches!(event, fl_model::workspace::DaemonEvent::ForgeChanged(_))
+                // Forge and sections events arrived with protocol 0.4.
+                let decodable = !matches!(
+                    event,
+                    fl_model::workspace::DaemonEvent::ForgeChanged(_)
+                        | fl_model::workspace::DaemonEvent::SectionsChanged(_)
+                )
                     || hello.proto.major > 0
                     || hello.proto.minor >= 4;
                 if decodable {
@@ -384,6 +388,14 @@ async fn handle_request(
             .merge_pull_request(worktree, method)
             .await
             .map(Response::ForgeState),
+        Request::ListSections => workspace.sections_state().await.map(Response::SectionsState),
+        Request::MutateSections {
+            expected_rev,
+            mutation,
+        } => workspace
+            .mutate_sections(expected_rev, mutation)
+            .await
+            .map(Response::SectionsState),
     }
 }
 

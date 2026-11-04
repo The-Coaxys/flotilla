@@ -27,10 +27,10 @@ button, direct operations, forge) and §8.1 (bottom bar, Checks tab).
   push local commits, update on conflicts, checks when failing or running, mark ready for
   drafts, then awaiting review or merge with the repository's preferred method. The dropdown
   lists every applicable action (only allowed merge methods) plus "Open pull request".
-- **M3 remains open.** The direct Git/PR loop is implemented; the required agent-routed
-  operations, Fast/Thorough routes, per-scope prompt templates, dispatch modes, app-managed
-  review threads and sections are not yet implemented. Adapter work is a prerequisite for
-  routed actions, not permission to omit them from M3 acceptance.
+- **M3 remains open.** The direct Git/PR loop and sections implementation are present;
+  the required agent-routed operations, Fast/Thorough routes, per-scope prompt templates,
+  dispatch modes and app-managed review threads still require their separate acceptance
+  evidence. Sections changes below are implementation evidence, not verified acceptance.
 
 ## Contract
 
@@ -68,11 +68,60 @@ button, direct operations, forge) and §8.1 (bottom bar, Checks tab).
 ### Limits
 
 - GitHub only; GitLab/Bitbucket later behind the same calls.
-- Remaining M3 acceptance work: app-managed anchored review threads and triage; manual/filter
-  sections with manual-assignment precedence and pinned ordering; Fast/Thorough routes,
-  prompt templates and dispatch modes; temporary branch naming and agent-driven actions.
+- Remaining M3 acceptance work: app-managed anchored review threads and triage;
+  Fast/Thorough routes, prompt templates and dispatch modes; temporary branch naming and
+  agent-driven actions. Sections require the checks and native smoke described below.
 - The direct-loop UI smoke uses a scripted forge. It does not prove GitHub mutations against
   a real remote repository or installed Windows behavior.
 - Protocol boundary verification now checks rejection of 0.2 peers and suppression of 0.4
   forge events for supported 0.3 peers. All three daemon workspace tests pass; native
   shell/editor/app tests pass (77 total). Workspace and UI clippy pass with warnings denied.
+
+## Sections (§6) — implementation evidence, not yet verified
+
+- `fl-model::sections` owns workspace-local manual/filter definitions, explicit display
+  order and filter priority, manual worktree assignments and independent pin membership.
+  The deterministic classifier chooses Pinned, explicit manual assignment, matching filter
+  by descending priority (display order and stable identity break ties), then Unassigned.
+  Predicates combine with AND: PR state, review decision, rolled-up checks, structured agent
+  state, run state and whole-branch glob. `*` and `?` are supported; other characters are
+  literal, including slash and brackets. No PR, review, checks, run or agent observation
+  satisfies a predicate asking for a known value. A fresh detached Git summary does not
+  fall back to a stale stored branch.
+- `fld-store::database::sections` introduces schema V4 through the existing transactional,
+  backed-up migration convention. Definitions, memberships and their own unsigned revision
+  commit as one bounded snapshot. Mutations use revision compare-and-set. Assignment
+  requires a manual section in the worktree's own workspace. Deletion or conversion to a
+  filter clears assignments but preserves pins; worktree deletion prunes membership in the
+  same transaction. No fields were added to the M2 `WorkspaceTree` or `Worktree` payloads.
+- Protocol 0.4 adds append-only section list/mutation requests, snapshot responses and a
+  section-change event. New events are suppressed for 0.3 peers. Client sync follows
+  snapshots monotonically, reloads after reconnect, and immediately remembers mutation
+  replies. Native sidebar/editor integration uses this real daemon state rather than
+  local-only section definitions.
+- Added behavior tests cover precedence, missing observations, conjunctive forge filters,
+  neutral checks, detached branches, wildcard boundaries, run/setup distinction and unknown
+  exits, workspace isolation, durable reopen, stale revisions, invalid edits, pin-preserving
+  section deletion and V3 migration backup. A real-daemon socket test covers list/create/
+  assign/pin, pushed state, revision conflict, unchanged M2 tree, 0.3 event suppression,
+  daemon restart and membership pruning. Protocol/sync tests accompany their wire paths.
+
+### Sections limits and pending verification
+
+- Structured agent observations are currently unsupported by this slice: classification
+  receives `None`, never inferred terminal text or invented Idle/Running state. The model
+  and filter editor retain the optional future structured-agent predicate contract.
+- Run filters aggregate **run targets only**, never setup/teardown. Deterministic precedence
+  across multiple targets is Running, Failed, ExitedUnknown, Idle, Succeeded; an absent
+  target is unknown, not Idle. Check predicates distinguish neutral from success and no
+  checks from either; integration must use the authoritative forge aggregate when supplied.
+- No builds, tests, formatters, linters or UI smoke were run for this section slice. Parent
+  integration must run `cargo test -p fl-model -p fl-proto -p fld-store -p flc-sync`,
+  `cargo test -p fld-server --test workspaces sections_mutations_events_restart_and_legacy_peer`,
+  and the native client build/check on its supported target, after shared M3 merges.
+- Native smoke: connect two clients; create a manual section and an ordered branch-glob
+  filter, assign a matching worktree manually, pin it, unpin it, unassign it and observe the
+  filter reclaim it. Edit filter priority/order and each predicate, verify unknown agent
+  state does not match, delete the manual section, reconnect/restart the daemon and confirm
+  persistence and cross-client updates. Disconnected/unsupported controls and stale-edit
+  errors must remain visible and safe. This interaction is prescribed, not exercised.

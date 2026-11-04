@@ -6,6 +6,7 @@
 mod forge;
 mod scripts;
 mod status;
+mod sections;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -194,6 +195,12 @@ impl WorkspaceService {
         }
         self.terminals.close_all(removed.closed).await;
         self.tree_changed(removed.rev);
+        // Membership pruning commits with deletion; publish its new revision
+        // separately without changing the M2 WorkspaceTree wire shape.
+        match self.sections_state().await {
+            Ok(state) => self.publish(DaemonEvent::SectionsChanged(state)),
+            Err(error) => tracing::warn!(message = %error.message, "section snapshot after worktree removal failed"),
+        }
     }
 
     /// Launch policy for terminals of one worktree: its directory as cwd and

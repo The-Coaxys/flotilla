@@ -2,6 +2,7 @@
 pub mod forge;
 pub mod layout;
 pub mod workspace;
+pub mod sections;
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -32,6 +33,7 @@ identity!(
     WorkspaceId,
     ProjectId,
     WorktreeId,
+    SectionId,
     TabId,
     ViewId,
     PaneId,
