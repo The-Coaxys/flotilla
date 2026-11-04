@@ -253,6 +253,9 @@ pub enum Request {
         number: u64,
         method: MergeMethod,
     },
+    ListReviews { worktree: WorktreeId },
+    MutateReview { worktree: WorktreeId, base_rev: u64, mutation: fl_model::review::ReviewMutation },
+    PendingReviewBundle { worktree: WorktreeId },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -283,6 +286,8 @@ pub enum Response {
     Committed {
         head: String,
     },
+    Reviews(fl_model::review::ReviewState),
+    ReviewBundle(fl_model::review::ReviewBundle),
 }
 
 /// Returned on the authenticated control stream before requesting channels.
@@ -398,6 +403,8 @@ impl Request {
     pub fn validate(&self) -> Result<(), ValidationError> {
         use validation::{bound, path, text};
         match self {
+            Self::MutateReview { worktree, mutation, .. } => mutation.validate(*worktree)
+                .map_err(ValidationError::Invalid),
             Self::ApplyLayout { op, .. } | Self::ApplyScopedLayout { op, .. } => op
                 .validate()
                 .map_err(|_| ValidationError::Invalid("layout operation")),
@@ -449,6 +456,11 @@ impl Request {
 impl Response {
     pub fn validate(&self) -> Result<(), ValidationError> {
         match self {
+            Self::Reviews(state) => state.validate().map_err(ValidationError::Invalid),
+            Self::ReviewBundle(bundle) => {
+                validation::bound("review bundle threads", bundle.threads.len(), fl_model::review::MAX_THREADS)?;
+                validation::text("review bundle", &bundle.prompt, fl_model::review::MAX_REVIEW_BYTES + 32768)
+            }
             Self::Capabilities(value) => value.validate(),
             Self::Layout(value) => value
                 .validate()

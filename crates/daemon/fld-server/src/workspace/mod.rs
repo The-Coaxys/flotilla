@@ -4,6 +4,7 @@
 //! Durable structure lives in `fld-store` (schema v3). Structural changes
 //! are serialized and each one publishes `WorkspaceTreeChanged`.
 mod forge;
+mod review;
 mod scripts;
 mod status;
 

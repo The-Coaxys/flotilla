@@ -1262,6 +1262,9 @@ fn check_private_file(file: &File) -> Result<()> {
 #[path = "tree.rs"]
 mod tree;
 use tree::{MAX_WORKTREES, load_tree};
+#[path = "review.rs"]
+mod review;
+pub(crate) use review::SCHEMA_V5;
 
 #[cfg(test)]
 #[path = "database_tests.rs"]

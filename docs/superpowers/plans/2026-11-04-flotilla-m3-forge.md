@@ -93,3 +93,34 @@ button, direct operations, forge) and §8.1 (bottom bar, Checks tab).
   `m2-workspaces`, six checks, aggregate Pending, zero unresolved threads, squash preferred.
   The temporary driver was removed. The multi-page fixture also proves a late failing check
   and unresolved thread are included before publication.
+## App-managed review implementation notes (not verification evidence)
+
+- `fl-model::review` holds typed thread/comment IDs, repository-relative file anchors and
+  optional 1-based inclusive line ranges, User/Agent origin, triage and lifecycle status.
+  Human comments start Pending; agent findings start Open and enter the pending bundle
+  only after Should fix. Dismiss resolves and excludes a finding; Reopen restores triage.
+- `fld-store::database::Database::{list_reviews,mutate_review}` owns bounded, atomic
+  worktree snapshots and checks `base_rev` before every mutation. `review::SCHEMA_V5`
+  creates the separate review table with cascading worktree deletion. Integration must
+  apply the sections V4 migration before V5 and raise `SCHEMA_VERSION` to 5; this slice
+  deliberately does not invent or skip V4. Migration-fixture downgrades must drop reviews.
+- Append-only protocol 0.4 requests are ListReviews, MutateReview and PendingReviewBundle;
+  responses are Reviews and ReviewBundle. ReviewChanged carries worktree/revision and is
+  gated to 0.4 peers. `Sync::{list_reviews,mutate_review,pending_review_bundle}` exposes
+  these calls; `WorkspacesState::reviews` follows events and reconnects with stale-response
+  protection. M2 workspace/worktree positional structs remain unchanged.
+- Native `host_review.rs` adds a Review panel, file comments from the document strip,
+  comments from the existing inclusive DiffView selection event, anchored file navigation,
+  replies and Should fix/Dismiss/Reopen/Fixing/Resolve. Drafts remain on errors/conflicts.
+  Copy pending reads the authoritative bundle and copies it without marking anything sent.
+  The public sync bundle API is the parent action router's dispatch integration point;
+  this slice does not claim a current/new/background chat delivery.
+- Added domain tests for anchor validation, transitions/replies and dismissed-bundle
+  exclusion, plus a store test for durable restart, revision conflicts and cascade cleanup.
+  No builds, tests, lint, formatters or native smoke were run for this slice.
+- Integration checks to run: `cargo test -p fl-model review`, `cargo test -p fld-store
+  reviews_survive_restart_and_conflicts_are_atomic`, `cargo test -p fl-proto`, and a native
+  client build. Manual smoke: open a worktree file, Comment on file, submit, reply; select
+  one line then Shift-select a range in Changes, submit; navigate each anchor; triage,
+  resolve/reopen and Copy pending; restart daemon and reconnect; edit the same snapshot
+  from two clients to exercise revision rejection while preserving the losing draft.

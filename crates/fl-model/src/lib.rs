@@ -1,6 +1,7 @@
 //! Shared domain values. This crate has no terminal engine, transport or UI dependency.
 pub mod forge;
 pub mod layout;
+pub mod review;
 pub mod workspace;
 
 use serde::{Deserialize, Serialize};
@@ -41,6 +42,8 @@ identity!(
     OperationId,
     ClientSessionId,
     TransferId,
+    ReviewThreadId,
+    ReviewCommentId,
     SubscriptionId
 );
 

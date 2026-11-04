@@ -221,7 +221,8 @@ pub fn daemon_event(value: &fl_model::workspace::DaemonEvent) -> Result<(), Vali
         DaemonEvent::WorktreeStatus(status) => worktree_status(status),
         DaemonEvent::ScriptChanged(state) => script_kind(&state.kind),
         DaemonEvent::ForgeChanged(state) => forge_state(state),
-        DaemonEvent::WorkspaceTreeChanged { .. } | DaemonEvent::LayoutChanged { .. } => Ok(()),
+        DaemonEvent::WorkspaceTreeChanged { .. } | DaemonEvent::LayoutChanged { .. }
+        | DaemonEvent::ReviewChanged { .. } => Ok(()),
     }
 }
 

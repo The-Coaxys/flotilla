@@ -10,6 +10,7 @@ mod clock;
 mod input;
 mod layout;
 mod mirror;
+mod review;
 mod workspaces;
 
 use std::collections::HashMap;

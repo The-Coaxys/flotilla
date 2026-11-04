@@ -211,4 +211,6 @@ pub enum DaemonEvent {
     },
     /// The forge state of a worktree changed (polled or after an action).
     ForgeChanged(crate::forge::ForgeState),
+    /// App-managed reviews changed; fetch the bounded snapshot.
+    ReviewChanged { worktree: WorktreeId, rev: u64 },
 }
