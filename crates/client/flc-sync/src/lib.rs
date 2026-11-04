@@ -255,7 +255,8 @@ impl Sync {
         self.workspaces.clone()
     }
 
-    /// One request on the current link.
+    /// One request on the current link. Runs on the session's Tokio
+    /// runtime, so it can be awaited from any executor (the UI's included).
     pub async fn call(&self, req: Request) -> Result<Response, CallError> {
         let link = self
             .links
@@ -263,7 +264,12 @@ impl Sync {
             .clone()
             .filter(|link| !link.is_closed())
             .ok_or(CallError::Offline)?;
-        Ok(link.rpc(req).await?)
+        self.core
+            .runtime
+            .spawn(async move { link.rpc(req).await })
+            .await
+            .map_err(|_| CallError::Offline)?
+            .map_err(CallError::from)
     }
 
     pub async fn list_dir(&self, path: String) -> Result<DirListing, CallError> {

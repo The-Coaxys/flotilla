@@ -581,6 +581,15 @@ async fn workspaces_status_and_worktree_layouts_follow_the_daemon() {
     let state = wait_workspaces(&sync, "initial tree", |s| s.live && s.tree.is_some()).await;
     let workspace = state.tree.as_ref().unwrap().workspaces[0].id;
 
+    // Requests can be awaited from executors other than Tokio (the UI's).
+    let listing = std::thread::scope(|scope| {
+        scope
+            .spawn(|| futures::executor::block_on(sync.list_dir(repo.display().to_string())))
+            .join()
+            .unwrap()
+    })
+    .unwrap();
+    assert!(listing.entries.iter().any(|entry| entry.name == "a.txt"));
     let project = sync
         .add_project(workspace, repo.display().to_string())
         .await
