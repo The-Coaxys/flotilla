@@ -10,7 +10,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     let provider = args
         .next()
-        .ok_or("usage: chat <claude|codex> <absolute trusted cwd> [model] [output-schema-json]")?;
+        .ok_or("usage: chat <claude|codex|cursor|pi|omp> <absolute trusted cwd> [model] [output-schema-json]")?;
     let cwd = args.next().ok_or("missing cwd")?.into();
     let registry = ProviderRegistry::default();
     for discovery in registry.discover().await {

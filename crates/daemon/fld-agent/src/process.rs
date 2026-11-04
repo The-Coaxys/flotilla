@@ -217,6 +217,12 @@ pub(crate) async fn probe(provider: &ProviderSpec) -> Result<()> {
         AdapterKind::CodexAppServer => {
             cmd.args(["app-server", "--listen", "stdio://"]);
         }
+        AdapterKind::Acp | AdapterKind::CursorStreamJson | AdapterKind::PiRpc => {
+            return Err(AdapterError::Unsupported(format!(
+                "legacy probe does not speak {:?}; use its adapter handshake",
+                provider.adapter
+            )));
+        }
     }
     let mut child = cmd.spawn()?;
     let group = ProcessGroup(child.id());
@@ -282,6 +288,8 @@ pub(crate) fn initialize(kind: AdapterKind, id: &str) -> Value {
         AdapterKind::CodexAppServer => {
             json!({"id":id.parse::<u64>().unwrap_or(1),"method":"initialize","params":{"clientInfo":{"name":"flotilla","title":"Flotilla","version":env!("CARGO_PKG_VERSION")},"capabilities":{"experimentalApi":true}}})
         }
+        // Reached only if a caller bypasses `Adapter::launch` dispatch.
+        AdapterKind::Acp | AdapterKind::CursorStreamJson | AdapterKind::PiRpc => Value::Null,
     }
 }
 
@@ -492,6 +500,11 @@ impl Machine {
             AdapterKind::CodexAppServer => {
                 json!({"id":id.parse::<u64>().unwrap_or(0),"method":method,"params":params})
             }
+            AdapterKind::Acp | AdapterKind::CursorStreamJson | AdapterKind::PiRpc => {
+                return Err(AdapterError::Unsupported(
+                    "legacy RPC writer does not speak this adapter".into(),
+                ));
+            }
         })
     }
     pub fn clear_requests(&mut self) -> Result<()> {
@@ -541,6 +554,11 @@ impl Machine {
         match self.provider.adapter {
             AdapterKind::ClaudeStream => self.claude_incoming(value),
             AdapterKind::CodexAppServer => self.codex_incoming(value),
+            AdapterKind::Acp | AdapterKind::CursorStreamJson | AdapterKind::PiRpc => {
+                Err(AdapterError::Unsupported(
+                    "legacy machine does not speak this adapter".into(),
+                ))
+            }
         }
     }
     fn operation(
@@ -551,6 +569,11 @@ impl Machine {
         match self.provider.adapter {
             AdapterKind::ClaudeStream => self.claude_operation(operation, reply),
             AdapterKind::CodexAppServer => self.codex_operation(operation, reply),
+            AdapterKind::Acp | AdapterKind::CursorStreamJson | AdapterKind::PiRpc => {
+                Err(AdapterError::Unsupported(
+                    "legacy machine does not speak this adapter".into(),
+                ))
+            }
         }
     }
 }
@@ -640,6 +663,7 @@ pub(crate) async fn launch(provider: ProviderSpec, mut config: SessionConfig) ->
         AdapterKind::CodexAppServer => {
             cmd.args(["app-server", "--listen", "stdio://"]);
         }
+        AdapterKind::Acp | AdapterKind::CursorStreamJson | AdapterKind::PiRpc => {}
     }
     let child = cmd.spawn()?;
     let (events_tx, events) = mpsc::channel(EVENT_CAPACITY);

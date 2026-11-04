@@ -1,0 +1,2 @@
+{"type":"ready","protocolVersion":1,"supportedProtocolVersions":[1,2],"maxFrameBytes":1048576}
+{"id":"init","type":"response","command":"get_state","success":true,"data":{"sessionId":"01a1a6ba-900a-713f-9d67-2f8484310993","isStreaming":false,"model":{"id":"claude-opus-5-5"}}}

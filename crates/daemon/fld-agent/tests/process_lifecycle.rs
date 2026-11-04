@@ -144,3 +144,112 @@ async fn resume_does_not_silently_create_a_fresh_session() {
         Err(AdapterError::InvalidResume(_))
     ));
 }
+
+fn resumed(provider: &ProviderSpec, cwd: &std::path::Path) -> SessionConfig {
+    let mut config = config(cwd);
+    config.resume = Some(ResumeTarget {
+        provider_id: provider.id.clone(),
+        adapter: provider.adapter,
+        native_id: uuid::Uuid::new_v4().to_string(),
+        cwd: cwd.into(),
+    });
+    config
+}
+
+#[tokio::test]
+async fn cursor_child_death_between_turns_is_fatal_but_resumable_next_launch() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("cursor.sh");
+    tokio::fs::write(&path, "exit 3\n").await.unwrap();
+    let mut provider = ProviderRegistry::default().get("cursor").unwrap().clone();
+    provider.command = "/bin/sh".into();
+    provider.args = vec![path.to_str().unwrap().into()];
+    let mut adapter = Adapter::launch(provider.clone(), resumed(&provider, dir.path()))
+        .await
+        .unwrap();
+    assert_eq!(adapter.state(), SessionState::Idle);
+    let _ = adapter.send("hello").await;
+    failed(&adapter).await;
+    let mut exited = false;
+    while let Some(record) = adapter.events.recv().await {
+        assert!(!matches!(
+            record.event,
+            ChatEvent::TurnEnd {
+                outcome: TurnOutcome::Completed,
+                ..
+            }
+        ));
+        if let ChatEvent::ProcessExited { code, expected } = record.event {
+            assert_eq!(code, Some(3));
+            assert!(!expected);
+            exited = true;
+        }
+    }
+    assert!(exited);
+}
+
+#[tokio::test]
+async fn cursor_shutdown_reaps_the_turn_loop() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut provider = ProviderRegistry::default().get("cursor").unwrap().clone();
+    provider.command = "/bin/sh".into();
+    let adapter = Adapter::launch(provider.clone(), resumed(&provider, dir.path()))
+        .await
+        .unwrap();
+    adapter.shutdown().await.unwrap();
+    assert_eq!(adapter.state(), SessionState::Closed);
+}
+
+#[tokio::test]
+async fn pi_peer_death_after_a_prompt_never_completes_the_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("pi.sh");
+    let session = uuid::Uuid::new_v4();
+    let script = format!(
+        "IFS= read -r init\nprintf '%s\\n' '{{\"id\":\"init\",\"type\":\"response\",\"command\":\"get_state\",\"success\":true,\"data\":{{\"sessionId\":\"{session}\",\"isStreaming\":false}}}}'\nIFS= read -r prompt\nexit 9\n"
+    );
+    tokio::fs::write(&path, script).await.unwrap();
+    let mut provider = ProviderRegistry::default().get("pi").unwrap().clone();
+    provider.command = "/bin/sh".into();
+    provider.args = vec![path.to_str().unwrap().into()];
+    let mut adapter = Adapter::launch(provider, config(dir.path())).await.unwrap();
+    assert_eq!(adapter.state(), SessionState::Idle);
+    let _ = adapter.send("hello").await;
+    failed(&adapter).await;
+    let mut exited = false;
+    while let Some(record) = adapter.events.recv().await {
+        assert!(!matches!(
+            record.event,
+            ChatEvent::TurnEnd {
+                outcome: TurnOutcome::Completed,
+                ..
+            }
+        ));
+        if let ChatEvent::ProcessExited { code, expected } = record.event {
+            assert_eq!(code, Some(9));
+            assert!(!expected);
+            exited = true;
+        }
+    }
+    assert!(exited);
+}
+
+#[tokio::test]
+async fn acp_initialize_death_reports_the_exact_launch_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("acp.sh");
+    tokio::fs::write(&path, "exit 4\n").await.unwrap();
+    let mut provider = ProviderRegistry::default().get("claude").unwrap().clone();
+    provider.command = "/bin/sh".into();
+    provider.args = vec![path.to_str().unwrap().into()];
+    provider.adapter = AdapterKind::Acp;
+    provider.resume = ResumeStrategy::AcpSession;
+    let error = match Adapter::launch(provider, config(dir.path())).await {
+        Ok(_) => panic!("ACP initialize should fail when the child exits"),
+        Err(error) => error,
+    };
+    assert!(
+        matches!(error, AdapterError::Closed(_)),
+        "unexpected launch error: {error}"
+    );
+}
