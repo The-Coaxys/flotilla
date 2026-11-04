@@ -1136,7 +1136,56 @@ impl TextBuffer {
         self.saved_id = revision;
         self.group_open = false;
     }
+
+    /// Non-overlapping matches of `query`, at most [`MAX_FIND_MATCHES`].
+    /// Case-insensitive matching folds each character with Unicode
+    /// lowercasing, so ranges stay byte ranges of this document.
+    pub fn find_all(&self, query: &str, case_sensitive: bool) -> Vec<Range<usize>> {
+        if query.is_empty() {
+            return Vec::new();
+        }
+        let text = self.text();
+        let mut matches = Vec::new();
+        if case_sensitive {
+            for (start, found) in text.match_indices(query) {
+                matches.push(start..start + found.len());
+                if matches.len() == MAX_FIND_MATCHES {
+                    break;
+                }
+            }
+            return matches;
+        }
+        let needle: Vec<char> = query.chars().flat_map(char::to_lowercase).collect();
+        let mut start = 0;
+        while start < text.len() && matches.len() < MAX_FIND_MATCHES {
+            let mut folded = text[start..]
+                .char_indices()
+                .flat_map(|(at, c)| c.to_lowercase().map(move |lower| (at, c.len_utf8(), lower)));
+            let mut end = None;
+            let mut matched = 0;
+            for &want in &needle {
+                match folded.next() {
+                    Some((at, len, got)) if got == want => {
+                        matched += 1;
+                        end = Some(start + at + len);
+                    }
+                    _ => break,
+                }
+            }
+            match end {
+                Some(end) if matched == needle.len() => {
+                    matches.push(start..end);
+                    start = end;
+                }
+                _ => start += text[start..].chars().next().map_or(1, char::len_utf8),
+            }
+        }
+        matches
+    }
 }
+
+/// Upper bound on highlighted find matches.
+pub const MAX_FIND_MATCHES: usize = 10_000;
 
 /// Where `offset` lands after `edit`; an offset at an insertion point moves
 /// past the inserted text.
@@ -1507,6 +1556,27 @@ mod tests {
         );
         assert!(buffer.take_changes().is_empty());
         assert_eq!(buffer.version(), 2);
+    }
+
+    #[test]
+    fn find_matches_case_sensitively_and_insensitively() {
+        let buffer = TextBuffer::new("Foo foo FOO\nÉtÉ été\n");
+        assert_eq!(buffer.find_all("foo", true), vec![4..7]);
+        assert_eq!(buffer.find_all("foo", false), vec![0..3, 4..7, 8..11]);
+        let text = buffer.text();
+        let accents = buffer.find_all("été", false);
+        assert_eq!(accents.len(), 2);
+        assert!(
+            accents
+                .iter()
+                .all(|r| text[r.clone()].to_lowercase() == "été")
+        );
+        assert!(buffer.find_all("", false).is_empty());
+        assert!(buffer.find_all("missing", false).is_empty());
+        assert_eq!(
+            TextBuffer::new("aaaa").find_all("aa", true),
+            vec![0..2, 2..4]
+        );
     }
 
     #[test]
