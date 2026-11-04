@@ -31,6 +31,8 @@ use gpui::{
 use super::git_actions::{self, GitAction};
 use super::host_view::{primary_button, secondary_button};
 
+#[path = "host_chat.rs"]
+mod host_chat;
 #[path = "host_routes.rs"]
 mod routes;
 #[path = "host_sections.rs"]
@@ -51,6 +53,7 @@ enum Panel {
     Changes,
     Checks,
     Review,
+    Chat,
 }
 
 enum DocumentKind {
@@ -148,6 +151,7 @@ pub struct HostWorkspace {
     review: review::ReviewUi,
     sections_ui: sections::SectionsUi,
     routes_ui: routes::RoutesUi,
+    chat: host_chat::ChatUi,
     banner: Option<SharedString>,
     rtt: Option<Duration>,
     /// A just-added project whose primary checkout opens once the daemon's
@@ -161,6 +165,7 @@ pub struct HostWorkspace {
     /// Keeps the selected worktree's forge state fresh.
     _forge_poll: Option<Task<()>>,
     _follow: Task<()>,
+    _chat_follow: Task<()>,
 }
 
 impl EventEmitter<HostWorkspaceEvent> for HostWorkspace {}
@@ -238,6 +243,19 @@ impl HostWorkspace {
             }
         })
         .detach();
+        let mut chats = sync.chats_changes();
+        let chat_follow = cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            loop {
+                let state = chats.borrow_and_update().clone();
+                if this
+                    .update(cx, |view, cx| view.chat.adopt(state, cx))
+                    .is_err()
+                    || chats.changed().await.is_err()
+                {
+                    break;
+                }
+            }
+        });
         let mut changes = sync.workspaces_changes();
         let follow = cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             loop {
@@ -262,6 +280,7 @@ impl HostWorkspace {
                 }
             }
         });
+        let chat = host_chat::ChatUi::new(sync.chats());
         Self {
             state: sync.workspaces(),
             sync,
@@ -280,6 +299,7 @@ impl HostWorkspace {
             review: review::ReviewUi::default(),
             sections_ui: sections::SectionsUi::default(),
             routes_ui: routes::RoutesUi::default(),
+            chat,
             banner: None,
             rtt: None,
             pending_select: None,
@@ -288,6 +308,7 @@ impl HostWorkspace {
             git_menu: false,
             _forge_poll: None,
             _follow: follow,
+            _chat_follow: chat_follow,
         }
     }
 
@@ -746,6 +767,7 @@ impl HostWorkspace {
             .position(|doc| doc.path == path && matches!(doc.kind, DocumentKind::Diff(_)) == diff);
         if let Some(index) = found {
             documents.active = Some(index);
+            self.chat.clear_active();
         }
         found.is_some()
     }
@@ -789,6 +811,7 @@ impl HostWorkspace {
                         _review_events: None,
                     });
                     documents.active = Some(documents.open.len() - 1);
+                    view.chat.clear_active();
                     cx.notify();
                 }
                 Err(error) => {
@@ -890,6 +913,7 @@ impl HostWorkspace {
                         _review_events: Some(review_events),
                     });
                     documents.active = Some(documents.open.len() - 1);
+                    view.chat.clear_active();
                     cx.notify();
                 }
                 Err(error) => view.show_error(
@@ -1440,8 +1464,13 @@ impl HostWorkspace {
         t: &Theme,
         cx: &mut Context<Self>,
     ) -> Option<impl IntoElement + use<>> {
-        let documents = self.documents.get(&self.scope)?;
-        if documents.open.is_empty() {
+        let documents = self.documents.get(&self.scope);
+        let has_documents = documents.is_some_and(|documents| !documents.open.is_empty());
+        let active_document = documents.and_then(|documents| documents.active);
+        let chat_tabs = self.chat.tab_labels(self.scope);
+        let chat_active = self.chat.active_for(self.scope);
+        let is_worktree = matches!(self.scope, LayoutScope::Worktree(_));
+        if !has_documents && chat_tabs.is_empty() && !is_worktree {
             return None;
         }
         let tab = |id: SharedString, label: SharedString, active: bool| {
@@ -1476,49 +1505,93 @@ impl HostWorkspace {
                 tab(
                     "doc-terminals".into(),
                     "Terminals".into(),
-                    documents.active.is_none(),
+                    active_document.is_none() && chat_active.is_none(),
                 )
                 .on_click(cx.listener(|view, _, _, cx| {
-                    view.documents().active = None;
+                    if let Some(documents) = view.documents.get_mut(&view.scope) {
+                        documents.active = None;
+                    }
+                    view.chat.clear_active();
                     cx.notify();
                 })),
             );
-        for (index, doc) in documents.open.iter().enumerate() {
-            let dirty = match &doc.kind {
-                DocumentKind::File { editor, .. } => editor.read(cx).is_dirty(),
-                DocumentKind::Diff(_) => false,
-            };
-            let label: SharedString = if dirty {
-                format!("● {}", doc.title).into()
-            } else {
-                doc.title.clone()
-            };
+        for (session, label, active) in chat_tabs {
+            let tab_label: SharedString = format!("◆ {label}").into();
             strip = strip.child(
                 tab(
-                    format!("doc-{index}").into(),
-                    label,
-                    documents.active == Some(index),
+                    SharedString::from(format!("chat-tab-{session}")),
+                    tab_label,
+                    active,
                 )
                 .on_click(cx.listener(move |view, _, _, cx| {
-                    view.documents().active = Some(index);
-                    cx.notify();
+                    view.select_chat_tab(session, cx)
                 }))
                 .child(
                     div()
-                        .id(SharedString::from(format!("doc-close-{index}")))
+                        .id(SharedString::from(format!("chat-tab-close-{session}")))
                         .text_color(t.text_tertiary)
                         .child("×")
                         .on_click(cx.listener(move |view, _, _, cx| {
                             cx.stop_propagation();
-                            view.close_document(index, cx)
+                            view.close_chat_tab(session, cx)
                         })),
                 ),
             );
         }
-        strip = strip.child(
-            secondary_button("review-file", "Comment on file", t)
-                .on_click(cx.listener(|view, _, _, cx| view.review_active_file(cx))),
-        );
+        if let Some(documents) = documents {
+            for (index, doc) in documents.open.iter().enumerate() {
+                let dirty = match &doc.kind {
+                    DocumentKind::File { editor, .. } => editor.read(cx).is_dirty(),
+                    DocumentKind::Diff(_) => false,
+                };
+                let label: SharedString = if dirty {
+                    format!("● {}", doc.title).into()
+                } else {
+                    doc.title.clone()
+                };
+                strip = strip.child(
+                    tab(
+                        format!("doc-{index}").into(),
+                        label,
+                        active_document == Some(index) && chat_active.is_none(),
+                    )
+                    .on_click(cx.listener(move |view, _, _, cx| {
+                        view.chat.clear_active();
+                        if let Some(documents) = view.documents.get_mut(&view.scope) {
+                            documents.active = Some(index);
+                        }
+                        cx.notify();
+                    }))
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("doc-close-{index}")))
+                            .text_color(t.text_tertiary)
+                            .child("×")
+                            .on_click(cx.listener(move |view, _, _, cx| {
+                                cx.stop_propagation();
+                                view.close_document(index, cx)
+                            })),
+                    ),
+                );
+            }
+        }
+        if is_worktree {
+            strip = strip.child(
+                secondary_button("open-chat-panel", "Chat", t).on_click(cx.listener(
+                    |view, _, _, cx| {
+                        view.panel = Panel::Chat;
+                        view.panel_open = true;
+                        cx.notify();
+                    },
+                )),
+            );
+        }
+        if has_documents {
+            strip = strip.child(
+                secondary_button("review-file", "Comment on file", t)
+                    .on_click(cx.listener(|view, _, _, cx| view.review_active_file(cx))),
+            );
+        }
         Some(strip)
     }
 
@@ -1659,7 +1732,7 @@ impl HostWorkspace {
         let id = worktree.id;
         // A plain folder has no git changes to list.
         let folder = self.is_folder(worktree);
-        if folder && self.panel != Panel::Review {
+        if folder && !matches!(self.panel, Panel::Review | Panel::Chat) {
             self.panel = Panel::Files;
         }
         let changes = self
@@ -1722,7 +1795,8 @@ impl HostWorkspace {
                 Panel::Review,
                 self.panel == Panel::Review,
                 cx,
-            ));
+            ))
+            .child(segment("Chat".into(), Panel::Chat, self.panel == Panel::Chat, cx));
         let body: AnyElement = match self.panel {
             Panel::Files => self
                 .render_file_tree(&worktree.path, &t, cx)
@@ -1730,6 +1804,7 @@ impl HostWorkspace {
             Panel::Changes => self.render_changes(id, &changes, &t, cx).into_any_element(),
             Panel::Checks => self.render_checks(id, &t, cx).into_any_element(),
             Panel::Review => self.render_reviews(id, &t, cx).into_any_element(),
+            Panel::Chat => self.render_chat_panel(id, &t, cx),
         };
         let scripts = self.render_scripts(id, &t, window, cx);
         div()
@@ -2238,6 +2313,9 @@ impl HostWorkspace {
     }
 
     fn render_dialog(&self, t: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if let Some(dialog) = self.render_chat_dialog(t, cx) {
+            return Some(dialog);
+        }
         if let Some(dialog) = self.render_sections_dialog(t, cx) {
             return Some(dialog);
         }
@@ -2596,6 +2674,7 @@ impl HostWorkspace {
 impl Render for HostWorkspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = cx.theme().clone();
+        self.apply_pending_chat(window, cx);
         let strip = self
             .render_documents_strip(&t, cx)
             .map(IntoElement::into_any_element);
@@ -2607,9 +2686,13 @@ impl Render for HostWorkspace {
                 DocumentKind::File { editor, .. } => editor.clone().into_any_element(),
                 DocumentKind::Diff(diff) => diff.clone().into_any_element(),
             });
-        let content = match active_document {
-            Some(document) => document,
-            None => self.shell(window, cx).into_any_element(),
+        let chat_session = self.chat.active_for(self.scope);
+        let content = match chat_session {
+            Some(session) => self.render_chat_surface(session, window, cx),
+            None => match active_document {
+                Some(document) => document,
+                None => self.shell(window, cx).into_any_element(),
+            },
         };
         let bottom = self.render_bottom_bar(&t, cx);
         let panel = match self.selected_worktree().cloned() {
@@ -2619,6 +2702,7 @@ impl Render for HostWorkspace {
             _ => None,
         };
         let banner = self.banner.clone();
+        let toasts = self.render_chat_toasts(&t, cx);
         let dialog = self.render_dialog(&t, cx);
         let git_menu = self.render_git_menu(&t, cx);
         let dispatches = self.render_dispatch_strip(&t, cx);
@@ -2657,6 +2741,7 @@ impl Render for HostWorkspace {
             )
             .children(panel)
             .children(git_menu)
+            .children(toasts)
             .children(dialog)
     }
 }
