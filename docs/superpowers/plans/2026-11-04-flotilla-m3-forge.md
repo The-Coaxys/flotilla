@@ -172,3 +172,28 @@ button, direct operations, forge) and §8.1 (bottom bar, Checks tab).
   state does not match, delete the manual section, reconnect/restart the daemon and confirm
   persistence and cross-client updates. Disconnected/unsupported controls and stale-edit
   errors must remain visible and safe. This interaction is prescribed, not exercised.
+
+
+## Sections, app-managed review threads and routing preparation
+
+Implemented and exercised after the direct loop:
+
+- `fl-model::sections` + store schema V4 + `ListSections`/`MutateSections` + `SectionsChanged`:
+  manual and filter sections with display order, filter priority, pins and manual assignments;
+  classification is pinned → manual assignment → filter (descending priority) → unassigned.
+- `fl-model::review` + store schema V5 + `ListReviews`/`MutateReview`/`PendingReviewBundle`:
+  file and line-range anchors, replies, triage (Should fix / Dismiss), lifecycle transitions,
+  revision compare-and-set, and `ReviewChanged`. Copying the pending bundle never claims a send.
+- `fl-model::routing` + store schema V6 + `GetRouting`/`MutateRouting`/`ListChatProviders`/
+  `DispatchGitTask`: scopes global/workspace/project, group and action overrides, dispatch modes
+  including alternate click, per-scope prompt templates with bounded `{{name}}` interpolation,
+  and real provider discovery through the adapter core. Prepare modes render the real prompt;
+  submit modes report explicitly that the chat runtime is required and never pretend to run.
+
+Native X11 evidence (real daemon, scripted forge): created a section, assigned a worktree
+(pin precedence then manual precedence both visible in the sidebar), opened the Review panel,
+added a thread on `z.txt`, restarted the daemon and confirmed the section, assignment and
+thread survived with `Copy pending` producing the thread's prompt on the clipboard.
+
+Known gaps at this point: routed submit execution (needs the chat runtime), routes/templates UI
+and the agent-routed Git actions UI (in progress), and a Windows client run of these surfaces.
