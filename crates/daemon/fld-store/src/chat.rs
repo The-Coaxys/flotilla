@@ -11,8 +11,8 @@
 //! back to `LIKE`; both modes are recorded in `chat_meta.fts5`.
 use super::*;
 use fl_model::chat::{
-    ChatEventPage, ChatHit, ChatSession, EventRecord, InboxItem, InboxKind, InboxState,
-    ResumeTarget, SessionState, StatusSource,
+    ChatEvent, ChatEventPage, ChatHit, ChatSession, EventRecord, InboxItem, InboxKind, InboxState,
+    ResumeTarget, SessionState, StatusSource, CHAT_SCHEMA_VERSION,
 };
 
 const MAX_CHAT_EVENT_BYTES: usize = 2 * 1024 * 1024;
@@ -199,13 +199,26 @@ impl Database {
         Ok(())
     }
 
+    /// Newest [`fl_model::chat::MAX_CHAT_HISTORY`] sessions of one worktree, in
+    /// creation order. Older sessions remain durably stored and searchable but
+    /// are not listed; callers that need them page transcripts by session ID.
     pub fn chat_sessions(&self, worktree: WorktreeId) -> Result<Vec<ChatSession>> {
         let mut statement = self.connection.prepare(
             "SELECT id,worktree,provider,label,status,status_source,model,thinking,
                     permission_mode,resume,seq,created_ms,updated_ms
-             FROM chat_sessions WHERE worktree=?1 ORDER BY created_ms,id",
+             FROM (
+                SELECT * FROM chat_sessions WHERE worktree=?1
+                ORDER BY created_ms DESC,id DESC
+                LIMIT ?2
+             ) ORDER BY created_ms,id",
         )?;
-        let rows = statement.query_map([worktree.as_bytes().as_slice()], decode_session)?;
+        let rows = statement.query_map(
+            params![
+                worktree.as_bytes().as_slice(),
+                fl_model::chat::MAX_CHAT_HISTORY as i64
+            ],
+            decode_session,
+        )?;
         rows.collect::<rusqlite::Result<Vec<_>>>()?
             .into_iter()
             .collect()
@@ -503,6 +516,28 @@ impl Database {
         message: &str,
         now: u64,
     ) -> Result<ChatSession> {
+        self.fail_chat_session_notify(id, message, None, now)
+    }
+
+    /// Fail a session and add its error card in the same transaction, so a
+    /// channel that closed on an error is both visible and durable.
+    pub fn fail_chat_session_with_inbox(
+        &mut self,
+        id: uuid::Uuid,
+        message: &str,
+        item: NewInboxItem,
+        now: u64,
+    ) -> Result<ChatSession> {
+        self.fail_chat_session_notify(id, message, Some(item), now)
+    }
+
+    fn fail_chat_session_notify(
+        &mut self,
+        id: uuid::Uuid,
+        message: &str,
+        inbox: Option<NewInboxItem>,
+        now: u64,
+    ) -> Result<ChatSession> {
         validate_chat_text("chat failure", message, MAX_CHAT_TITLE_BYTES)?;
         let status = SessionState::Failed {
             message: message.to_owned(),
@@ -538,6 +573,9 @@ impl Database {
         )?;
         let (session, _) = load_chat(&transaction, id)?
             .ok_or_else(|| StoreError::Missing("chat session not found".into()))?;
+        if let Some(item) = inbox {
+            insert_inbox(&transaction, id, session.worktree, &item)?;
+        }
         transaction.commit()?;
         Ok(session)
     }
@@ -641,8 +679,9 @@ impl Database {
 
     /// Normalize every session after a daemon restart. No live adapter exists,
     /// so pending decisions are unanswerable: they are cleared, their inbox
-    /// cards are dismissed, and a previously working session reads idle. This
-    /// never manufactures a successful turn.
+    /// cards are dismissed, and a previously working session reads idle. A
+    /// session caught mid-turn gets a durable `interrupted` event before it is
+    /// normalized, so the transcript never silently loses a running turn.
     pub fn reset_chats_after_restart(&mut self, now: u64) -> Result<Vec<ChatSession>> {
         let transaction = self
             .connection
@@ -656,6 +695,7 @@ impl Database {
                 inbox_kind_code(InboxKind::Question),
             ],
         )?;
+        Self::record_interrupted_turns(&transaction, now)?;
         transaction.execute(
             "UPDATE chat_sessions SET status=?1,status_source=?2,updated_ms=max(updated_ms,?3)
              WHERE archived=0 AND status != ?4",
@@ -679,6 +719,70 @@ impl Database {
         drop(statement);
         transaction.commit()?;
         Ok(sessions)
+    }
+
+    /// Append one durable `interrupted` error to every non-archived session
+    /// that was Running when the previous daemon stopped. The store never
+    /// fabricates a completed turn; the transcript instead explains the gap.
+    fn record_interrupted_turns(connection: &Connection, now: u64) -> Result<()> {
+        let mut statement = connection.prepare(
+            "SELECT id,seq,incarnation,status FROM chat_sessions WHERE archived=0",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+                row.get::<_, Vec<u8>>(3)?,
+            ))
+        })?;
+        let mut interrupted = Vec::new();
+        for row in rows {
+            let (id, seq, incarnation, status) = row?;
+            let status: SessionState = postcard::from_bytes(&status)?;
+            if matches!(status, SessionState::Running) {
+                interrupted.push((
+                    uuid_from(&id)?,
+                    sequence_u64(&seq)?,
+                    uuid_from(&incarnation)?,
+                ));
+            }
+        }
+        drop(statement);
+        for (id, seq, incarnation) in interrupted {
+            let sequence = seq
+                .checked_add(1)
+                .ok_or_else(|| corrupt("chat sequence overflow"))?;
+            let record = EventRecord {
+                schema_version: CHAT_SCHEMA_VERSION,
+                session_id: id,
+                incarnation,
+                sequence,
+                timestamp_ms: now,
+                native_session_id: None,
+                turn_id: None,
+                event: ChatEvent::Error {
+                    code: "interrupted".into(),
+                    message: "the daemon stopped while this turn was running; the provider turn was interrupted".into(),
+                    fatal: false,
+                },
+            };
+            let bytes = postcard::to_stdvec(&record)?;
+            if bytes.len() > MAX_CHAT_EVENT_BYTES {
+                return Err(StoreError::Invalid("chat event exceeds byte limit".into()));
+            }
+            let search = fl_model::chat::search_text(&record.event);
+            connection.execute(
+                "INSERT INTO chat_events(session,sequence,record,search_text)
+                 VALUES(?1,?2,?3,?4)",
+                params![id.as_bytes().as_slice(), sequence_key(sequence), bytes, search],
+            )?;
+            connection.execute(
+                "UPDATE chat_sessions SET seq=?2,updated_ms=max(updated_ms,?3) WHERE id=?1",
+                params![id.as_bytes().as_slice(), sequence_key(sequence), sql_ms(now)?],
+            )?;
+        }
+        Ok(())
     }
 
     /// Mark a session archived read-only: its transcript stays searchable and
@@ -828,9 +932,9 @@ fn validate_session(session: &ChatSession) -> Result<()> {
 fn validate_resume(resume: &ResumeTarget) -> Result<()> {
     validate_chat_text("resume provider", &resume.provider_id, MAX_CHAT_PROVIDER_BYTES)?;
     let native = &resume.native_id;
-    if native.is_empty() || native.len() > 512 {
+    if native.is_empty() || native.len() > MAX_CHAT_MODEL_BYTES {
         return Err(StoreError::Invalid(
-            "resume identity must be 1..512 bytes".into(),
+            "resume identity must be 1..1024 bytes".into(),
         ));
     }
     if resume.cwd.as_os_str().is_empty() || resume.cwd.to_str().is_none() {
@@ -895,6 +999,14 @@ fn insert_inbox(
             item.dedupe,
             sql_ms(item.created_ms)?,
         ],
+    )?;
+    // One bounded inbox: prune the oldest rows in the adding transaction so
+    // an unbounded provider cannot grow the table without limit.
+    connection.execute(
+        "DELETE FROM chat_inbox WHERE id NOT IN (
+            SELECT id FROM chat_inbox ORDER BY created_ms DESC, id DESC LIMIT ?1
+         )",
+        [fl_model::chat::MAX_CHAT_HISTORY as i64],
     )?;
     Ok(())
 }
@@ -1236,7 +1348,9 @@ fn substring_snippet(text: &str, query: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fl_model::chat::{ChatEvent, PermissionMode, TextUpdate};
+    use fl_model::chat::{
+        ApprovalDecision, BoundedText, ChatEvent, PermissionMode, TextUpdate,
+    };
 
     fn root() -> tempfile::TempDir {
         tempfile::tempdir().unwrap()
@@ -1456,6 +1570,126 @@ mod tests {
         assert_eq!(sessions[0].status_source, StatusSource::Heuristic);
         assert!(db.chat_pending(id).unwrap().is_empty());
         assert!(db.chat_inbox().unwrap().is_empty());
+        let page = db.chat_event_page(id, 1, 16).unwrap();
+        assert_eq!(page.events.len(), 2);
+        assert!(matches!(
+            &page.events[1].event,
+            ChatEvent::Error { code, .. } if code == "interrupted"
+        ));
+        assert_eq!(sessions[0].seq, 2);
+    }
+
+    #[test]
+    fn nested_subagent_decisions_are_listed_and_resolved_by_child_id() {
+        let dir = root();
+        let mut db = Database::open(dir.path()).unwrap();
+        let (worktree, id) = seed_worktree(&db);
+        db.create_chat_session(&session(worktree, id)).unwrap();
+        let incarnation = uuid::Uuid::new_v4();
+        let event = ChatEvent::Subagent {
+            parent_tool_id: "tool".into(),
+            events: vec![ChatEvent::ApprovalRequest {
+                id: "child-approval".into(),
+                tool: "Bash".into(),
+                details: BoundedText {
+                    text: "pwd".into(),
+                    truncated: false,
+                },
+                options: vec![ApprovalDecision::AllowOnce, ApprovalDecision::Deny],
+            }],
+        };
+        let record = EventRecord {
+            schema_version: CHAT_SCHEMA_VERSION,
+            session_id: id,
+            incarnation,
+            sequence: 1,
+            timestamp_ms: 2,
+            native_session_id: Some("native".into()),
+            turn_id: None,
+            event,
+        };
+        let effects = ChatEventEffects {
+            status: Some((SessionState::AwaitingInput, StatusSource::Structured)),
+            add_pending: vec![PendingRequest {
+                request: "child-approval".into(),
+                kind: PendingKind::Approval,
+                payload: postcard::to_stdvec(&record.event).unwrap(),
+                created_ms: 2,
+            }],
+            inbox: vec![NewInboxItem {
+                kind: InboxKind::Approval,
+                title: "Approval needed: Bash".into(),
+                dedupe: "approval:child-approval".into(),
+                created_ms: 2,
+            }],
+            ..Default::default()
+        };
+        db.append_chat_event(id, &record, effects).unwrap();
+        let pending = db.chat_pending(id).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].request, "child-approval");
+        assert_eq!(db.chat_session(id).unwrap().status, SessionState::AwaitingInput);
+        let inbox = db.chat_inbox().unwrap();
+        assert_eq!(inbox.len(), 1);
+        assert_eq!(inbox[0].kind, InboxKind::Approval);
+        db.resolve_chat_pending(id, "child-approval", "approval:child-approval")
+            .unwrap();
+        assert!(db.chat_pending(id).unwrap().is_empty());
+        assert!(db.chat_inbox().unwrap().is_empty());
+    }
+
+    #[test]
+    fn inbox_pruning_keeps_the_newest_items_in_the_adding_transaction() {
+        let dir = root();
+        let mut db = Database::open(dir.path()).unwrap();
+        let (worktree, id) = seed_worktree(&db);
+        db.create_chat_session(&session(worktree, id)).unwrap();
+        let total = fl_model::chat::MAX_CHAT_HISTORY + 8;
+        for index in 0..total {
+            db.add_chat_inbox(
+                id,
+                NewInboxItem {
+                    kind: InboxKind::Completed,
+                    title: format!("item {index}"),
+                    dedupe: format!("inbox:{index}"),
+                    created_ms: index as u64,
+                },
+            )
+            .unwrap();
+        }
+        let inbox = db.chat_inbox().unwrap();
+        assert_eq!(inbox.len(), fl_model::chat::MAX_CHAT_HISTORY);
+        assert!(inbox.iter().all(|item| item.title != "item 0"));
+        assert!(
+            inbox
+                .iter()
+                .any(|item| item.title == format!("item {}", total - 1))
+        );
+        let count: i64 = db
+            .connection
+            .query_row("SELECT count(*) FROM chat_inbox", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, fl_model::chat::MAX_CHAT_HISTORY as i64);
+    }
+
+    #[test]
+    fn session_lists_are_bounded_to_the_newest_history_window() {
+        let dir = root();
+        let mut db = Database::open(dir.path()).unwrap();
+        let (worktree, _) = seed_worktree(&db);
+        let mut ids = Vec::new();
+        for index in 0..(fl_model::chat::MAX_CHAT_HISTORY + 3) {
+            let id = uuid::Uuid::new_v4();
+            let mut value = session(worktree, id);
+            value.created_ms = 100 + index as u64;
+            value.updated_ms = value.created_ms;
+            db.create_chat_session(&value).unwrap();
+            ids.push(id);
+        }
+        let listed = db.chat_sessions(worktree).unwrap();
+        assert_eq!(listed.len(), fl_model::chat::MAX_CHAT_HISTORY);
+        assert!(!listed.iter().any(|session| session.id == ids[0]));
+        assert_eq!(listed.last().unwrap().id, *ids.last().unwrap());
     }
 
     #[test]

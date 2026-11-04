@@ -9,6 +9,26 @@ use tokio::sync::oneshot;
 fn rpc_error(id: Value, message: &str) -> Value {
     json!({"id":id,"error":{"code":-32601,"message":message}})
 }
+/// Only a genuinely unknown thread makes a stored resume target unusable.
+/// Transient transport/auth/provider failures must keep the transcript
+/// restorable instead of archiving it.
+fn unknown_thread(error: &Value) -> bool {
+    let message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    [
+        "thread not found",
+        "unknown thread",
+        "thread does not exist",
+        "no such thread",
+        "missing thread",
+        "thread is gone",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle))
+}
 fn rpc_id(value: &Value) -> Result<String> {
     match value {
         Value::String(s) if !s.is_empty() => Ok(s.clone()),
@@ -226,10 +246,12 @@ impl Machine {
             match pending.kind {
                 PendingKind::Initialize => return Err(AdapterError::Unsupported(message)),
                 PendingKind::ReadResume | PendingKind::OpenSession => {
-                    return Err(if self.info.resumed {
+                    return Err(if !self.info.resumed {
+                        AdapterError::Rejected(message)
+                    } else if unknown_thread(error) {
                         AdapterError::InvalidResume(message)
                     } else {
-                        AdapterError::Rejected(message)
+                        AdapterError::Protocol(message)
                     });
                 }
                 PendingKind::Send { .. } => {
@@ -848,6 +870,34 @@ mod tests {
             machine.codex_incoming(response),
             Err(AdapterError::InvalidResume(_))
         ));
+    }
+    #[test]
+    fn resumed_thread_errors_are_protocol_unless_the_thread_is_unknown() {
+        let (mut machine, _events) = test_machine(AdapterKind::CodexAppServer);
+        machine.config.resume = Some(machine.info.resume.clone());
+        machine.info.resumed = true;
+        for (message, unknown) in [
+            ("thread not found", true),
+            ("connection reset by peer", false),
+            ("authentication failed", false),
+        ] {
+            machine.pending.insert(
+                "9".into(),
+                Pending {
+                    kind: PendingKind::ReadResume,
+                    reply: None,
+                    started: Instant::now(),
+                },
+            );
+            let error = machine
+                .codex_incoming(json!({"id":9,"error":{"code":-32602,"message":message}}))
+                .expect_err("an RPC error is reported");
+            match (error, unknown) {
+                (AdapterError::InvalidResume(_), true) => {}
+                (AdapterError::Protocol(_), false) => {}
+                (other, _) => panic!("{message:?} classified as {other:?}"),
+            }
+        }
     }
     #[test]
     fn approvals_preserve_integer_or_string_ids_and_only_allow_once() {

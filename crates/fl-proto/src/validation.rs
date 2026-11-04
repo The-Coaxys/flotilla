@@ -252,6 +252,8 @@ pub const MAX_CHAT_REQUEST_BYTES: usize = 1024;
 pub const MAX_CHAT_ANSWERS: usize = 64;
 pub const MAX_CHAT_ANSWER_BYTES: usize = 4096;
 pub const MAX_CHAT_MODEL_BYTES: usize = 1024;
+/// Provider-native session and turn identities on one event record.
+pub const MAX_CHAT_ID_BYTES: usize = 1024;
 pub const MAX_CHAT_PROVIDER_BYTES: usize = 256;
 /// Session labels, failure text and inbox titles.
 pub const MAX_CHAT_INBOX_BYTES: usize = 4096;
@@ -284,7 +286,7 @@ pub fn chat_resume(value: &fl_model::chat::ResumeTarget) -> Result<(), Validatio
     if value.provider_id.trim().is_empty() {
         return Err(ValidationError::Invalid("resume provider"));
     }
-    text("resume identity", &value.native_id, 512)?;
+    text("resume identity", &value.native_id, MAX_CHAT_ID_BYTES)?;
     if value.native_id.is_empty() {
         return Err(ValidationError::Invalid("resume identity"));
     }
@@ -329,6 +331,12 @@ pub fn chat_event(value: &fl_model::chat::EventRecord) -> Result<(), ValidationE
     )?;
     non_nil("chat session", value.session_id)?;
     non_nil("chat incarnation", value.incarnation)?;
+    for field in [&value.native_session_id, &value.turn_id]
+        .into_iter()
+        .flatten()
+    {
+        text("chat event identity", field, MAX_CHAT_ID_BYTES)?;
+    }
     let size = postcard::experimental::serialized_size(value)
         .map_err(|error| ValidationError::InvalidPayload(error.to_string()))?;
     bound("chat event bytes", size, MAX_CHAT_EVENT_BYTES)?;

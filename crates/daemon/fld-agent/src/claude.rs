@@ -100,9 +100,12 @@ pub(crate) async fn validate_resume(
         .join("projects")
         .join(encoded)
         .join(format!("{}.jsonl", target.native_id));
+    // A missing/unreadable transcript is an environment failure. Only a
+    // readable transcript that lacks the requested identity is a semantic
+    // resume mismatch that may archive the chat.
     let file = tokio::fs::File::open(path)
         .await
-        .map_err(|e| AdapterError::InvalidResume(format!("Claude transcript: {e}")))?;
+        .map_err(|e| AdapterError::Protocol(format!("Claude transcript: {e}")))?;
     let mut lines = BufReader::new(file.take((MAX_WIRE_LINE * 4) as u64)).lines();
     while let Some(line) = lines.next_line().await? {
         if line.len() > MAX_WIRE_LINE {
@@ -810,6 +813,60 @@ mod tests {
                 .windows(2)
                 .all(|r| r[1].sequence == r[0].sequence + 1)
         );
+    }
+    #[tokio::test]
+    async fn missing_transcript_is_transient_not_an_invalid_resume() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut provider = crate::ProviderRegistry::default()
+            .get("claude")
+            .unwrap()
+            .clone();
+        provider.env.insert(
+            "CLAUDE_CONFIG_DIR".into(),
+            dir.path().to_string_lossy().into_owned(),
+        );
+        let target = ResumeTarget {
+            provider_id: "claude".into(),
+            adapter: AdapterKind::ClaudeStream,
+            native_id: uuid::Uuid::new_v4().to_string(),
+            cwd: dir.path().into(),
+        };
+        assert!(matches!(
+            validate_resume(&provider, &target, dir.path()).await,
+            Err(AdapterError::Protocol(_))
+        ));
+    }
+    #[test]
+    fn failed_turn_keeps_failed_state_until_the_next_send() {
+        let (mut machine, mut events) = test_machine(AdapterKind::ClaudeStream);
+        machine.active_turn = Some("turn".into());
+        machine
+            .end_turn(None, 1, TurnOutcome::Failed)
+            .unwrap();
+        let mut records = Vec::new();
+        while let Ok(record) = events.try_recv() {
+            records.push(record);
+        }
+        assert!(matches!(
+            records.last().map(|record| &record.event),
+            Some(ChatEvent::StateChanged(SessionState::Failed { .. }))
+        ));
+        assert!(!records
+            .iter()
+            .any(|record| matches!(&record.event, ChatEvent::StateChanged(SessionState::Idle))));
+        assert!(matches!(
+            machine.state.borrow().clone(),
+            SessionState::Failed { .. }
+        ));
+        let (reply, _) = oneshot::channel();
+        machine
+            .claude_operation(Operation::Send("again".into()), reply)
+            .unwrap();
+        while events.try_recv().is_ok() {}
+        assert!(matches!(
+            machine.state.borrow().clone(),
+            SessionState::Running
+        ));
     }
     #[test]
     fn malformed_and_oversized_messages_fail_closed() {

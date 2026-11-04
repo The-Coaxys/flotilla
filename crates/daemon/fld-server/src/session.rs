@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use fl_model::ClientSessionId;
 use fl_proto::{
     ChannelHello, ChannelReady, ClientMsg, DaemonInfo, Hello, PRODUCT_VERSION, PROTO, RejectReason,
-    Request, Response, RpcError, RpcErrorCode, ServerMsg, Welcome, build_id,
+    Request, Response, RpcError, RpcErrorCode, ServerMsg, Welcome, WireMessage, build_id,
 };
 use fl_transport::conn::{ConnError, FrameReader, FrameWriter};
 use tokio::task::JoinSet;
@@ -17,7 +17,7 @@ use crate::channels::Channels;
 use crate::chat::ChatService;
 use crate::devices::DeviceRegistry;
 use crate::events::EventBus;
-use crate::terminal::TerminalService;
+use crate::terminal::{TerminalService, bounded};
 use crate::workspace::WorkspaceService;
 
 /// Concurrent RPCs per control session; further requests wait to be read.
@@ -178,11 +178,33 @@ async fn control(
                     || hello.proto.major > 0
                     || hello.proto.minor >= 4;
                 if decodable {
-                    writer.send(&ServerMsg::Event(event)).await?;
+                    let message = ServerMsg::Event(event);
+                    // A malformed broadcast event must not tear down this
+                    // session for every client; drop it and let a reconnect
+                    // refetch durable state.
+                    match message.validate() {
+                        Ok(()) => writer.send(&message).await?,
+                        Err(error) => {
+                            tracing::warn!(%error, "dropping an outbound event that failed wire validation");
+                        }
+                    }
                 }
             }
             done = rpcs.join_next(), if !rpcs.is_empty() => {
-                if let Some(Ok((id, result))) = done {
+                if let Some(Ok((id, mut result))) = done {
+                    // A response that cannot be encoded is this request's
+                    // failure, not a reason to drop the whole connection.
+                    if let Ok(response) = &result
+                        && let Err(error) = response.validate()
+                    {
+                        let message = error.to_string();
+                        result = Err(RpcError {
+                            code: RpcErrorCode::Internal,
+                            message: bounded(format!(
+                                "the response for this request could not be encoded: {message}"
+                            )),
+                        });
+                    }
                     writer.send(&ServerMsg::RpcResult { id, result }).await?;
                 }
             }

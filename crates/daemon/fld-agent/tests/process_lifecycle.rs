@@ -114,6 +114,22 @@ async fn unexpected_process_exit_does_not_declare_a_turn_complete() {
 }
 
 #[tokio::test]
+async fn vanished_resume_cwd_is_transient_not_an_archivable_mismatch() {
+    let (dir, provider) = peer("exit 0").await;
+    let mut config = config(dir.path());
+    config.resume = Some(ResumeTarget {
+        provider_id: "claude".into(),
+        adapter: AdapterKind::ClaudeStream,
+        native_id: uuid::Uuid::new_v4().to_string(),
+        cwd: dir.path().join("missing"),
+    });
+    assert!(matches!(
+        Adapter::launch(provider, config).await,
+        Err(AdapterError::Protocol(_))
+    ));
+}
+
+#[tokio::test]
 async fn resume_does_not_silently_create_a_fresh_session() {
     let (dir, provider) = peer("exit 99").await;
     let mut config = config(dir.path());

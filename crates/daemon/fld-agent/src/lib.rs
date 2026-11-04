@@ -5,8 +5,11 @@
 //! local protocol initialize handshake (no prompts or model requests). Failure is
 //! terminal-only with an explanation. `Adapter::launch` repeats negotiation,
 //! validates the requested resume target, and returns only after initialization.
-//! A failed resume is an error: the caller must archive the old transcript and
-//! explicitly launch a fresh session, never silently continue with a new identity.
+//! Only a semantically invalid resume target (different native identity, cwd or
+//! provider) is `InvalidResume` and may archive the old transcript. Transient
+//! I/O, network and authentication failures are ordinary errors, so the caller
+//! keeps the transcript restorable and retries later; neither case silently
+//! continues with a new identity.
 //!
 //! Drain `Adapter::events` continuously and append records to storage. The channel
 //! is bounded: a slow/dropped consumer terminates the child rather than silently

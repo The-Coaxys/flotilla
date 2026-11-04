@@ -552,6 +552,16 @@ impl Request {
             Self::MutateRouting { mutation, .. } => {
                 mutation.validate().map_err(ValidationError::Invalid)
             }
+            Self::DispatchGitTask { worktree, context, .. } => {
+                validation::non_nil_id("dispatch worktree", worktree.as_bytes())?;
+                // User context is interpolated into the rendered prompt, so it
+                // must already fit the same bound as the prompt itself.
+                text(
+                    "dispatch context",
+                    context,
+                    validation::MAX_MESSAGE_BYTES,
+                )
+            }
             Self::ListChatSessions { worktree } => {
                 validation::non_nil_id("chat worktree", worktree.as_bytes())
             }
@@ -1361,5 +1371,30 @@ mod tests {
             .map(|sequence| chat_event(id, sequence))
             .collect();
         assert!(Response::ChatEvents(page).validate().is_err());
+    }
+
+    #[test]
+    fn dispatch_context_and_event_identities_are_bounded() {
+        use fl_model::routing::GitTask;
+        let worktree = WorktreeId::from_bytes([3; 16]);
+        for context in [
+            "x".repeat(crate::validation::MAX_MESSAGE_BYTES + 1),
+            "context\0with a NUL".into(),
+        ] {
+            let request = Request::DispatchGitTask {
+                worktree,
+                task: GitTask::Commit,
+                mode: None,
+                alternate: false,
+                context,
+            };
+            assert!(request.validate().is_err(), "{request:?} was accepted");
+        }
+        let session = chat_fixture();
+        let mut event = chat_event(session.id, 1);
+        event.turn_id = Some("t".repeat(crate::validation::MAX_CHAT_ID_BYTES + 1));
+        assert!(crate::validation::chat_event(&event).is_err());
+        event.turn_id = Some("turn\0with NUL".into());
+        assert!(crate::validation::chat_event(&event).is_err());
     }
 }

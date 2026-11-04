@@ -16,6 +16,8 @@ use uuid::Uuid;
 
 pub(crate) const OP_TIMEOUT: Duration = Duration::from_secs(60);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Matches the wire contract for provider-native identities.
+const MAX_NATIVE_ID: usize = 1024;
 
 pub(crate) fn command(provider: &ProviderSpec) -> ProcessCommand {
     let mut command = ProcessCommand::new(&provider.command);
@@ -523,7 +525,16 @@ impl Machine {
         self.claude_blocks.clear();
         self.final_seen = false;
         self.structured_seen = false;
-        self.set_state(SessionState::Idle)
+        match outcome {
+            // A failed turn stays visible until the user sends or steers
+            // again; never reinterpret it as a clean idle session.
+            TurnOutcome::Failed => self.set_state(SessionState::Failed {
+                message: "the provider reported a failed turn".into(),
+            }),
+            TurnOutcome::Completed | TurnOutcome::Cancelled => {
+                self.set_state(SessionState::Idle)
+            }
+        }
     }
     pub fn user_event(&mut self, id: String, text: String) -> Result<()> {
         self.emit(ChatEvent::UserMessage { id, text })
@@ -559,14 +570,16 @@ pub(crate) async fn launch(provider: ProviderSpec, mut config: SessionConfig) ->
         ));
     }
     if let Some(resume) = &config.resume {
+        // A vanished path is a transient environment failure, not proof that
+        // the stored conversation is semantically wrong. Keep it restorable.
         let cwd = tokio::fs::canonicalize(&resume.cwd)
             .await
-            .map_err(|e| AdapterError::InvalidResume(e.to_string()))?;
+            .map_err(|e| AdapterError::Protocol(format!("cannot verify resume cwd: {e}")))?;
         if resume.provider_id != provider.id
             || resume.adapter != provider.adapter
             || cwd != config.cwd
             || resume.native_id.is_empty()
-            || resume.native_id.len() > 512
+            || resume.native_id.len() > MAX_NATIVE_ID
         {
             return Err(AdapterError::InvalidResume(
                 "provider, cwd, or identity mismatch".into(),
