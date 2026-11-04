@@ -1,0 +1,47 @@
+[package]
+name = "flc-editor"
+description = "Flotilla code viewer/editor and diff view: rope buffer, tree-sitter highlighting, imara-diff"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+# Local X11 runs on Linux for development and UI checks; releases ship Windows.
+linux-x11 = ["gpui/x11"]
+
+[dependencies]
+fl-model.workspace = true
+fl-proto.workspace = true
+flc-ui.workspace = true
+imara-diff.workspace = true
+ropey.workspace = true
+tree-sitter.workspace = true
+tree-sitter-bash.workspace = true
+tree-sitter-c.workspace = true
+tree-sitter-c-sharp.workspace = true
+tree-sitter-cpp.workspace = true
+tree-sitter-css.workspace = true
+tree-sitter-go.workspace = true
+tree-sitter-html.workspace = true
+tree-sitter-java.workspace = true
+tree-sitter-javascript.workspace = true
+tree-sitter-json.workspace = true
+tree-sitter-lua.workspace = true
+tree-sitter-md.workspace = true
+tree-sitter-php.workspace = true
+tree-sitter-python.workspace = true
+tree-sitter-ruby.workspace = true
+tree-sitter-rust.workspace = true
+arborium-sql.workspace = true
+tree-sitter-toml-ng.workspace = true
+tree-sitter-typescript.workspace = true
+tree-sitter-yaml.workspace = true
+unicode-segmentation.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+gpui = "0.2.2"
+
+[target.'cfg(not(windows))'.dependencies]
+gpui = { version = "0.2.2", default-features = false }
