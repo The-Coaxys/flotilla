@@ -1,13 +1,16 @@
 //! Flotilla daemon core: state home, device registry, control sessions,
-//! listeners (Unix socket for SSH-forwarded peers, QUIC for direct peers) and
-//! the persistent terminal service.
+//! listeners (Unix socket for SSH-forwarded peers, QUIC for direct peers),
+//! the persistent terminal service and workspaces (projects, worktrees, git
+//! status, files and scripts).
 pub mod channels;
 pub mod devices;
+mod events;
 pub mod identity;
 pub mod listen;
 pub mod paths;
 pub mod session;
 mod terminal;
+mod workspace;
 
 use std::io::Write;
 use std::net::SocketAddr;
@@ -126,6 +129,15 @@ pub async fn start(config: DaemonConfig) -> Result<DaemonHandle, ServerError> {
     )
     .await?;
     let cancel = CancellationToken::new();
+    let events = Arc::new(events::EventBus::default());
+    let workspace = workspace::WorkspaceService::start(
+        home.clone(),
+        terminals.clone(),
+        events.clone(),
+        cancel.child_token(),
+    )
+    .await
+    .map_err(|error| std::io::Error::other(format!("starting workspaces: {}", error.message)))?;
     let ctx = Arc::new(session::SessionCtx {
         registry: Arc::new(devices::DeviceRegistry::new(home.devices_path())),
         hello_timeout: config.hello_timeout,
@@ -138,6 +150,8 @@ pub async fn start(config: DaemonConfig) -> Result<DaemonHandle, ServerError> {
         shutdown: cancel.clone(),
         channels: Arc::default(),
         terminals: terminals.clone(),
+        events,
+        workspace,
     });
     let mut tasks = vec![tokio::spawn(listen::unix_accept_loop(unix, ctx.clone()))];
     if let Some(ep) = &quic {

@@ -13,7 +13,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use fl_model::layout::{Layout, LayoutOp};
-use fl_model::{IncarnationId, OperationId, ProcessInfo, ProcessState, TerminalId};
+use fl_model::workspace::LayoutScope;
+use fl_model::{
+    IncarnationId, OperationId, ProcessInfo, ProcessState, Size, TerminalId, WorktreeId,
+};
+use fl_prochost_proto::SpawnSpec;
 use fl_prochost_proto::{ErrorCode, Request, Response};
 use fl_proto::{
     CHANNEL_SCHEMA, Capabilities, ChannelRole, RpcError, RpcErrorCode, TERMINAL_PROTOCOL,
@@ -21,7 +25,8 @@ use fl_proto::{
 };
 use fl_term::{ENGINE_ID, EffectMode};
 use fl_transport::conn::{ConnError, FrameReader, FrameWriter};
-use fld_store::{LaunchDefaults, StoreError, TerminalEntry, TerminalKey};
+use fld_store::{LaunchDefaults, ScriptEntry, StoreError, TerminalEntry, TerminalKey};
+use tokio::sync::watch;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
@@ -83,17 +88,22 @@ fn rpc(code: RpcErrorCode, message: impl Into<String>) -> RpcError {
     }
 }
 
-fn store_rpc(error: StoreError) -> RpcError {
+pub(crate) fn store_rpc(error: StoreError) -> RpcError {
     let code = match &error {
         StoreError::RevisionConflict { .. } => RpcErrorCode::RevisionConflict,
-        StoreError::OperationConflict(_) | StoreError::Layout(_) | StoreError::Invalid(_) => {
-            RpcErrorCode::InvalidArgument
-        }
-        StoreError::NotFound(_) => RpcErrorCode::NotFound,
+        StoreError::OperationConflict(_)
+        | StoreError::Layout(_)
+        | StoreError::Invalid(_)
+        | StoreError::Duplicate(_) => RpcErrorCode::InvalidArgument,
+        StoreError::NotFound(_) | StoreError::Missing(_) => RpcErrorCode::NotFound,
         StoreError::WrongIncarnation => RpcErrorCode::WrongIncarnation,
         _ => RpcErrorCode::Internal,
     };
     rpc(code, error.to_string())
+}
+
+pub(crate) fn stopped_rpc() -> RpcError {
+    stopped()
 }
 
 fn stopped() -> RpcError {
@@ -155,6 +165,13 @@ impl TerminalService {
             .into_iter()
             .map(|info| (info.terminal, info))
             .collect();
+        let scripts = self
+            .shared
+            .store
+            .call(|store| store.database.scripts())
+            .await
+            .map_err(std::io::Error::other)?
+            .map_err(|error| std::io::Error::other(format!("listing scripts: {error}")))?;
         for entry in entries {
             let key = key_of(&entry);
             let process = processes.remove(&key.terminal);
@@ -170,6 +187,13 @@ impl TerminalService {
                     self.attach(info).await;
                 }
                 Some(info) if info.incarnation == key.incarnation => {
+                    if let Some(script) = scripts.iter().find(|script| script.key == key) {
+                        // A script ran once; rerunning it unasked could repeat
+                        // side effects. Its run is over: forget the terminal.
+                        tracing::warn!(terminal = %key.terminal, "script process was lost; closing it");
+                        self.forget_script(script.clone()).await;
+                        continue;
+                    }
                     tracing::warn!(terminal = %key.terminal, "terminal process was lost; relaunching");
                     self.relaunch(key, true).await;
                 }
@@ -185,6 +209,9 @@ impl TerminalService {
                     if entry.process.is_none() && entry.checkpoint.is_none() {
                         // Committed but never (successfully) spawned: same incarnation.
                         self.launch(entry).await;
+                    } else if let Some(script) = scripts.iter().find(|script| script.key == key) {
+                        tracing::warn!(terminal = %key.terminal, "script process is missing; closing it");
+                        self.forget_script(script.clone()).await;
                     } else {
                         tracing::warn!(terminal = %key.terminal, "terminal process is missing; relaunching");
                         self.relaunch(key, false).await;
@@ -388,10 +415,18 @@ impl TerminalService {
         })
     }
 
+    pub(crate) fn launch_defaults(&self) -> &LaunchDefaults {
+        &self.launch
+    }
+
     pub(crate) async fn get_layout(&self) -> Result<Layout, RpcError> {
+        self.get_scoped_layout(LayoutScope::Home).await
+    }
+
+    pub(crate) async fn get_scoped_layout(&self, scope: LayoutScope) -> Result<Layout, RpcError> {
         self.shared
             .store
-            .call(|store| store.database.default_layout())
+            .call(move |store| store.database.scoped_layout(scope))
             .await
             .map_err(|_| stopped())?
             .map_err(store_rpc)
@@ -405,17 +440,30 @@ impl TerminalService {
         base_rev: u64,
         op: LayoutOp,
     ) -> Result<Layout, RpcError> {
+        let defaults = self.launch.clone();
+        self.apply_scoped_layout(LayoutScope::Home, operation, base_rev, op, defaults)
+            .await
+    }
+
+    /// `defaults` is the scope's launch policy (a worktree's cwd and env).
+    pub(crate) async fn apply_scoped_layout(
+        self: &Arc<Self>,
+        scope: LayoutScope,
+        operation: OperationId,
+        base_rev: u64,
+        op: LayoutOp,
+        defaults: LaunchDefaults,
+    ) -> Result<Layout, RpcError> {
         let service = self.clone();
         tokio::spawn(async move {
             let _serial = service.layout.lock().await;
-            let defaults = service.launch.clone();
             let applied = service
                 .shared
                 .store
                 .call(move |store| {
                     store
                         .database
-                        .apply_layout(operation, base_rev, op, &defaults)
+                        .apply_scoped_layout(scope, operation, base_rev, op, &defaults)
                 })
                 .await
                 .map_err(|_| stopped())?
@@ -435,6 +483,128 @@ impl TerminalService {
                 format!("layout task failed: {error}"),
             )
         })?
+    }
+
+    /// Retire terminal intents closed by a committed structural change
+    /// (worktree or project removal).
+    pub(crate) async fn close_all(self: &Arc<Self>, keys: Vec<TerminalKey>) {
+        let _serial = self.layout.lock().await;
+        for key in keys {
+            self.close(key).await;
+        }
+    }
+
+    /// Commit a script terminal for `(worktree, kind)`, replacing (closing)
+    /// its previous run, then launch it. Detached like layout effects.
+    pub(crate) async fn start_script(
+        self: &Arc<Self>,
+        worktree: WorktreeId,
+        kind: String,
+        argv: Vec<String>,
+        defaults: LaunchDefaults,
+        size: Size,
+    ) -> Result<TerminalKey, RpcError> {
+        let service = self.clone();
+        tokio::spawn(async move {
+            let _serial = service.layout.lock().await;
+            let spec = SpawnSpec {
+                terminal: TerminalId::new(),
+                incarnation: IncarnationId::new(),
+                argv,
+                cwd: defaults.cwd,
+                env: defaults.env,
+                size,
+                quota_bytes: defaults.quota_bytes,
+            };
+            let (entry, replaced) = service
+                .shared
+                .store
+                .call(move |store| store.database.start_script(worktree, &kind, spec))
+                .await
+                .map_err(|_| stopped())?
+                .map_err(store_rpc)?;
+            if let Some(key) = replaced {
+                service.close(key).await;
+            }
+            let key = key_of(&entry);
+            service.launch(entry).await;
+            Ok(key)
+        })
+        .await
+        .map_err(|error| {
+            rpc(
+                RpcErrorCode::Internal,
+                format!("script task failed: {error}"),
+            )
+        })?
+    }
+
+    /// Every script terminal recorded in the store.
+    pub(crate) async fn scripts(&self) -> Result<Vec<ScriptEntry>, RpcError> {
+        self.shared
+            .store
+            .call(|store| store.database.scripts())
+            .await
+            .map_err(|_| stopped())?
+            .map_err(store_rpc)
+    }
+
+    async fn forget_script(self: &Arc<Self>, script: ScriptEntry) {
+        let closed = self
+            .shared
+            .store
+            .call(move |store| store.database.close_script(script.worktree, &script.kind))
+            .await;
+        match closed {
+            Ok(Ok(Some(key))) => self.close(key).await,
+            Ok(Ok(None)) => {}
+            Ok(Err(error)) => tracing::warn!("closing script terminal: {error}"),
+            Err(error) => tracing::warn!("{error}"),
+        }
+    }
+
+    /// Ask one process to exit (SIGTERM, then SIGKILL after the grace). Its
+    /// terminal, output and exit status remain.
+    pub(crate) async fn terminate(&self, key: TerminalKey) -> Result<(), RpcError> {
+        match self
+            .shared
+            .prochost
+            .request(&Request::Terminate {
+                terminal: key.terminal,
+                incarnation: key.incarnation,
+                grace_ms: TERMINATE_GRACE_MS,
+            })
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(error) if is_gone(&error) => Ok(()),
+            Err(error) => Err(rpc(
+                RpcErrorCode::Internal,
+                format!("terminating process: {error}"),
+            )),
+        }
+    }
+
+    /// The live process state of an attached terminal incarnation, as a
+    /// watch that closes when its worker stops.
+    pub(crate) fn watch_state(&self, key: TerminalKey) -> Option<watch::Receiver<ProcessState>> {
+        self.terminals
+            .lock()
+            .expect("terminal registry poisoned")
+            .get(&key.terminal)
+            .filter(|terminal| terminal.key == key)
+            .map(|terminal| terminal.watch_state())
+    }
+
+    /// `None` when the incarnation is not attached (closed, or its launch or
+    /// restore failed).
+    pub(crate) fn process_state(&self, key: TerminalKey) -> Option<ProcessState> {
+        self.terminals
+            .lock()
+            .expect("terminal registry poisoned")
+            .get(&key.terminal)
+            .filter(|terminal| terminal.key == key)
+            .map(|terminal| terminal.info().state)
     }
 
     pub(crate) fn process_info(

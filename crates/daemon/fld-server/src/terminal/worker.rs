@@ -85,6 +85,8 @@ pub(crate) struct Terminal {
     pub key: TerminalKey,
     commands: mpsc::Sender<Command>,
     info: Mutex<ProcessInfo>,
+    /// Process state transitions, for daemon-side observers (scripts).
+    state: tokio::sync::watch::Sender<ProcessState>,
     ownership: Mutex<Ownership>,
     abort: CancellationToken,
 }
@@ -92,6 +94,10 @@ pub(crate) struct Terminal {
 impl Terminal {
     pub(crate) fn info(&self) -> ProcessInfo {
         self.info.lock().expect("terminal info poisoned").clone()
+    }
+
+    pub(crate) fn watch_state(&self) -> tokio::sync::watch::Receiver<ProcessState> {
+        self.state.subscribe()
     }
 
     pub(crate) fn owner(&self) -> Option<InputOwner> {
@@ -302,6 +308,7 @@ pub(crate) fn spawn(
     let terminal = Arc::new(Terminal {
         key,
         commands,
+        state: tokio::sync::watch::Sender::new(info.state.clone()),
         info: Mutex::new(info),
         ownership: Mutex::default(),
         abort: abort.clone(),
@@ -595,6 +602,13 @@ impl Worker {
             (before != (info.state.clone(), info.size, info.echo)).then(|| info.clone())
         };
         if let Some(info) = changed {
+            self.terminal.state.send_if_modified(|state| {
+                let modified = *state != info.state;
+                if modified {
+                    *state = info.state.clone();
+                }
+                modified
+            });
             let persisted = info.clone();
             self.shared.store.submit(move |store| {
                 if let Err(error) = store.database.update_process(&persisted) {

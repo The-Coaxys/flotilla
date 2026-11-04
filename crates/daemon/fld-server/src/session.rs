@@ -15,7 +15,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::channels::Channels;
 use crate::devices::DeviceRegistry;
+use crate::events::EventBus;
 use crate::terminal::TerminalService;
+use crate::workspace::WorkspaceService;
 
 /// Concurrent RPCs per control session; further requests wait to be read.
 const MAX_INFLIGHT_RPCS: usize = 32;
@@ -44,6 +46,8 @@ pub struct SessionCtx {
     pub shutdown: CancellationToken,
     pub(crate) channels: Arc<Channels>,
     pub(crate) terminals: Arc<TerminalService>,
+    pub(crate) events: Arc<EventBus>,
+    pub(crate) workspace: Arc<WorkspaceService>,
 }
 
 /// Allow a best-effort timeout rejection without letting an unresponsive peer
@@ -112,6 +116,15 @@ pub async fn serve_connection(
     }
 }
 
+async fn next_event(
+    subscription: &mut Option<crate::events::Subscription<'_>>,
+) -> Option<fl_model::workspace::DaemonEvent> {
+    match subscription {
+        Some(subscription) => subscription.events.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
 async fn control(
     ctx: Arc<SessionCtx>,
     hello: Hello,
@@ -139,9 +152,16 @@ async fn control(
         }))
         .await?;
     let mut rpcs = JoinSet::new();
+    // Registered before any RPC runs, so no change after a reply is missed.
+    // Peers older than protocol 0.3 cannot decode `ServerMsg::Event`.
+    let mut subscription =
+        (hello.proto.major > 0 || hello.proto.minor >= 3).then(|| ctx.events.subscribe());
     loop {
         tokio::select! {
             _ = lease.cancel.cancelled() => return Ok(SessionEnd::Finished),
+            Some(event) = next_event(&mut subscription) => {
+                writer.send(&ServerMsg::Event(event)).await?;
+            }
             done = rpcs.join_next(), if !rpcs.is_empty() => {
                 if let Some(Ok((id, result))) = done {
                     writer.send(&ServerMsg::RpcResult { id, result }).await?;
@@ -208,6 +228,7 @@ async fn handle_request(
     req: Request,
 ) -> Result<Response, RpcError> {
     let terminals = &ctx.terminals;
+    let workspace = &ctx.workspace;
     match req {
         Request::DaemonInfo => Ok(Response::DaemonInfo(DaemonInfo {
             version: PRODUCT_VERSION.to_string(),
@@ -243,6 +264,84 @@ async fn handle_request(
                 code: RpcErrorCode::InvalidCapability,
                 message: error.to_string(),
             }),
+        Request::GetWorkspaceTree => workspace.tree().await.map(Response::WorkspaceTree),
+        Request::ListDir { path } => workspace.list_dir(path).await.map(Response::DirListing),
+        Request::AddProject {
+            workspace: id,
+            path,
+        } => workspace.add_project(id, path).await.map(Response::Project),
+        Request::CloneProject {
+            workspace: id,
+            url,
+            dest,
+        } => workspace
+            .clone_project(id, url, dest)
+            .await
+            .map(Response::Project),
+        Request::RemoveProject { project } => workspace
+            .remove_project(project)
+            .await
+            .map(|()| Response::Done),
+        Request::CreateWorktree {
+            project,
+            branch,
+            base,
+        } => workspace
+            .create_worktree(project, branch, base)
+            .await
+            .map(Response::Worktree),
+        Request::DeleteWorktree { worktree, force } => workspace
+            .delete_worktree(worktree, force)
+            .await
+            .map(|()| Response::Done),
+        Request::SetWorktreeLabel { worktree, label } => workspace
+            .set_label(worktree, label)
+            .await
+            .map(Response::Worktree),
+        Request::WorktreeStatus { worktree } => workspace
+            .worktree_status(worktree)
+            .await
+            .map(Response::WorktreeStatus),
+        Request::ReadFile { path, max_bytes } => workspace
+            .read_file(path, max_bytes)
+            .await
+            .map(Response::FileContent),
+        Request::WriteFile {
+            path,
+            bytes,
+            expected_sha256,
+        } => workspace
+            .write_file(path, bytes, expected_sha256)
+            .await
+            .map(Response::Written),
+        Request::FileDiff { worktree, path } => workspace
+            .file_diff(worktree, path)
+            .await
+            .map(Response::FileDiff),
+        Request::GetScopedLayout { scope } => {
+            workspace.scoped_layout(scope).await.map(Response::Layout)
+        }
+        Request::ApplyScopedLayout {
+            scope,
+            operation,
+            base_rev,
+            op,
+        } => workspace
+            .apply_scoped_layout(scope, operation, base_rev, op)
+            .await
+            .map(Response::Layout),
+        Request::RunScript { worktree, kind } => workspace
+            .run_script(worktree, kind)
+            .await
+            .map(Response::ScriptState),
+        Request::StopScript { worktree, kind } => workspace
+            .stop_script(worktree, kind)
+            .await
+            .map(Response::ScriptState),
+        Request::ListScripts { worktree } => workspace
+            .list_scripts(worktree)
+            .await
+            .map(Response::Scripts),
     }
 }
 
