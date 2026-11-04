@@ -1,0 +1,49 @@
+{
+  "recorded_at": "2026-11-04",
+  "claude_version": "2.1.316",
+  "codex_version": "0.160.1",
+  "initialize_only": true,
+  "model_requests_exercised": false,
+  "recordings": {
+    "claude-initialize.recorded.jsonl": {
+      "invocation": "claude -p --input-format stream-json --output-format stream-json --include-partial-messages --verbose --permission-prompt-tool stdio --permission-mode manual --setting-sources \"\" --strict-mcp-config --mcp-config '{\"mcpServers\":{}}'",
+      "stdin": {
+        "type": "control_request",
+        "request_id": "capture-init",
+        "request": {
+          "subtype": "initialize",
+          "hooks": null
+        }
+      },
+      "projection": "Only response subtype/request_id and response fields claude_code_version,current_permission_mode,session_state,capabilities retained. Other fields include account and local paths and were omitted."
+    },
+    "codex-initialize.recorded.jsonl": {
+      "invocation": "codex app-server --listen stdio://",
+      "stdin": {
+        "id": 1,
+        "method": "initialize",
+        "params": {
+          "clientInfo": {
+            "name": "flotilla_protocol_capture",
+            "version": "0.2.0"
+          },
+          "capabilities": {
+            "experimentalApi": true
+          }
+        }
+      },
+      "projection": "Only id and result platformFamily/platformOs retained; userAgent and codexHome omitted to remove host identity/paths."
+    },
+    "codex-contract.recorded.json": {
+      "invocation": "codex app-server generate-json-schema --out <temporary directory>",
+      "projection": "Required field lists and property names for adapter-used request/notification methods, projected from generated method unions."
+    }
+  },
+  "synthetic": [
+    "claude-turn.synthetic.jsonl",
+    "codex-turn.synthetic.jsonl"
+  ],
+  "claude_control_source": "https://github.com/anthropics/claude-agent-sdk-python/blob/main/src/claude_agent_sdk/_internal/query.py",
+  "claude_permission_routing_source": "https://github.com/anthropics/claude-agent-sdk-python/blob/main/src/claude_agent_sdk/types.py",
+  "notes": "SDK stdio permission control is used instead of an MCP approval server; both route human decisions without auto-approval. Synthetic turns test protocol normalization, not live model responses."
+}

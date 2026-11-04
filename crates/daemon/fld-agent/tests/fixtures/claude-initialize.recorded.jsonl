@@ -1,0 +1,1 @@
+{"type":"control_response","response":{"subtype":"success","request_id":"capture-init","response":{"claude_code_version":"2.1.316","current_permission_mode":"default","session_state":"idle","capabilities":["ui_surface_v1","mcp_call_result_not_for_model_v1"]}}}

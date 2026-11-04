@@ -12,6 +12,7 @@ members = [
     "crates/daemon/fld-store",
     "crates/daemon/fld-git",
     "crates/daemon/fld-forge",
+    "crates/daemon/fld-agent",
     "crates/daemon/flotillad",
     "crates/client/flc-conn",
     "crates/client/flc-sync",
@@ -36,6 +37,7 @@ default-members = [
     "crates/daemon/fld-store",
     "crates/daemon/fld-git",
     "crates/daemon/fld-forge",
+    "crates/daemon/fld-agent",
     "crates/daemon/flotillad",
     "crates/client/flc-conn",
     "crates/client/flc-sync",
@@ -60,6 +62,7 @@ fld-prochost = { path = "crates/daemon/fld-prochost" }
 fld-store = { path = "crates/daemon/fld-store" }
 fld-git = { path = "crates/daemon/fld-git" }
 fld-forge = { path = "crates/daemon/fld-forge" }
+fld-agent = { path = "crates/daemon/fld-agent" }
 flc-conn = { path = "crates/client/flc-conn" }
 flc-sync = { path = "crates/client/flc-sync" }
 flc-shell = { path = "crates/client/flc-shell" }
