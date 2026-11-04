@@ -1065,9 +1065,12 @@ fn version_two(root: &Path) -> (Layout, Vec<TerminalEntry>) {
     let connection = Connection::open(root.join("state.db")).unwrap();
     connection
         .execute_batch(
-            "DROP TABLE routing; DROP TABLE reviews; DROP TABLE sections; DROP TABLE scripts; DROP TABLE worktree_layouts; DROP TABLE worktrees; \
-             DROP TABLE projects; DROP TABLE workspaces; DROP TABLE workspace_meta; \
-             PRAGMA user_version=2;",
+            "DROP TABLE IF EXISTS chat_fts; DROP TABLE IF EXISTS chat_search; DROP TABLE IF EXISTS chat_inbox; \
+             DROP TABLE IF EXISTS chat_pending; DROP TABLE IF EXISTS chat_events; DROP TABLE IF EXISTS chat_sessions; \
+             DROP TABLE IF EXISTS chat_meta; DROP TABLE IF EXISTS routing; DROP TABLE IF EXISTS reviews; \
+             DROP TABLE IF EXISTS sections; DROP TABLE IF EXISTS scripts; DROP TABLE IF EXISTS worktree_layouts; \
+             DROP TABLE IF EXISTS worktrees; DROP TABLE IF EXISTS projects; DROP TABLE IF EXISTS workspaces; \
+             DROP TABLE IF EXISTS workspace_meta; PRAGMA user_version=2;",
         )
         .unwrap();
     (layout, terminals)

@@ -410,7 +410,13 @@ mod tests {
         let (db, _, _) = setup(root.path());
         let tree = db.workspace_tree().unwrap();
         db.connection
-            .execute_batch("DROP TABLE routing; DROP TABLE reviews; DROP TABLE sections; PRAGMA user_version=3;")
+            .execute_batch(
+                "DROP TABLE IF EXISTS chat_fts; DROP TABLE IF EXISTS chat_search; DROP TABLE IF EXISTS chat_inbox; \
+                 DROP TABLE IF EXISTS chat_pending; DROP TABLE IF EXISTS chat_events; \
+                 DROP TABLE IF EXISTS chat_sessions; DROP TABLE IF EXISTS chat_meta; \
+                 DROP TABLE IF EXISTS routing; DROP TABLE IF EXISTS reviews; DROP TABLE IF EXISTS sections; \
+                 PRAGMA user_version=3;",
+            )
             .unwrap();
         drop(db);
         let db = Database::open(root.path()).unwrap();

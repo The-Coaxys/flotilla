@@ -14,6 +14,7 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use crate::channels::Channels;
+use crate::chat::ChatService;
 use crate::devices::DeviceRegistry;
 use crate::events::EventBus;
 use crate::terminal::TerminalService;
@@ -48,6 +49,7 @@ pub struct SessionCtx {
     pub(crate) terminals: Arc<TerminalService>,
     pub(crate) events: Arc<EventBus>,
     pub(crate) workspace: Arc<WorkspaceService>,
+    pub(crate) chat: Arc<ChatService>,
 }
 
 /// Allow a best-effort timeout rejection without letting an unresponsive peer
@@ -160,7 +162,8 @@ async fn control(
         tokio::select! {
             _ = lease.cancel.cancelled() => return Ok(SessionEnd::Finished),
             Some(event) = next_event(&mut subscription) => {
-                // Forge, review and section events arrived with protocol 0.4.
+                // Forge, review, section, routing and chat events arrived
+                // with protocol 0.4.
                 let decodable = !matches!(
                     event,
                     fl_model::workspace::DaemonEvent::ForgeChanged(_)
@@ -168,6 +171,9 @@ async fn control(
                         | fl_model::workspace::DaemonEvent::SectionsChanged(_)
                         | fl_model::workspace::DaemonEvent::RoutingChanged(_)
                         | fl_model::workspace::DaemonEvent::TaskDispatchChanged(_)
+                        | fl_model::workspace::DaemonEvent::ChatSessionChanged(_)
+                        | fl_model::workspace::DaemonEvent::ChatEventAppended { .. }
+                        | fl_model::workspace::DaemonEvent::InboxChanged
                 )
                     || hello.proto.major > 0
                     || hello.proto.minor >= 4;
@@ -242,6 +248,7 @@ async fn handle_request(
 ) -> Result<Response, RpcError> {
     let terminals = &ctx.terminals;
     let workspace = &ctx.workspace;
+    let chat = &ctx.chat;
     match req {
         Request::DaemonInfo => Ok(Response::DaemonInfo(DaemonInfo {
             version: PRODUCT_VERSION.to_string(),
@@ -444,6 +451,58 @@ async fn handle_request(
             .dispatch_git_task(worktree, task, mode, alternate, context)
             .await
             .map(Response::TaskDispatch),
+        Request::ListChatSessions { worktree } => chat
+            .list_sessions(worktree)
+            .await
+            .map(Response::ChatSessions),
+        Request::GetChatEvents {
+            session,
+            from,
+            limit,
+        } => chat
+            .event_page(session, from, limit)
+            .await
+            .map(Response::ChatEvents),
+        Request::StartChat {
+            worktree,
+            provider,
+            model,
+            thinking,
+            permission_mode,
+            resume,
+        } => chat
+            .start_chat(worktree, provider, model, thinking, permission_mode, resume)
+            .await
+            .map(|session| Response::ChatSessions(vec![session])),
+        Request::SendChat { session, text } => {
+            chat.send(session, text).await.map(|()| Response::Done)
+        }
+        Request::SteerChat { session, text } => {
+            chat.steer(session, text).await.map(|()| Response::Done)
+        }
+        Request::CancelChat { session } => chat.cancel(session).await.map(|()| Response::Done),
+        Request::ApproveChat {
+            session,
+            request,
+            decision,
+        } => chat
+            .approve(session, request, decision)
+            .await
+            .map(|()| Response::Done),
+        Request::AnswerChat {
+            session,
+            request,
+            response,
+        } => chat
+            .answer(session, request, response)
+            .await
+            .map(|()| Response::Done),
+        Request::CloseChat { session } => chat.close(session).await.map(|()| Response::Done),
+        Request::SearchChats { query, limit } => {
+            chat.search(query, limit).await.map(Response::ChatHits)
+        }
+        Request::ListInbox => chat.inbox().await.map(Response::Inbox),
+        Request::DismissInbox { item } => chat.dismiss_inbox(item).await.map(|()| Response::Done),
     }
 }
 

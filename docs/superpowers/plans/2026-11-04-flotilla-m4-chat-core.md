@@ -67,5 +67,54 @@ Never infer completion from process liveness, a bell, text heuristics or nonempt
 
 ## Execution evidence
 
-Implementation in progress. The adapter slice is isolated on `m4-adapters`; no M4 acceptance
-or live-provider success is claimed yet.
+### Slice `m4-chat` (daemon chat service, durable state and wire contract)
+
+Implemented on branch `m4-chat` on top of `cf7d5d8`:
+
+- `fl-model::chat` owns the wire records (`ChatSession`, `ChatEventPage`, `InboxItem`,
+  `ChatHit`, constants) plus `search_text`, the bounded plain-text projection indexed for
+  transcript search. `DaemonEvent` gained `ChatSessionChanged`, `ChatEventAppended` and
+  `InboxChanged` (appended variants).
+- `fl-proto` 0.4 appends every chat request/response. Chat requests, events, pages, hits and
+  inbox items are bounded at both boundaries; empty messages/queries and nil identities are
+  rejected. Chat events are only pushed to peers speaking protocol 0.4.
+- Store V7 (`crates/daemon/fld-store/src/chat.rs`): `chat_sessions`, append-only
+  `chat_events` (PK `(session, sequence)`, worktree FK cascade, per-session durable cursor),
+  `chat_pending` (approvals/questions), `chat_inbox` (unique dedupe key) and an FTS5 index
+  over `chat_events.search_text` with a bounded `LIKE` fallback recorded in `chat_meta`.
+  Events commit with their status/pending/inbox effects before publication. Migration keeps
+  the existing `state.db.before-v<old>-to-v<new>-<id>.db` backup convention; the v2/v3
+  downgrade fixtures drop the new tables.
+- `fld-server::chat` supervises one `fld_agent::Adapter` per live session (bounded to eight),
+  assigns durable per-session sequences, drains events into the store, applies status only
+  from structured adapter events, persists/clears pending decisions, records inbox cards,
+  and publishes `ChatEventAppended`/`ChatSessionChanged`/`InboxChanged` after the commit.
+  Daemon restart clears unanswerable pending decisions and normalizes working sessions to
+  idle; a later send reattaches with the validated stored resume target, or archives the
+  transcript read-only when the target is missing/rejected. Send/steer/start/cancel and
+  one-shot calls have timeouts; shutdown closes every adapter.
+- `workspace::routing::dispatch_git_task` now executes submit modes: structured one-shot
+  calls for NameWorktree/Commit/CommitPush/CreatePr/EnhancePrompt (validated JSON before any
+  Git/forge mutation), real sessions for Resolve/FixCi/FixChanges/FixComments/Investigate,
+  FixComments uses the pending review bundle, and dispatch state is published truthfully.
+  Routed one-shot calls never answer an approval/question on the user's behalf.
+- `flc-sync::chat` mirrors sessions, ordered transcript pages and the inbox on watch
+  channels, refetches from the last durable sequence on reconnect, and exposes a request
+  helper for every chat RPC.
+
+Commands exercised (all passing):
+
+```
+cargo check --workspace --exclude flc-ui --exclude flc-terminal --exclude flc-editor --exclude flotilla
+cargo test -p fld-store --lib
+cargo test -p fl-model -p fl-proto -p flc-sync --lib
+cargo test -p fld-server
+cargo test -p flc-sync
+cargo clippy -p fl-model -p fl-proto -p fld-store -p fld-agent -p fld-server -p fld-git -p flc-sync --all-targets -- -D warnings
+```
+
+Not exercised, and therefore not claimed: a live Claude/Codex turn, a live approval or
+question round-trip, native chat rendering, Windows toast activation, and a real routed
+dispatch against an installed provider. The daemon chat service and routed dispatch have no
+fake-CLI integration fixture yet; their provider interaction is compiled and unit-tested at
+the store/protocol/mirror layer but not proven against a running model.

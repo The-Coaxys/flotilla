@@ -6,6 +6,7 @@
 //! writes and reconnection live on the caller's Tokio runtime and off the UI.
 mod cache;
 mod channels;
+mod chat;
 mod clock;
 mod input;
 mod layout;
@@ -33,6 +34,7 @@ use fl_proto::{Request, Response};
 use flc_conn::broker::{ControlLink, RpcCallError};
 pub use input::{Discard, DiscardReason};
 pub use layout::{LayoutApplyError, LayoutTicket, PendingLayoutOp, WorkspaceState};
+pub use chat::{ChatState, MergeError};
 pub use mirror::{EndReason, MirrorEvent, MirrorHandle, MirrorState, MirrorStatus};
 use tokio::runtime::Handle;
 use tokio::sync::{broadcast, mpsc, watch};
@@ -111,6 +113,8 @@ pub struct Sync {
     layouts: Mutex<HashMap<LayoutScope, LayoutHandle>>,
     registry: workspaces::LayoutRegistry,
     workspaces: watch::Receiver<Arc<WorkspacesState>>,
+    chats: watch::Receiver<Arc<ChatState>>,
+    chats_tx: Arc<watch::Sender<Arc<ChatState>>>,
     /// Shared with the workspace task, so forge and sections request
     /// results land in the mirror immediately.
     workspaces_tx: Arc<watch::Sender<Arc<WorkspacesState>>>,
@@ -222,10 +226,19 @@ impl Sync {
             registry.clone(),
             core.shutdown.clone(),
         );
+        let (chats_tx, chats) = watch::channel(Arc::new(ChatState::default()));
+        let chats_tx = Arc::new(chats_tx);
+        let chats_task = chat::run(
+            links.clone(),
+            workspaces.clone(),
+            chats_tx.clone(),
+            core.shutdown.clone(),
+        );
         {
             let mut tasks = lock(&core.tasks);
             tasks.spawn_on(channels_task, &core.runtime);
             tasks.spawn_on(workspaces_task, &core.runtime);
+            tasks.spawn_on(chats_task, &core.runtime);
         }
         let home = spawn_layout(&core, &links, &events, &registry, LayoutScope::Home);
         Self {
@@ -236,6 +249,8 @@ impl Sync {
             registry,
             workspaces,
             workspaces_tx,
+            chats,
+            chats_tx,
             events,
         }
     }
@@ -294,6 +309,12 @@ impl Sync {
             return Err(CallError::Rpc(RpcCallError::Remote(fl_proto::RpcError {
                 code: fl_proto::RpcErrorCode::Unsupported,
                 message: "sidebar sections require daemon protocol 0.4".into(),
+            })));
+        }
+        if chat::is_chat_request(&req) && !chat::supports_chat(link.daemon_proto()) {
+            return Err(CallError::Rpc(RpcCallError::Remote(fl_proto::RpcError {
+                code: fl_proto::RpcErrorCode::Unsupported,
+                message: "chat requires daemon protocol 0.4".into(),
             })));
         }
         self.core
@@ -652,6 +673,190 @@ impl Sync {
     ) -> Result<ScriptState, CallError> {
         match self.call(Request::StopScript { worktree, kind }).await? {
             Response::ScriptState(state) => Ok(state),
+            _ => Err(CallError::Unexpected),
+        }
+    }
+
+    /// Sessions, transcripts and the inbox, kept current from pushed events.
+    pub fn chats(&self) -> Arc<ChatState> {
+        self.chats.borrow().clone()
+    }
+
+    pub fn chats_changes(&self) -> watch::Receiver<Arc<ChatState>> {
+        self.chats.clone()
+    }
+
+    /// Durable events the mirror holds for one session, in sequence order.
+    pub fn chat_events(&self, session: uuid::Uuid) -> Vec<fl_model::chat::EventRecord> {
+        self.chats.borrow().session_events(session).to_vec()
+    }
+
+    pub async fn list_chat_sessions(
+        &self,
+        worktree: WorktreeId,
+    ) -> Result<Vec<fl_model::chat::ChatSession>, CallError> {
+        match self.call(Request::ListChatSessions { worktree }).await? {
+            Response::ChatSessions(sessions) => {
+                let incoming = sessions.clone();
+                chat::update(&self.chats_tx, |state| {
+                    state.replace_worktree_sessions(worktree, incoming)
+                });
+                Ok(sessions)
+            }
+            _ => Err(CallError::Unexpected),
+        }
+    }
+
+    /// Fetch one page from `from` (inclusive) and append it to the mirror.
+    pub async fn get_chat_events(
+        &self,
+        session: uuid::Uuid,
+        from: u64,
+        limit: u16,
+    ) -> Result<fl_model::chat::ChatEventPage, CallError> {
+        match self
+            .call(Request::GetChatEvents {
+                session,
+                from,
+                limit,
+            })
+            .await?
+        {
+            Response::ChatEvents(page) => {
+                chat::update(&self.chats_tx, |state| {
+                    let _ = state.append_page(&page);
+                });
+                Ok(page)
+            }
+            _ => Err(CallError::Unexpected),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn start_chat(
+        &self,
+        worktree: WorktreeId,
+        provider: String,
+        model: Option<String>,
+        thinking: Option<String>,
+        permission_mode: fl_model::chat::PermissionMode,
+        resume: Option<fl_model::chat::ResumeTarget>,
+    ) -> Result<fl_model::chat::ChatSession, CallError> {
+        match self
+            .call(Request::StartChat {
+                worktree,
+                provider,
+                model,
+                thinking,
+                permission_mode,
+                resume,
+            })
+            .await?
+        {
+            Response::ChatSessions(mut sessions) if sessions.len() == 1 => {
+                let session = sessions.remove(0);
+                let incoming = session.clone();
+                chat::update(&self.chats_tx, |state| state.merge_session(incoming));
+                Ok(session)
+            }
+            _ => Err(CallError::Unexpected),
+        }
+    }
+
+    pub async fn send_chat(&self, session: uuid::Uuid, text: String) -> Result<(), CallError> {
+        match self.call(Request::SendChat { session, text }).await? {
+            Response::Done => Ok(()),
+            _ => Err(CallError::Unexpected),
+        }
+    }
+
+    pub async fn steer_chat(&self, session: uuid::Uuid, text: String) -> Result<(), CallError> {
+        match self.call(Request::SteerChat { session, text }).await? {
+            Response::Done => Ok(()),
+            _ => Err(CallError::Unexpected),
+        }
+    }
+
+    pub async fn cancel_chat(&self, session: uuid::Uuid) -> Result<(), CallError> {
+        match self.call(Request::CancelChat { session }).await? {
+            Response::Done => Ok(()),
+            _ => Err(CallError::Unexpected),
+        }
+    }
+
+    pub async fn approve_chat(
+        &self,
+        session: uuid::Uuid,
+        request: String,
+        decision: fl_model::chat::ApprovalDecision,
+    ) -> Result<(), CallError> {
+        match self
+            .call(Request::ApproveChat {
+                session,
+                request,
+                decision,
+            })
+            .await?
+        {
+            Response::Done => Ok(()),
+            _ => Err(CallError::Unexpected),
+        }
+    }
+
+    pub async fn answer_chat(
+        &self,
+        session: uuid::Uuid,
+        request: String,
+        response: fl_model::chat::QuestionResponse,
+    ) -> Result<(), CallError> {
+        match self
+            .call(Request::AnswerChat {
+                session,
+                request,
+                response,
+            })
+            .await?
+        {
+            Response::Done => Ok(()),
+            _ => Err(CallError::Unexpected),
+        }
+    }
+
+    pub async fn close_chat(&self, session: uuid::Uuid) -> Result<(), CallError> {
+        match self.call(Request::CloseChat { session }).await? {
+            Response::Done => Ok(()),
+            _ => Err(CallError::Unexpected),
+        }
+    }
+
+    pub async fn search_chats(
+        &self,
+        query: String,
+        limit: u16,
+    ) -> Result<Vec<fl_model::chat::ChatHit>, CallError> {
+        match self.call(Request::SearchChats { query, limit }).await? {
+            Response::ChatHits(hits) => Ok(hits),
+            _ => Err(CallError::Unexpected),
+        }
+    }
+
+    pub async fn list_inbox(&self) -> Result<Vec<fl_model::chat::InboxItem>, CallError> {
+        match self.call(Request::ListInbox).await? {
+            Response::Inbox(items) => {
+                let incoming = items.clone();
+                chat::update(&self.chats_tx, |state| state.set_inbox(incoming));
+                Ok(items)
+            }
+            _ => Err(CallError::Unexpected),
+        }
+    }
+
+    pub async fn dismiss_inbox(&self, item: uuid::Uuid) -> Result<(), CallError> {
+        match self.call(Request::DismissInbox { item }).await? {
+            Response::Done => {
+                chat::update(&self.chats_tx, |state| state.dismiss(item));
+                Ok(())
+            }
             _ => Err(CallError::Unexpected),
         }
     }

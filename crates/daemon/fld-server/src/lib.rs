@@ -3,6 +3,7 @@
 //! the persistent terminal service and workspaces (projects, worktrees, git
 //! status, files and scripts).
 pub mod channels;
+mod chat;
 pub mod devices;
 mod events;
 pub mod identity;
@@ -130,10 +131,14 @@ pub async fn start(config: DaemonConfig) -> Result<DaemonHandle, ServerError> {
     .await?;
     let cancel = CancellationToken::new();
     let events = Arc::new(events::EventBus::default());
+    let chat = chat::ChatService::start(terminals.clone(), events.clone(), cancel.child_token())
+        .await
+        .map_err(|error| std::io::Error::other(format!("starting chats: {}", error.message)))?;
     let workspace = workspace::WorkspaceService::start(
         home.clone(),
         terminals.clone(),
         events.clone(),
+        chat.clone(),
         cancel.child_token(),
     )
     .await
@@ -152,6 +157,7 @@ pub async fn start(config: DaemonConfig) -> Result<DaemonHandle, ServerError> {
         terminals: terminals.clone(),
         events,
         workspace,
+        chat,
     });
     let mut tasks = vec![tokio::spawn(listen::unix_accept_loop(unix, ctx.clone()))];
     if let Some(ep) = &quic {

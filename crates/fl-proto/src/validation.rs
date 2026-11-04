@@ -227,11 +227,312 @@ pub fn daemon_event(value: &fl_model::workspace::DaemonEvent) -> Result<(), Vali
             Ok(())
         }
         DaemonEvent::TaskDispatchChanged(dispatch) => task_dispatch(dispatch),
+        DaemonEvent::ChatSessionChanged(session) => chat_session(session),
+        DaemonEvent::ChatEventAppended {
+            session,
+            incarnation,
+            ..
+        } => {
+            non_nil("chat session", *session)?;
+            non_nil("chat incarnation", *incarnation)
+        }
         DaemonEvent::WorkspaceTreeChanged { .. }
         | DaemonEvent::LayoutChanged { .. }
-        | DaemonEvent::ReviewChanged { .. } => Ok(()),
+        | DaemonEvent::ReviewChanged { .. }
+        | DaemonEvent::InboxChanged => Ok(()),
     }
 }
+
+// --- M4: chat, transcript and inbox bounds ---------------------------------
+
+/// A search query or an opaque provider request ID.
+pub const MAX_CHAT_QUERY_BYTES: usize = 1024;
+pub const MAX_CHAT_REQUEST_BYTES: usize = 1024;
+/// One answer map sent back for a provider question.
+pub const MAX_CHAT_ANSWERS: usize = 64;
+pub const MAX_CHAT_ANSWER_BYTES: usize = 4096;
+pub const MAX_CHAT_MODEL_BYTES: usize = 1024;
+pub const MAX_CHAT_PROVIDER_BYTES: usize = 256;
+/// Session labels, failure text and inbox titles.
+pub const MAX_CHAT_INBOX_BYTES: usize = 4096;
+/// Largest durable event record accepted from or sent to a peer.
+pub const MAX_CHAT_EVENT_BYTES: usize = 2 * 1024 * 1024;
+/// Largest encoded event page; keeps several pages below one frame.
+pub const MAX_CHAT_PAGE_BYTES: usize = 8 * 1024 * 1024;
+/// Deepest nested subagent event tree accepted in one record.
+const MAX_CHAT_EVENT_DEPTH: usize = 8;
+const MAX_CHAT_EVENT_ITEMS: usize = 256;
+
+pub(crate) fn non_nil(field: &'static str, value: uuid::Uuid) -> Result<(), ValidationError> {
+    if value.is_nil() {
+        Err(ValidationError::Invalid(field))
+    } else {
+        Ok(())
+    }
+}
+
+pub(crate) fn non_nil_id(field: &'static str, value: &[u8; 16]) -> Result<(), ValidationError> {
+    if value.iter().all(|byte| *byte == 0) {
+        Err(ValidationError::Invalid(field))
+    } else {
+        Ok(())
+    }
+}
+
+pub fn chat_resume(value: &fl_model::chat::ResumeTarget) -> Result<(), ValidationError> {
+    text("resume provider", &value.provider_id, MAX_CHAT_PROVIDER_BYTES)?;
+    if value.provider_id.trim().is_empty() {
+        return Err(ValidationError::Invalid("resume provider"));
+    }
+    text("resume identity", &value.native_id, 512)?;
+    if value.native_id.is_empty() {
+        return Err(ValidationError::Invalid("resume identity"));
+    }
+    path(&value.cwd.to_string_lossy())
+}
+
+pub fn chat_session(value: &fl_model::chat::ChatSession) -> Result<(), ValidationError> {
+    non_nil("chat session", value.id)?;
+    text(
+        "chat provider",
+        &value.provider,
+        MAX_CHAT_PROVIDER_BYTES,
+    )?;
+    if value.provider.trim().is_empty() {
+        return Err(ValidationError::Invalid("chat provider"));
+    }
+    text("chat label", &value.label, MAX_CHAT_INBOX_BYTES)?;
+    if value.label.trim().is_empty() {
+        return Err(ValidationError::Invalid("chat label"));
+    }
+    for field in [&value.model, &value.thinking].into_iter().flatten() {
+        text("chat model", field, MAX_CHAT_MODEL_BYTES)?;
+    }
+    if let fl_model::chat::SessionState::Failed { message } = &value.status {
+        text("chat failure", message, MAX_CHAT_INBOX_BYTES)?;
+    }
+    if let Some(resume) = &value.resume {
+        chat_resume(resume)?;
+    }
+    Ok(())
+}
+
+fn chat_event_text(value: &fl_model::chat::BoundedText) -> Result<(), ValidationError> {
+    text("chat event text", &value.text, fl_model::chat::MAX_CHAT_TEXT)
+}
+
+pub fn chat_event(value: &fl_model::chat::EventRecord) -> Result<(), ValidationError> {
+    schema(
+        "chat event schema",
+        value.schema_version,
+        fl_model::chat::CHAT_SCHEMA_VERSION,
+    )?;
+    non_nil("chat session", value.session_id)?;
+    non_nil("chat incarnation", value.incarnation)?;
+    let size = postcard::experimental::serialized_size(value)
+        .map_err(|error| ValidationError::InvalidPayload(error.to_string()))?;
+    bound("chat event bytes", size, MAX_CHAT_EVENT_BYTES)?;
+    chat_content(&value.event, 0)
+}
+
+fn chat_content(
+    event: &fl_model::chat::ChatEvent,
+    depth: usize,
+) -> Result<(), ValidationError> {
+    use fl_model::chat::ChatEvent;
+    if depth > MAX_CHAT_EVENT_DEPTH {
+        return Err(ValidationError::Invalid("chat event nesting"));
+    }
+    let event_text = |field: &'static str, value: &str| {
+        text(field, value, fl_model::chat::MAX_CHAT_TEXT)
+    };
+    match event {
+        ChatEvent::SessionReady(info) => {
+            non_nil("chat session", info.id)?;
+            non_nil("chat incarnation", info.incarnation)?;
+            chat_resume(&info.resume)?;
+            if let Some(model) = &info.model {
+                text("chat model", model, MAX_CHAT_MODEL_BYTES)?;
+            }
+            Ok(())
+        }
+        ChatEvent::StateChanged(state) => match state {
+            fl_model::chat::SessionState::Failed { message } => {
+                text("chat failure", message, MAX_CHAT_INBOX_BYTES)
+            }
+            _ => Ok(()),
+        },
+        ChatEvent::UserMessage { id, text: value } => {
+            event_text("chat event id", id)?;
+            event_text("chat message", value)
+        }
+        ChatEvent::AssistantText {
+            id,
+            update: _,
+            text: value,
+        }
+        | ChatEvent::Thinking { id, delta: value } => {
+            event_text("chat event id", id)?;
+            event_text("chat message", value)
+        }
+        ChatEvent::StructuredOutput { json } => event_text("structured output", json),
+        ChatEvent::ToolCall(call) => {
+            event_text("tool id", &call.id)?;
+            event_text("tool title", &call.title)?;
+            chat_event_text(&call.input_summary)?;
+            if let Some(output) = &call.output {
+                chat_event_text(output)?;
+            }
+            if let Some(diff) = &call.diff {
+                chat_event_text(diff)?;
+            }
+            Ok(())
+        }
+        ChatEvent::ToolOutput { id, delta } => {
+            event_text("tool id", id)?;
+            chat_event_text(delta)
+        }
+        ChatEvent::FileEdit {
+            path,
+            unified_diff,
+        } => {
+            event_text("chat path", &path.to_string_lossy())?;
+            chat_event_text(unified_diff)
+        }
+        ChatEvent::ApprovalRequest {
+            id,
+            tool,
+            details,
+            options,
+        } => {
+            event_text("approval id", id)?;
+            event_text("approval tool", tool)?;
+            chat_event_text(details)?;
+            bound("approval options", options.len(), 8)
+        }
+        ChatEvent::QuestionRequest {
+            id,
+            questions,
+            schema_json,
+        } => {
+            event_text("question id", id)?;
+            bound("questions", questions.len(), 64)?;
+            if let Some(schema) = schema_json {
+                event_text("question schema", schema)?;
+            }
+            for question in questions {
+                event_text("question id", &question.id)?;
+                event_text("question", &question.text)?;
+                bound("question options", question.options.len(), 64)?;
+                for option in &question.options {
+                    event_text("question option", &option.label)?;
+                    event_text("question option", &option.description)?;
+                }
+            }
+            Ok(())
+        }
+        ChatEvent::RequestResolved { id } => event_text("approval id", id),
+        ChatEvent::Subagent { parent_tool_id, events } => {
+            event_text("subagent tool id", parent_tool_id)?;
+            bound("subagent events", events.len(), MAX_CHAT_EVENT_ITEMS)?;
+            for event in events {
+                chat_content(event, depth + 1)?;
+            }
+            Ok(())
+        }
+        ChatEvent::TurnEnd { model, usage, .. } => {
+            if let Some(model) = model {
+                text("chat model", model, MAX_CHAT_MODEL_BYTES)?;
+            }
+            if let Some(cost) = &usage.cost_usd {
+                text("chat cost", cost, 64)?;
+            }
+            Ok(())
+        }
+        ChatEvent::Error { code, message, .. } => {
+            event_text("chat error code", code)?;
+            event_text("chat error", message)
+        }
+        ChatEvent::Diagnostic { stream, output } => {
+            event_text("diagnostic stream", stream)?;
+            chat_event_text(output)
+        }
+        ChatEvent::ProcessExited { .. } => Ok(()),
+    }
+}
+
+pub fn chat_events(value: &fl_model::chat::ChatEventPage) -> Result<(), ValidationError> {
+    non_nil("chat session", value.session)?;
+    non_nil("chat incarnation", value.incarnation)?;
+    bound(
+        "chat events",
+        value.events.len(),
+        fl_model::chat::MAX_CHAT_MESSAGES,
+    )?;
+    let mut previous = None;
+    let mut total = 0usize;
+    for event in &value.events {
+        chat_event(event)?;
+        if event.session_id != value.session {
+            return Err(ValidationError::Invalid("chat event session"));
+        }
+        if previous.is_some_and(|previous| event.sequence <= previous) {
+            return Err(ValidationError::Invalid("chat event sequence"));
+        }
+        previous = Some(event.sequence);
+        total += postcard::experimental::serialized_size(event)
+            .map_err(|error| ValidationError::InvalidPayload(error.to_string()))?;
+    }
+    bound("chat page bytes", total, MAX_CHAT_PAGE_BYTES)
+}
+
+pub fn chat_hits(values: &[fl_model::chat::ChatHit]) -> Result<(), ValidationError> {
+    bound(
+        "chat hits",
+        values.len(),
+        fl_model::chat::MAX_CHAT_HISTORY,
+    )?;
+    for hit in values {
+        non_nil("chat session", hit.session)?;
+        text("chat snippet", &hit.snippet, fl_model::chat::MAX_CHAT_TEXT)?;
+    }
+    Ok(())
+}
+
+pub fn inbox_items(values: &[fl_model::chat::InboxItem]) -> Result<(), ValidationError> {
+    bound(
+        "inbox items",
+        values.len(),
+        fl_model::chat::MAX_CHAT_HISTORY,
+    )?;
+    for item in values {
+        non_nil("inbox item", item.id)?;
+        non_nil("chat session", item.session)?;
+        text("inbox title", &item.title, MAX_CHAT_INBOX_BYTES)?;
+        if item.title.trim().is_empty() {
+            return Err(ValidationError::Invalid("inbox title"));
+        }
+    }
+    Ok(())
+}
+
+pub fn question_response(
+    value: &fl_model::chat::QuestionResponse,
+) -> Result<(), ValidationError> {
+    bound("answers", value.answers.len(), MAX_CHAT_ANSWERS)?;
+    for (question, answers) in &value.answers {
+        text("answer question", question, MAX_CHAT_ANSWER_BYTES)?;
+        bound("answer values", answers.len(), MAX_CHAT_ANSWERS)?;
+        for answer in answers {
+            text("answer", answer, MAX_CHAT_ANSWER_BYTES)?;
+        }
+    }
+    if let Some(json) = &value.structured_json {
+        text("answer json", json, fl_model::chat::MAX_CHAT_TEXT)?;
+    }
+    Ok(())
+}
+
 
 /// A routed dispatch carries its rendered prompt; bound it like a message.
 pub fn task_dispatch(value: &fl_model::routing::TaskDispatch) -> Result<(), ValidationError> {

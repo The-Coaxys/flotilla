@@ -289,6 +289,61 @@ pub enum Request {
         /// Extra user context appended through `{{task}}`.
         context: String,
     },
+    // --- M4: chat sessions, transcripts, approvals and the inbox (0.4) ---
+    /// Sessions of one worktree, ordered by creation time.
+    ListChatSessions {
+        worktree: WorktreeId,
+    },
+    /// Durable events from `from` (inclusive).
+    GetChatEvents {
+        session: uuid::Uuid,
+        from: u64,
+        limit: u16,
+    },
+    /// Launch a provider adapter for a new chat in `worktree`.
+    StartChat {
+        worktree: WorktreeId,
+        provider: String,
+        model: Option<String>,
+        thinking: Option<String>,
+        permission_mode: fl_model::chat::PermissionMode,
+        /// Continue a validated native session instead of starting fresh.
+        resume: Option<fl_model::chat::ResumeTarget>,
+    },
+    SendChat {
+        session: uuid::Uuid,
+        text: String,
+    },
+    SteerChat {
+        session: uuid::Uuid,
+        text: String,
+    },
+    CancelChat {
+        session: uuid::Uuid,
+    },
+    ApproveChat {
+        session: uuid::Uuid,
+        /// The approval request ID, valid only while it is pending.
+        request: String,
+        decision: fl_model::chat::ApprovalDecision,
+    },
+    AnswerChat {
+        session: uuid::Uuid,
+        request: String,
+        response: fl_model::chat::QuestionResponse,
+    },
+    CloseChat {
+        session: uuid::Uuid,
+    },
+    /// Full-text search over durable transcripts.
+    SearchChats {
+        query: String,
+        limit: u16,
+    },
+    ListInbox,
+    DismissInbox {
+        item: uuid::Uuid,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -325,6 +380,11 @@ pub enum Response {
     RoutingState(fl_model::routing::RoutingState),
     ChatProviders(Vec<fl_model::chat::ProviderDiscovery>),
     TaskDispatch(fl_model::routing::TaskDispatch),
+    // --- M4 ---
+    ChatSessions(Vec<fl_model::chat::ChatSession>),
+    ChatEvents(fl_model::chat::ChatEventPage),
+    ChatHits(Vec<fl_model::chat::ChatHit>),
+    Inbox(Vec<fl_model::chat::InboxItem>),
 }
 
 /// Returned on the authenticated control stream before requesting channels.
@@ -492,6 +552,109 @@ impl Request {
             Self::MutateRouting { mutation, .. } => {
                 mutation.validate().map_err(ValidationError::Invalid)
             }
+            Self::ListChatSessions { worktree } => {
+                validation::non_nil_id("chat worktree", worktree.as_bytes())
+            }
+            Self::GetChatEvents {
+                session,
+                limit,
+                ..
+            } => {
+                validation::non_nil("chat session", *session)?;
+                if *limit == 0 {
+                    return Err(ValidationError::Invalid("chat page limit"));
+                }
+                bound(
+                    "chat page limit",
+                    *limit as usize,
+                    fl_model::chat::MAX_CHAT_MESSAGES,
+                )
+            }
+            Self::StartChat {
+                worktree,
+                provider,
+                model,
+                thinking,
+                resume,
+                ..
+            } => {
+                validation::non_nil_id("chat worktree", worktree.as_bytes())?;
+                text(
+                    "chat provider",
+                    provider,
+                    validation::MAX_CHAT_PROVIDER_BYTES,
+                )?;
+                if provider.trim().is_empty() {
+                    return Err(ValidationError::Invalid("chat provider"));
+                }
+                for value in [model, thinking].into_iter().flatten() {
+                    text(
+                        "chat setting",
+                        value,
+                        validation::MAX_CHAT_MODEL_BYTES,
+                    )?;
+                }
+                if let Some(resume) = resume {
+                    validation::chat_resume(resume)?;
+                }
+                Ok(())
+            }
+            Self::SendChat { session, text: value }
+            | Self::SteerChat { session, text: value } => {
+                validation::non_nil("chat session", *session)?;
+                if value.trim().is_empty() {
+                    return Err(ValidationError::Invalid("empty chat message"));
+                }
+                text("chat message", value, fl_model::chat::MAX_CHAT_TEXT)
+            }
+            Self::CancelChat { session } | Self::CloseChat { session } => {
+                validation::non_nil("chat session", *session)
+            }
+            Self::ApproveChat {
+                session, request, ..
+            } => {
+                validation::non_nil("chat session", *session)?;
+                text(
+                    "approval request",
+                    request,
+                    validation::MAX_CHAT_REQUEST_BYTES,
+                )?;
+                if request.trim().is_empty() {
+                    return Err(ValidationError::Invalid("approval request"));
+                }
+                Ok(())
+            }
+            Self::AnswerChat {
+                session,
+                request,
+                response,
+            } => {
+                validation::non_nil("chat session", *session)?;
+                text(
+                    "question request",
+                    request,
+                    validation::MAX_CHAT_REQUEST_BYTES,
+                )?;
+                if request.trim().is_empty() {
+                    return Err(ValidationError::Invalid("question request"));
+                }
+                validation::question_response(response)
+            }
+            Self::SearchChats { query, limit } => {
+                if query.trim().is_empty() {
+                    return Err(ValidationError::Invalid("empty chat query"));
+                }
+                text("chat query", query, validation::MAX_CHAT_QUERY_BYTES)?;
+                if *limit == 0 {
+                    return Err(ValidationError::Invalid("chat search limit"));
+                }
+                bound(
+                    "chat search limit",
+                    *limit as usize,
+                    fl_model::chat::MAX_CHAT_HISTORY,
+                )
+            }
+            Self::DismissInbox { item } => validation::non_nil("inbox item", *item),
             _ => Ok(()),
         }
     }
@@ -568,6 +731,23 @@ impl Response {
                 Ok(())
             }
             Self::TaskDispatch(value) => validation::task_dispatch(value),
+            Self::ChatSessions(values) => {
+                validation::bound(
+                    "chat sessions",
+                    values.len(),
+                    fl_model::chat::MAX_CHAT_HISTORY,
+                )?;
+                for (index, value) in values.iter().enumerate() {
+                    validation::chat_session(value)?;
+                    if values[..index].iter().any(|other| other.id == value.id) {
+                        return Err(ValidationError::Invalid("duplicate chat session"));
+                    }
+                }
+                Ok(())
+            }
+            Self::ChatEvents(value) => validation::chat_events(value),
+            Self::ChatHits(values) => validation::chat_hits(values),
+            Self::Inbox(values) => validation::inbox_items(values),
             Self::Written(_) | Self::Done => Ok(()),
             Self::DaemonInfo(value) => {
                 for text in [
@@ -982,5 +1162,204 @@ mod tests {
         let mut state = fixture;
         state.sections.clear();
         reject_sections_snapshot(state);
+    }
+
+    fn chat_fixture() -> fl_model::chat::ChatSession {
+        use fl_model::chat::{PermissionMode, StatusSource};
+        fl_model::chat::ChatSession {
+            id: uuid::Uuid::from_bytes([7; 16]),
+            worktree: WorktreeId::from_bytes([8; 16]),
+            provider: "claude".into(),
+            label: "Claude Code 1234abcd".into(),
+            status: fl_model::chat::SessionState::Idle,
+            status_source: StatusSource::Structured,
+            model: Some("sonnet".into()),
+            thinking: Some("default".into()),
+            permission_mode: PermissionMode::Ask,
+            resume: Some(fl_model::chat::ResumeTarget {
+                provider_id: "claude".into(),
+                adapter: fl_model::chat::AdapterKind::ClaudeStream,
+                native_id: "native-session".into(),
+                cwd: std::path::PathBuf::from("/srv/wt"),
+            }),
+            seq: 9,
+            created_ms: 10,
+            updated_ms: 20,
+        }
+    }
+
+    fn chat_event(session: uuid::Uuid, sequence: u64) -> fl_model::chat::EventRecord {
+        use fl_model::chat::{ChatEvent, TextUpdate};
+        fl_model::chat::EventRecord {
+            schema_version: fl_model::chat::CHAT_SCHEMA_VERSION,
+            session_id: session,
+            incarnation: uuid::Uuid::from_bytes([9; 16]),
+            sequence,
+            timestamp_ms: sequence,
+            native_session_id: Some("native-session".into()),
+            turn_id: None,
+            event: ChatEvent::AssistantText {
+                id: format!("m{sequence}"),
+                update: TextUpdate::Final,
+                text: "hello".into(),
+            },
+        }
+    }
+
+    #[test]
+    fn chat_requests_responses_and_events_roundtrip() {
+        use fl_model::chat::{ApprovalDecision, QuestionResponse};
+        let session = chat_fixture();
+        let id = session.id;
+        let worktree = session.worktree;
+        let requests = vec![
+            Request::ListChatSessions { worktree },
+            Request::GetChatEvents {
+                session: id,
+                from: 1,
+                limit: 64,
+            },
+            Request::StartChat {
+                worktree,
+                provider: "claude".into(),
+                model: Some("sonnet".into()),
+                thinking: None,
+                permission_mode: fl_model::chat::PermissionMode::Ask,
+                resume: session.resume.clone(),
+            },
+            Request::SendChat {
+                session: id,
+                text: "hi".into(),
+            },
+            Request::SteerChat {
+                session: id,
+                text: "more".into(),
+            },
+            Request::CancelChat { session: id },
+            Request::ApproveChat {
+                session: id,
+                request: "req".into(),
+                decision: ApprovalDecision::AllowOnce,
+            },
+            Request::AnswerChat {
+                session: id,
+                request: "q".into(),
+                response: QuestionResponse::default(),
+            },
+            Request::CloseChat { session: id },
+            Request::SearchChats {
+                query: "hello".into(),
+                limit: 10,
+            },
+            Request::ListInbox,
+            Request::DismissInbox {
+                item: uuid::Uuid::from_bytes([3; 16]),
+            },
+        ];
+        for (index, request) in requests.into_iter().enumerate() {
+            let message = ClientMsg::Rpc {
+                id: index as u64,
+                req: request,
+            };
+            assert_eq!(
+                ClientMsg::from_frame(&message.to_frame().unwrap()).unwrap(),
+                message
+            );
+        }
+        let page = fl_model::chat::ChatEventPage {
+            session: id,
+            incarnation: uuid::Uuid::from_bytes([9; 16]),
+            events: vec![chat_event(id, 1), chat_event(id, 2)],
+            more: true,
+        };
+        let hit = fl_model::chat::ChatHit {
+            session: id,
+            worktree,
+            sequence: 1,
+            snippet: "hello".into(),
+        };
+        let inbox = fl_model::chat::InboxItem {
+            id: uuid::Uuid::from_bytes([4; 16]),
+            session: id,
+            worktree,
+            kind: fl_model::chat::InboxKind::Approval,
+            state: fl_model::chat::InboxState::Unread,
+            title: "Approval needed".into(),
+            created_ms: 3,
+        };
+        for response in [
+            Response::ChatSessions(vec![session]),
+            Response::ChatEvents(page),
+            Response::ChatHits(vec![hit]),
+            Response::Inbox(vec![inbox]),
+        ] {
+            let message = ServerMsg::RpcResult {
+                id: 1,
+                result: Ok(response),
+            };
+            assert_eq!(
+                ServerMsg::from_frame(&message.to_frame().unwrap()).unwrap(),
+                message
+            );
+        }
+        let event = ServerMsg::Event(fl_model::workspace::DaemonEvent::ChatEventAppended {
+            session: id,
+            worktree,
+            incarnation: uuid::Uuid::from_bytes([9; 16]),
+            sequence: 2,
+        });
+        assert_eq!(
+            ServerMsg::from_frame(&event.to_frame().unwrap()).unwrap(),
+            event
+        );
+    }
+
+    #[test]
+    fn chat_payloads_are_bounded_at_both_wire_boundaries() {
+        use fl_model::chat::MAX_CHAT_TEXT;
+        let session = chat_fixture();
+        let id = session.id;
+        for request in [
+            Request::SendChat {
+                session: id,
+                text: String::new(),
+            },
+            Request::SendChat {
+                session: id,
+                text: "   ".into(),
+            },
+            Request::SteerChat {
+                session: id,
+                text: "x".repeat(MAX_CHAT_TEXT + 1),
+            },
+            Request::GetChatEvents {
+                session: id,
+                from: 1,
+                limit: 0,
+            },
+            Request::SearchChats {
+                query: "  ".into(),
+                limit: 1,
+            },
+            Request::ListChatSessions {
+                worktree: WorktreeId::from_bytes([0; 16]),
+            },
+            Request::CloseChat {
+                session: uuid::Uuid::nil(),
+            },
+        ] {
+            assert!(request.validate().is_err(), "{request:?} was accepted");
+        }
+        let mut page = fl_model::chat::ChatEventPage {
+            session: id,
+            incarnation: uuid::Uuid::from_bytes([9; 16]),
+            events: vec![chat_event(id, 2), chat_event(id, 1)],
+            more: false,
+        };
+        assert!(Response::ChatEvents(page.clone()).validate().is_err());
+        page.events = (1..=(fl_model::chat::MAX_CHAT_MESSAGES as u64 + 1))
+            .map(|sequence| chat_event(id, sequence))
+            .collect();
+        assert!(Response::ChatEvents(page).validate().is_err());
     }
 }
