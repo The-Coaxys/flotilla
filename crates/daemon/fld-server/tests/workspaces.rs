@@ -551,10 +551,15 @@ fn fake_gh(dir: &Path) -> PathBuf {
         format!(
             r#"#!/bin/sh
 S={state}
+if [ -f "$S/rate-limit" ]; then
+  echo hit >> "$S/rate-limit-hits"
+  echo 'API rate limit exceeded' >&2
+  exit 1
+fi
 case "$1 $2" in
   "api graphql")
     if [ -f $S/number ]; then
-      printf '{{"data":{{"repository":{{"mergeCommitAllowed":false,"squashMergeAllowed":true,"rebaseMergeAllowed":false,"pullRequests":{{"nodes":[{{"number":7,"url":"https://github.com/acme/widgets/pull/7","title":"%s","state":"%s","isDraft":%s,"baseRefName":"main","headRefName":"feature","mergeable":"MERGEABLE","reviewDecision":null,"reviewThreads":{{"nodes":[]}},"commits":{{"nodes":[{{"commit":{{"statusCheckRollup":{{"state":"SUCCESS","contexts":{{"nodes":[{{"__typename":"CheckRun","name":"test","status":"COMPLETED","conclusion":"SUCCESS","detailsUrl":"https://ci/1"}}]}}}}}}}}]}}}}]}}}}}}}}' "$(cat $S/title)" "$(cat $S/state)" "$(cat $S/draft)"
+      printf '{{"data":{{"repository":{{"mergeCommitAllowed":false,"squashMergeAllowed":true,"rebaseMergeAllowed":false,"pullRequests":{{"nodes":[{{"number":7,"url":"https://github.com/acme/widgets/pull/7","title":"%s","state":"%s","isDraft":%s,"baseRefName":"main","headRefName":"feature","headRepository":{{"nameWithOwner":"acme/widgets"}},"mergeable":"MERGEABLE","reviewDecision":null,"reviewThreads":{{"nodes":[]}},"commits":{{"nodes":[{{"commit":{{"statusCheckRollup":{{"state":"SUCCESS","contexts":{{"nodes":[{{"__typename":"CheckRun","name":"test","status":"COMPLETED","conclusion":"SUCCESS","detailsUrl":"https://ci/1"}}]}}}}}}}}]}}}}]}}}}}}}}' "$(cat $S/title)" "$(cat $S/state)" "$(cat $S/draft)"
     else
       printf '{{"data":{{"repository":{{"mergeCommitAllowed":false,"squashMergeAllowed":true,"rebaseMergeAllowed":false,"pullRequests":{{"nodes":[]}}}}}}}}'
     fi ;;
@@ -750,9 +755,26 @@ async fn git_actions_and_the_pull_request_loop() {
         panic!("expected forge state")
     };
     assert!(!state.pr.unwrap().draft);
+    // A dialog for a different PR must not mutate the current PR.
+    let stale = control
+        .rpc(Request::MergePullRequest {
+            worktree: task.id,
+            number: 8,
+            method: fl_model::forge::MergeMethod::Squash,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(stale.code, RpcErrorCode::RevisionConflict);
+    assert_eq!(
+        std::fs::read_to_string(root.join("gh-state/state"))
+            .unwrap()
+            .trim(),
+        "OPEN"
+    );
     let disallowed = control
         .rpc(Request::MergePullRequest {
             worktree: task.id,
+            number: 7,
             method: fl_model::forge::MergeMethod::Rebase,
         })
         .await
@@ -761,6 +783,7 @@ async fn git_actions_and_the_pull_request_loop() {
     let Response::ForgeState(state) = control
         .ok(Request::MergePullRequest {
             worktree: task.id,
+            number: 7,
             method: fl_model::forge::MergeMethod::Squash,
         })
         .await
@@ -805,6 +828,25 @@ async fn git_actions_and_the_pull_request_loop() {
             .as_deref()
             .is_some_and(|r| r.contains("not installed")),
         "{state:?}"
+    );
+    // A rate-limit response stops both later explicit refreshes and polling.
+    unsafe { std::env::set_var("FLOTILLA_GH", &gh) };
+    std::fs::write(root.join("gh-state/rate-limit"), "").unwrap();
+    let limited = control
+        .rpc(Request::ForgeStatus { worktree: task.id })
+        .await
+        .unwrap_err();
+    assert!(limited.message.contains("rate limit"), "{limited:?}");
+    let hits = std::fs::read(root.join("gh-state/rate-limit-hits")).unwrap();
+    std::fs::remove_file(root.join("gh-state/rate-limit")).unwrap();
+    let backed_off = control
+        .rpc(Request::ForgeStatus { worktree: task.id })
+        .await
+        .unwrap_err();
+    assert!(backed_off.message.contains("backoff"), "{backed_off:?}");
+    assert_eq!(
+        std::fs::read(root.join("gh-state/rate-limit-hits")).unwrap(),
+        hits
     );
     daemon.shutdown().await;
 }

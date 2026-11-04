@@ -380,8 +380,12 @@ async fn handle_request(
             .mark_ready(worktree)
             .await
             .map(Response::ForgeState),
-        Request::MergePullRequest { worktree, method } => workspace
-            .merge_pull_request(worktree, method)
+        Request::MergePullRequest {
+            worktree,
+            number,
+            method,
+        } => workspace
+            .merge_pull_request(worktree, number, method)
             .await
             .map(Response::ForgeState),
     }

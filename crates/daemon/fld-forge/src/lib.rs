@@ -41,12 +41,17 @@ const PR_QUERY: &str = r#"query($owner: String!, $repo: String!, $head: String!)
     mergeCommitAllowed
     squashMergeAllowed
     rebaseMergeAllowed
-    pullRequests(headRefName: $head, first: 1, states: [OPEN, MERGED, CLOSED],
+    pullRequests(headRefName: $head, first: 100, states: [OPEN, MERGED, CLOSED],
                  orderBy: {field: CREATED_AT, direction: DESC}) {
+      pageInfo { hasNextPage }
       nodes {
         number url title state isDraft baseRefName headRefName mergeable reviewDecision
-        reviewThreads(first: 100) { nodes { isResolved } }
+        headRepository { nameWithOwner }
+        reviewThreads(first: 100) {
+          pageInfo { hasNextPage endCursor } nodes { isResolved }
+        }
         commits(last: 1) { nodes { commit { statusCheckRollup { state contexts(first: 100) {
+          pageInfo { hasNextPage endCursor }
           nodes {
             __typename
             ... on CheckRun { name status conclusion detailsUrl }
@@ -54,6 +59,33 @@ const PR_QUERY: &str = r#"query($owner: String!, $repo: String!, $head: String!)
           }
         } } } } }
       }
+    }
+  }
+}"#;
+
+const THREADS_QUERY: &str = r#"query($owner: String!, $repo: String!, $number: Int!, $cursor: String!) {
+  repository(owner: $owner, name: $repo) {
+    pullRequest(number: $number) {
+      reviewThreads(first: 100, after: $cursor) {
+        pageInfo { hasNextPage endCursor } nodes { isResolved }
+      }
+    }
+  }
+}"#;
+
+const CHECKS_QUERY: &str = r#"query($owner: String!, $repo: String!, $number: Int!, $cursor: String!) {
+  repository(owner: $owner, name: $repo) {
+    pullRequest(number: $number) {
+      commits(last: 1) { nodes { commit { statusCheckRollup {
+        contexts(first: 100, after: $cursor) {
+          pageInfo { hasNextPage endCursor }
+          nodes {
+            __typename
+            ... on CheckRun { name status conclusion detailsUrl }
+            ... on StatusContext { context state targetUrl }
+          }
+        }
+      } } } }
     }
   }
 }"#;
@@ -155,7 +187,107 @@ impl GitHub {
             ],
             None,
         )?;
-        parse_pull_request(&out)
+        let mut envelope: Envelope =
+            serde_json::from_slice(&out).map_err(|e| ForgeError::Parse(e.to_string()))?;
+        let repository = self.repository();
+        if let Some(repo) = envelope
+            .data
+            .as_mut()
+            .and_then(|data| data.repository.as_mut())
+        {
+            for pr in &mut repo.pull_requests.nodes {
+                if pr.head_ref_name != branch
+                    || !pr
+                        .head_repository
+                        .as_ref()
+                        .is_some_and(|head| head.name_with_owner.eq_ignore_ascii_case(&repository))
+                {
+                    continue;
+                }
+                if let Some(threads) = pr.review_threads.as_mut() {
+                    self.complete_connection(
+                        pr.number,
+                        THREADS_QUERY,
+                        "/data/repository/pullRequest/reviewThreads",
+                        threads,
+                    )?;
+                }
+                if let Some(rollup) = pr
+                    .commits
+                    .as_mut()
+                    .and_then(|commits| commits.nodes.first_mut())
+                    .and_then(|node| node.commit.status_check_rollup.as_mut())
+                {
+                    self.complete_connection(pr.number, CHECKS_QUERY,
+                        "/data/repository/pullRequest/commits/nodes/0/commit/statusCheckRollup/contexts",
+                        &mut rollup.contexts)?;
+                }
+            }
+        }
+        project_reply(envelope, Some((&repository, branch)))
+    }
+
+    fn complete_connection<T: serde::de::DeserializeOwned>(
+        &self,
+        number: u64,
+        query: &str,
+        pointer: &str,
+        connection: &mut Nodes<T>,
+    ) -> Result<()> {
+        while connection
+            .page_info
+            .as_ref()
+            .is_some_and(|page| page.has_next_page)
+        {
+            let cursor = connection
+                .page_info
+                .as_ref()
+                .and_then(|page| page.end_cursor.as_deref())
+                .ok_or_else(|| ForgeError::Parse("missing pagination cursor".into()))?;
+            let out = self.run(
+                None,
+                &[
+                    "api",
+                    "graphql",
+                    "-f",
+                    &format!("query={query}"),
+                    "-f",
+                    &format!("owner={}", self.owner),
+                    "-f",
+                    &format!("repo={}", self.repo),
+                    "-F",
+                    &format!("number={number}"),
+                    "-f",
+                    &format!("cursor={cursor}"),
+                ],
+                None,
+            )?;
+            let mut reply: serde_json::Value =
+                serde_json::from_slice(&out).map_err(|e| ForgeError::Parse(e.to_string()))?;
+            if let Some(message) = reply.pointer("/errors/0/message").and_then(|v| v.as_str()) {
+                return Err(ForgeError::Command {
+                    args: "api".into(),
+                    stderr: message.to_owned(),
+                });
+            }
+            let mut page: Nodes<T> = serde_json::from_value(
+                reply
+                    .pointer_mut(pointer)
+                    .ok_or_else(|| ForgeError::Parse("missing paginated forge connection".into()))?
+                    .take(),
+            )
+            .map_err(|e| ForgeError::Parse(e.to_string()))?;
+            if page.page_info.as_ref().is_some_and(|next| {
+                next.has_next_page && next.end_cursor.as_deref() == Some(cursor)
+            }) {
+                return Err(ForgeError::Parse(
+                    "forge pagination cursor did not advance".into(),
+                ));
+            }
+            connection.nodes.append(&mut page.nodes);
+            connection.page_info = page.page_info;
+        }
+        Ok(())
     }
 
     /// Open a pull request from `head` into `base`; returns its URL.
@@ -243,8 +375,23 @@ struct Repository {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct Nodes<T> {
     nodes: Vec<T>,
+    page_info: Option<PageInfo>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PageInfo {
+    has_next_page: bool,
+    end_cursor: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HeadRepository {
+    name_with_owner: String,
 }
 
 #[derive(Deserialize)]
@@ -257,6 +404,7 @@ struct Pr {
     is_draft: bool,
     base_ref_name: String,
     head_ref_name: String,
+    head_repository: Option<HeadRepository>,
     mergeable: Option<String>,
     review_decision: Option<String>,
     review_threads: Option<Nodes<Thread>>,
@@ -283,6 +431,7 @@ struct CommitRollup {
 #[derive(Deserialize)]
 struct Rollup {
     contexts: Nodes<RollupItem>,
+    state: String,
 }
 
 #[derive(Deserialize)]
@@ -330,8 +479,22 @@ fn status_context_status(state: &str) -> CheckStatus {
 
 /// Parse the reply of [`PR_QUERY`].
 pub fn parse_pull_request(json: &[u8]) -> Result<(Option<PullRequest>, MergeMethods)> {
+    parse_reply(json, None)
+}
+
+fn parse_reply(
+    json: &[u8],
+    scope: Option<(&str, &str)>,
+) -> Result<(Option<PullRequest>, MergeMethods)> {
     let envelope: Envelope =
         serde_json::from_slice(json).map_err(|e| ForgeError::Parse(e.to_string()))?;
+    project_reply(envelope, scope)
+}
+
+fn project_reply(
+    envelope: Envelope,
+    scope: Option<(&str, &str)>,
+) -> Result<(Option<PullRequest>, MergeMethods)> {
     if let Some(error) = envelope.errors.first() {
         return Err(ForgeError::Command {
             args: "api".into(),
@@ -347,7 +510,32 @@ pub fn parse_pull_request(json: &[u8]) -> Result<(Option<PullRequest>, MergeMeth
         merge: repository.merge_commit_allowed,
         rebase: repository.rebase_merge_allowed,
     };
-    let Some(pr) = repository.pull_requests.nodes.into_iter().next() else {
+    let mut candidates = repository.pull_requests.nodes.into_iter().filter(|pr| {
+        scope.is_none_or(|(repo, branch)| {
+            pr.head_ref_name == branch
+                && pr
+                    .head_repository
+                    .as_ref()
+                    .is_some_and(|head| head.name_with_owner.eq_ignore_ascii_case(repo))
+        })
+    });
+    let first = candidates.next();
+    let selected = match first {
+        Some(pr) if pr.state == "OPEN" => Some(pr),
+        fallback => candidates.find(|pr| pr.state == "OPEN").or(fallback),
+    };
+    if scope.is_some()
+        && selected.as_ref().is_none_or(|pr| pr.state != "OPEN")
+        && repository
+            .pull_requests
+            .page_info
+            .is_some_and(|page| page.has_next_page)
+    {
+        return Err(ForgeError::Unavailable(
+            "too many pull requests share this branch name to resolve it safely".into(),
+        ));
+    }
+    let Some(pr) = selected else {
         return Ok((None, methods));
     };
     let state = match pr.state.as_str() {
@@ -367,10 +555,14 @@ pub fn parse_pull_request(json: &[u8]) -> Result<(Option<PullRequest>, MergeMeth
         Some("REVIEW_REQUIRED") => Some(ReviewDecision::ReviewRequired),
         _ => None,
     };
-    let checks = pr
+    let rollup = pr
         .commits
         .and_then(|commits| commits.nodes.into_iter().next())
-        .and_then(|node| node.commit.status_check_rollup)
+        .and_then(|node| node.commit.status_check_rollup);
+    let check_rollup = rollup
+        .as_ref()
+        .map(|rollup| status_context_status(&rollup.state));
+    let checks = rollup
         .map(|rollup| rollup.contexts.nodes)
         .unwrap_or_default()
         .into_iter()
@@ -413,8 +605,127 @@ pub fn parse_pull_request(json: &[u8]) -> Result<(Option<PullRequest>, MergeMeth
             mergeable,
             review,
             checks,
+            check_rollup,
             unresolved_threads,
         }),
         methods,
     ))
+}
+
+#[cfg(test)]
+mod selection_tests {
+    use super::*;
+    use serde_json::{Value, json};
+
+    fn candidate(number: u64, repository: &str, state: &str) -> Value {
+        json!({
+            "number": number,
+            "url": format!("https://github.com/acme/widgets/pull/{number}"),
+            "title": "Example", "state": state, "isDraft": false,
+            "baseRefName": "main", "headRefName": "feature",
+            "headRepository": {"nameWithOwner": repository},
+            "mergeable": "MERGEABLE"
+        })
+    }
+
+    fn reply(nodes: Vec<Value>, more: bool) -> Vec<u8> {
+        serde_json::to_vec(&json!({"data":{"repository":{
+            "mergeCommitAllowed": true, "squashMergeAllowed": true,
+            "rebaseMergeAllowed": false, "pullRequests":{
+                "nodes":nodes, "pageInfo":{"hasNextPage":more}
+            }
+        }}}))
+        .unwrap()
+    }
+
+    #[test]
+    fn selects_the_origins_open_pr_not_a_fork_or_newer_closed_pr() {
+        let bytes = reply(
+            vec![
+                candidate(9, "contributor/widgets", "OPEN"),
+                candidate(8, "acme/widgets", "MERGED"),
+                candidate(7, "Acme/Widgets", "OPEN"),
+            ],
+            false,
+        );
+        let (pr, _) = parse_reply(&bytes, Some(("acme/widgets", "feature"))).unwrap();
+        assert_eq!(pr.unwrap().number, 7);
+        let (pr, _) = parse_reply(&bytes, Some(("acme/widgets", "unrelated"))).unwrap();
+        assert!(pr.is_none());
+    }
+
+    #[test]
+    fn missing_ownership_and_incomplete_history_never_authorize_a_mutation() {
+        let mut unknown = candidate(9, "acme/widgets", "OPEN");
+        unknown.as_object_mut().unwrap().remove("headRepository");
+        let (pr, _) = parse_reply(
+            &reply(vec![unknown], false),
+            Some(("acme/widgets", "feature")),
+        )
+        .unwrap();
+        assert!(pr.is_none());
+        assert!(matches!(
+            parse_reply(
+                &reply(vec![candidate(8, "acme/widgets", "MERGED")], true),
+                Some(("acme/widgets", "feature"))
+            ),
+            Err(ForgeError::Unavailable(_))
+        ));
+    }
+
+    #[test]
+    fn later_check_and_thread_pages_are_included_before_publishing() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut pr = candidate(7, "acme/widgets", "OPEN");
+        pr["reviewThreads"] = json!({
+            "nodes":[{"isResolved":true}],
+            "pageInfo":{"hasNextPage":true,"endCursor":"threads-1"}
+        });
+        pr["commits"] = json!({"nodes":[{"commit":{"statusCheckRollup":{
+            "state":"FAILURE", "contexts":{
+                "nodes":[{"__typename":"CheckRun","name":"first","status":"COMPLETED","conclusion":"SUCCESS"}],
+                "pageInfo":{"hasNextPage":true,"endCursor":"checks-1"}
+            }
+        }}}]});
+        std::fs::write(dir.path().join("initial.json"), reply(vec![pr], false)).unwrap();
+        std::fs::write(
+            dir.path().join("threads.json"),
+            json!({"data":{"repository":{"pullRequest":{
+                "reviewThreads":{"nodes":[{"isResolved":false}],
+                    "pageInfo":{"hasNextPage":false,"endCursor":"threads-2"}}
+            }}}})
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("checks.json"), json!({"data":{"repository":{"pullRequest":{
+            "commits":{"nodes":[{"commit":{"statusCheckRollup":{"contexts":{
+                "nodes":[{"__typename":"CheckRun","name":"last","status":"COMPLETED","conclusion":"FAILURE"}],
+                "pageInfo":{"hasNextPage":false,"endCursor":"checks-2"}
+            }}}}]}
+        }}}}).to_string()).unwrap();
+        let script = dir.path().join("gh");
+        std::fs::write(&script, format!(
+            "#!/bin/sh\ncase \"$*\" in\n*cursor=threads-1*) cat '{0}/threads.json';;\n*cursor=checks-1*) cat '{0}/checks.json';;\n*) cat '{0}/initial.json';;\nesac\n",
+            dir.path().display()
+        )).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let (pr, _) = GitHub::new(script, "acme", "widgets")
+            .fetch("feature")
+            .unwrap();
+        let pr = pr.unwrap();
+        assert_eq!(pr.unresolved_threads, 1);
+        assert_eq!(pr.checks_status(), Some(CheckStatus::Failure));
+        assert_eq!(
+            pr.checks
+                .iter()
+                .map(|check| (check.name.as_str(), check.status))
+                .collect::<Vec<_>>(),
+            vec![
+                ("first", CheckStatus::Success),
+                ("last", CheckStatus::Failure)
+            ]
+        );
+    }
 }

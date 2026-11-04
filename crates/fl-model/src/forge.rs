@@ -90,6 +90,8 @@ pub struct PullRequest {
     pub mergeable: Mergeable,
     pub review: Option<ReviewDecision>,
     pub checks: Vec<Check>,
+    /// GitHub's authoritative status rollup, independent of listed contexts.
+    pub check_rollup: Option<CheckStatus>,
     pub unresolved_threads: u32,
 }
 
@@ -97,6 +99,9 @@ impl PullRequest {
     /// Rolled-up check state: any failure, else any pending, else success
     /// (`None` without checks).
     pub fn checks_status(&self) -> Option<CheckStatus> {
+        if let Some(status) = self.check_rollup {
+            return Some(status);
+        }
         if self.checks.is_empty() {
             return None;
         }

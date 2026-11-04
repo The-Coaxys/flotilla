@@ -11,6 +11,11 @@ pub fn commit(worktree: &Path, message: &str, all: bool) -> Result<String> {
     if message.trim().is_empty() {
         return Err(GitError::Invalid("the commit message is empty".into()));
     }
+    if !cmd::run(worktree, &["ls-files", "--unmerged", "-z"])?.is_empty() {
+        return Err(GitError::Refused(
+            "resolve and stage the conflicted files before committing".into(),
+        ));
+    }
     if all {
         cmd::run(worktree, &["add", "--all"])?;
     }
@@ -68,6 +73,23 @@ pub fn update(worktree: &Path, target: &str) -> Result<()> {
         return Err(GitError::Invalid(format!(
             "invalid target branch {target:?}"
         )));
+    }
+    let git_dir = cmd::run(worktree, &["rev-parse", "--absolute-git-dir"])?;
+    let git_dir = std::path::PathBuf::from(line(&git_dir));
+    if [
+        "MERGE_HEAD",
+        "CHERRY_PICK_HEAD",
+        "REVERT_HEAD",
+        "rebase-merge",
+        "rebase-apply",
+        "sequencer",
+    ]
+    .iter()
+    .any(|name| git_dir.join(name).exists())
+    {
+        return Err(GitError::Refused(
+            "finish or abort the current merge, rebase or cherry-pick before updating".into(),
+        ));
     }
     let dirty = !cmd::run(worktree, &["status", "--porcelain", "--untracked-files=no"])?.is_empty();
     if dirty {

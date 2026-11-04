@@ -136,6 +136,11 @@ impl WorkspaceService {
     }
 
     async fn fetch_forge(self: &Arc<Self>, id: WorktreeId) -> Result<ForgeState, RpcError> {
+        if self.forge_backed_off() {
+            return Err(internal(
+                "GitHub rate limit backoff is active; retry after five minutes",
+            ));
+        }
         let (_, target) = self.target(id).await?;
         let unavailable = |reason: &str| ForgeState {
             worktree: id,
@@ -269,9 +274,16 @@ impl WorkspaceService {
     pub(crate) async fn merge_pull_request(
         self: &Arc<Self>,
         id: WorktreeId,
+        expected_number: u64,
         method: MergeMethod,
     ) -> Result<ForgeState, RpcError> {
         let (github, number, methods) = self.pull_request(id).await?;
+        if number != expected_number {
+            return Err(rpc(
+                RpcErrorCode::RevisionConflict,
+                "the branch's pull request changed; refresh and confirm the merge again",
+            ));
+        }
         if !methods.allows(method) {
             return Err(invalid("the repository does not allow that merge method"));
         }
@@ -291,19 +303,16 @@ impl WorkspaceService {
                     _ = cancel.cancelled() => return,
                     _ = tick.tick() => {}
                 }
-                if service
-                    .forge
-                    .lock()
-                    .expect("forge cache poisoned")
-                    .backoff_until
-                    .is_some_and(|until| Instant::now() < until)
-                {
+                if service.forge_backed_off() {
                     continue;
                 }
                 let Ok(tree) = service.tree().await else {
                     continue;
                 };
                 for worktree in &tree.worktrees {
+                    if service.forge_backed_off() {
+                        break;
+                    }
                     let git = tree
                         .projects
                         .iter()
@@ -323,6 +332,14 @@ impl WorkspaceService {
                 }
             }
         });
+    }
+
+    fn forge_backed_off(&self) -> bool {
+        self.forge
+            .lock()
+            .expect("forge cache poisoned")
+            .backoff_until
+            .is_some_and(|until| Instant::now() < until)
     }
 
     fn forge_due(&self, id: WorktreeId) -> bool {

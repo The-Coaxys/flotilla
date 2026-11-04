@@ -597,6 +597,7 @@ impl HostWorkspace {
         let Some(Dialog::Merge {
             worktree,
             method,
+            number,
             busy,
             ..
         }) = self.dialog.as_mut()
@@ -604,10 +605,10 @@ impl HostWorkspace {
             return;
         };
         *busy = true;
-        let (worktree, method) = (*worktree, *method);
+        let (worktree, number, method) = (*worktree, *number, *method);
         let sync = self.sync.clone();
         cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
-            let result = sync.merge_pull_request(worktree, method).await;
+            let result = sync.merge_pull_request(worktree, number, method).await;
             let _ = this.update(cx, |view, cx| {
                 match result {
                     Ok(_) => view.dialog = None,

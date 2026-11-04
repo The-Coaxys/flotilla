@@ -76,3 +76,20 @@ button, direct operations, forge) and §8.1 (bottom bar, Checks tab).
 - Protocol boundary verification now checks rejection of 0.2 peers and suppression of 0.4
   forge events for supported 0.3 peers. All three daemon workspace tests pass; native
   shell/editor/app tests pass (77 total). Workspace and UI clippy pass with warnings denied.
+
+### Safety review follow-through
+
+- Reproduced two data-loss paths with real Git repositories before fixing them:
+  Commit staged unmerged index entries, and Update aborted an already pending merge whose
+  worktree was clean. Both regressions now preserve the user's index and merge state.
+- Merge confirmation carries the displayed PR number through the wire; a different current
+  PR is rejected with `RevisionConflict` before calling the forge.
+- Forge lookup verifies the head repository and branch, and prefers an open PR over newer
+  closed history. Ambiguous incomplete PR history is reported unavailable, never guessed.
+- Check and review-thread connections are paginated; check state retains GitHub's
+  authoritative rollup rather than inferring a pass from the first context page.
+- Rate-limit backoff is enforced before explicit refreshes and each poll candidate.
+- Exercised the production `GitHub::fetch` path against the real repository: PR #3, branch
+  `m2-workspaces`, six checks, aggregate Pending, zero unresolved threads, squash preferred.
+  The temporary driver was removed. The multi-page fixture also proves a late failing check
+  and unresolved thread are included before publication.

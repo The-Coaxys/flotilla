@@ -151,3 +151,44 @@ fn the_github_repository_comes_from_origin() {
         Some(("acme".into(), "widgets".into()))
     );
 }
+
+#[test]
+fn update_preserves_an_existing_clean_pending_merge() {
+    let (_dir, work, _) = cloned();
+    git(&work, &["switch", "-q", "-c", "other"]);
+    write(&work, "other.txt", "other\n");
+    commit_all(&work, "other");
+    git(&work, &["switch", "-q", "main"]);
+    git(
+        &work,
+        &["merge", "--no-commit", "--no-ff", "-s", "ours", "other"],
+    );
+    assert_eq!(git(&work, &["status", "--porcelain"]), "");
+    let pending = git(&work, &["rev-parse", "MERGE_HEAD"]);
+    assert!(matches!(
+        ops::update(&work, "main"),
+        Err(GitError::Refused(_))
+    ));
+    assert_eq!(git(&work, &["rev-parse", "MERGE_HEAD"]), pending);
+}
+
+#[test]
+fn commit_all_preserves_unresolved_index_entries() {
+    let (_dir, work, _) = cloned();
+    git(&work, &["switch", "-q", "-c", "other"]);
+    write(&work, "a.txt", "other side\n");
+    commit_all(&work, "other");
+    git(&work, &["switch", "-q", "main"]);
+    write(&work, "a.txt", "main side\n");
+    commit_all(&work, "main");
+    let merge = git_output(&work, &["merge", "--no-edit", "other"]);
+    assert!(!merge.status.success());
+    let head = git(&work, &["rev-parse", "HEAD"]);
+    let unmerged = git(&work, &["ls-files", "--unmerged"]);
+    assert!(matches!(
+        ops::commit(&work, "not resolved", true),
+        Err(GitError::Refused(_))
+    ));
+    assert_eq!(git(&work, &["ls-files", "--unmerged"]), unmerged);
+    assert_eq!(git(&work, &["rev-parse", "HEAD"]), head);
+}

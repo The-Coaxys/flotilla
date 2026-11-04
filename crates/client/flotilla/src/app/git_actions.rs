@@ -181,6 +181,7 @@ mod tests {
                 url: None,
             }],
             unresolved_threads: 0,
+            check_rollup: None,
         }
     }
 

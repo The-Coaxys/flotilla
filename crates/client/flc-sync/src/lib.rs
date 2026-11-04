@@ -493,10 +493,15 @@ impl Sync {
     pub async fn merge_pull_request(
         &self,
         worktree: WorktreeId,
+        number: u64,
         method: MergeMethod,
     ) -> Result<ForgeState, CallError> {
         match self
-            .call(Request::MergePullRequest { worktree, method })
+            .call(Request::MergePullRequest {
+                worktree,
+                number,
+                method,
+            })
             .await?
         {
             Response::ForgeState(state) => {

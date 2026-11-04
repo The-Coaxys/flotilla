@@ -249,6 +249,8 @@ pub enum Request {
     },
     MergePullRequest {
         worktree: WorktreeId,
+        /// The pull request displayed in the confirmation dialog.
+        number: u64,
         method: MergeMethod,
     },
 }
@@ -435,6 +437,9 @@ impl Request {
                 }
                 text("pull request title", title, MAX_TEXT_BYTES)?;
                 text("pull request body", body, validation::MAX_MESSAGE_BYTES)
+            }
+            Self::MergePullRequest { number, .. } if *number == 0 => {
+                Err(ValidationError::Invalid("zero pull request number"))
             }
             _ => Ok(()),
         }
