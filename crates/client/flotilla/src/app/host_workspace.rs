@@ -4,6 +4,8 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
+#[path = "host_review.rs"]
+mod review;
 
 use fl_model::forge::{CheckStatus, MergeMethod, Mergeable, PrState, ReviewDecision};
 use fl_model::workspace::{
@@ -43,6 +45,7 @@ enum Panel {
     Files,
     Changes,
     Checks,
+    Review,
 }
 
 enum DocumentKind {
@@ -61,6 +64,7 @@ struct Document {
     path: String,
     title: SharedString,
     kind: DocumentKind,
+    _review_events: Option<Subscription>,
 }
 
 /// Open documents of one scope; `active == None` shows the terminals.
@@ -136,6 +140,7 @@ pub struct HostWorkspace {
     script_tab: ScriptKind,
     script_views: HashMap<(WorktreeId, String), Entity<TerminalView>>,
     dialog: Option<Dialog>,
+    review: review::ReviewUi,
     banner: Option<SharedString>,
     rtt: Option<Duration>,
     /// A just-added project whose primary checkout opens once the daemon's
@@ -265,6 +270,7 @@ impl HostWorkspace {
             script_tab: ScriptKind::Setup,
             script_views: HashMap::new(),
             dialog: None,
+            review: review::ReviewUi::default(),
             banner: None,
             rtt: None,
             pending_select: None,
@@ -698,6 +704,7 @@ impl HostWorkspace {
     fn open_file(&mut self, path: String, cx: &mut Context<Self>) {
         if self.activate_existing(&path, false) {
             cx.notify();
+            self.reveal_review_line(cx);
             return;
         }
         let sync = self.sync.clone();
@@ -711,6 +718,7 @@ impl HostWorkspace {
                         return;
                     }
                     let editor = cx.new(|cx| EditorView::from_content(&content, cx));
+                    view.reveal_review_editor(&path, &editor, cx);
                     let saved_path = path.clone();
                     let events =
                         cx.subscribe(&editor, move |view, editor, event: &EditorEvent, cx| {
@@ -729,6 +737,7 @@ impl HostWorkspace {
                             sha256: content.sha256,
                             _events: events,
                         },
+                        _review_events: None,
                     });
                     documents.active = Some(documents.open.len() - 1);
                     cx.notify();
@@ -800,6 +809,15 @@ impl HostWorkspace {
             let _ = this.update(cx, |view, cx| match result {
                 Ok(diff) => {
                     let diff_view = cx.new(|cx| DiffView::new(&diff, DiffLayout::Unified, cx));
+                    let review_path = change.path.clone();
+                    let review_events = cx.subscribe(&diff_view, move |view, _, event: &flc_editor::diff_view::DiffEvent, cx| {
+                        let flc_editor::diff_view::DiffEvent::LinesSelected { lines, .. } = event;
+                        view.compose_review(fl_model::review::ReviewAnchor {
+                            worktree,
+                            path: review_path.clone(),
+                            lines: Some(fl_model::review::LineRange { start: lines.start as u32 + 1, end: lines.end as u32 + 1 }),
+                        }, None, cx);
+                    });
                     let documents = view.documents.entry(scope).or_default();
                     documents.open.push(Document {
                         path,
@@ -809,6 +827,7 @@ impl HostWorkspace {
                         )
                         .into(),
                         kind: DocumentKind::Diff(diff_view),
+                        _review_events: Some(review_events),
                     });
                     documents.active = Some(documents.open.len() - 1);
                     cx.notify();
@@ -1483,6 +1502,10 @@ impl HostWorkspace {
                 ),
             );
         }
+        strip = strip.child(
+            secondary_button("review-file", "Comment on file", t)
+                .on_click(cx.listener(|view, _, _, cx| view.review_active_file(cx))),
+        );
         Some(strip)
     }
 
@@ -1608,7 +1631,7 @@ impl HostWorkspace {
         let id = worktree.id;
         // A plain folder has no git changes to list.
         let folder = self.is_folder(worktree);
-        if folder {
+        if folder && self.panel != Panel::Review {
             self.panel = Panel::Files;
         }
         let changes = self
@@ -1665,13 +1688,15 @@ impl HostWorkspace {
                     self.panel == Panel::Checks,
                     cx,
                 ))
-            });
+            })
+            .child(segment("Review".into(), Panel::Review, self.panel == Panel::Review, cx));
         let body: AnyElement = match self.panel {
             Panel::Files => self
                 .render_file_tree(&worktree.path, &t, cx)
                 .into_any_element(),
             Panel::Changes => self.render_changes(id, &changes, &t, cx).into_any_element(),
             Panel::Checks => self.render_checks(id, &t, cx).into_any_element(),
+            Panel::Review => self.render_reviews(id, &t, cx).into_any_element(),
         };
         let scripts = self.render_scripts(id, &t, window, cx);
         div()

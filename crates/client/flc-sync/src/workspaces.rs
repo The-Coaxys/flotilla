@@ -27,6 +27,8 @@ pub struct WorkspacesState {
     /// Forge state of worktrees the daemon has reported (pushed when it
     /// changes; request [`crate::Sync::forge_status`] for a fresh one).
     pub forges: HashMap<WorktreeId, ForgeState>,
+    /// Revisioned app-managed review state, retained offline.
+    pub reviews: HashMap<WorktreeId, fl_model::review::ReviewState>,
     /// Connected and following daemon events.
     pub live: bool,
 }
@@ -120,6 +122,12 @@ async fn follow(
             Ok(DaemonEvent::ForgeChanged(forge)) => update(state, |s| {
                 s.forges.insert(forge.worktree, forge);
             }),
+            Ok(DaemonEvent::ReviewChanged { worktree, rev }) => {
+                let known = state.borrow().reviews.get(&worktree).map(|s| s.rev);
+                if known.is_none_or(|known| known < rev) {
+                    crate::review::fetch(link, state, worktree).await;
+                }
+            }
             Ok(DaemonEvent::LayoutChanged { scope, .. }) => {
                 if let Some(commands) = layouts
                     .lock()
@@ -151,6 +159,7 @@ async fn resync(link: &ControlLink, state: &watch::Sender<Arc<WorkspacesState>>)
     };
     let ids: Vec<WorktreeId> = tree.worktrees.iter().map(|w| w.id).collect();
     let (statuses, scripts) = fetch_details(link, &ids).await;
+    crate::review::fetch_all(link, state, &ids).await;
     update(state, |s| {
         s.tree = Some(tree);
         s.statuses = statuses;
@@ -174,6 +183,7 @@ async fn refetch_tree(link: &ControlLink, state: &watch::Sender<Arc<WorkspacesSt
         .filter(|id| !known.contains(id))
         .collect();
     let (statuses, scripts) = fetch_details(link, &fresh).await;
+    crate::review::fetch_all(link, state, &fresh).await;
     update(state, |s| {
         // Never let a slow reply replace a newer tree.
         if s.tree
@@ -186,6 +196,7 @@ async fn refetch_tree(link: &ControlLink, state: &watch::Sender<Arc<WorkspacesSt
         s.statuses.retain(|id, _| live.contains(id));
         s.scripts.retain(|id, _| live.contains(id));
         s.forges.retain(|id, _| live.contains(id));
+        s.reviews.retain(|id, _| live.contains(id));
         s.statuses.extend(statuses);
         s.scripts.extend(scripts);
         s.tree = Some(tree);
