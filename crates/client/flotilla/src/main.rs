@@ -5,9 +5,12 @@ mod app;
 mod connect;
 mod embedded;
 mod hosts;
+mod notify;
 mod runtime;
 mod secrets;
 mod selftest;
+mod settings;
+mod updater;
 
 use std::path::PathBuf;
 
@@ -18,6 +21,12 @@ fn main() {
         std::process::exit(selftest::run(&path));
     }
     init_logging();
+    notify::init_app_id();
+    // A replacement may have been interrupted by a crash or a failed
+    // self-check: confirm the new build or put the previous one back and run it.
+    if updater::startup_recovery() {
+        return;
+    }
     let rt = runtime::start();
     app::run(rt.handle().clone());
 }

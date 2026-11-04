@@ -36,7 +36,7 @@ use std::{
     time::Duration,
 };
 
-const SCHEMA_VERSION: u32 = 9;
+const SCHEMA_VERSION: u32 = 10;
 const MAX_LAYOUT_BYTES: usize = 128 * 1024;
 const MAX_ENTRY_BYTES: usize = 512 * 1024;
 const MAX_TEXT_BYTES: usize = 4096;
@@ -566,6 +566,14 @@ fn migrate(connection: &mut Connection, root: &File, path: &Path, existed: bool)
             transaction.execute_batch(coordination::SCHEMA_V9)?;
             transaction.execute_batch(team::SCHEMA_V9)?;
         }
+        if version < 10 {
+            transaction.execute_batch(group::SCHEMA_V10)?;
+            transaction.execute_batch(commands::SCHEMA_V10)?;
+            transaction.execute(
+                "INSERT INTO commands(singleton,state) VALUES(1,?1)",
+                [commands::initial_commands()?],
+            )?;
+        }
         transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     }
     // Never initialize over a missing/corrupt default or partially valid rows.
@@ -585,6 +593,8 @@ fn migrate(connection: &mut Connection, root: &File, path: &Path, existed: bool)
     chat::validate_chat_integrity(&transaction)?;
     coordination::validate_integrity(&transaction)?;
     team::validate_integrity(&transaction)?;
+    group::validate_integrity(&transaction)?;
+    commands::validate_integrity(&transaction)?;
     transaction.commit()?;
     Ok(())
 }
@@ -1339,6 +1349,12 @@ pub mod coordination;
 
 #[path = "team.rs"]
 pub mod team;
+
+#[path = "group.rs"]
+mod group;
+
+#[path = "commands.rs"]
+mod commands;
 
 #[cfg(test)]
 #[path = "database_tests.rs"]

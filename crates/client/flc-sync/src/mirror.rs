@@ -118,11 +118,24 @@ pub enum MirrorEvent {
 }
 
 enum Command {
-    Input { view: ViewId, bytes: Vec<u8> },
-    Resize { view: ViewId, size: Size },
-    Claim { view: ViewId },
-    Visible { view: ViewId, visible: bool },
+    Input {
+        view: ViewId,
+        bytes: Vec<u8>,
+    },
+    Resize {
+        view: ViewId,
+        size: Size,
+    },
+    Claim {
+        view: ViewId,
+    },
+    Visible {
+        view: ViewId,
+        visible: bool,
+    },
     Scroll(i32),
+    /// Write the mirror cache now and acknowledge completion.
+    FlushCache(oneshot::Sender<()>),
 }
 
 struct Published {
@@ -184,6 +197,14 @@ impl MirrorHandle {
 
     fn command(&self, command: Command) {
         let _ = self.attachment.commands.send(command);
+    }
+
+    /// Persist the mirror cache now and wait for it, instead of waiting out
+    /// the debounce. Resolves immediately when this client has no cache.
+    pub async fn flush_cache(&self) {
+        let (done, wait) = oneshot::channel();
+        self.command(Command::FlushCache(done));
+        let _ = wait.await;
     }
 
     pub fn terminal(&self) -> TerminalId {
@@ -649,6 +670,11 @@ impl Actor {
                     self.frame_dirty = true;
                 }
             }
+            Command::FlushCache(done) => {
+                // `last` bypasses the debounce and waits for the write.
+                self.save_cache(true).await;
+                let _ = done.send(());
+            }
         }
     }
 
@@ -940,6 +966,9 @@ impl Actor {
                     engine.feed(offset, slice).map_err(engine_error)?;
                     offset += slice.len() as u64;
                 }
+                self.core
+                    .terminal_output_bytes
+                    .fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
             }
             TerminalRecordKind::Resize(size) => {
                 let mut engine = lock(&self.shared.engine);

@@ -10,6 +10,8 @@ mod host_hover;
 mod host_launcher;
 #[path = "host_workspace/host_palette.rs"]
 mod host_palette;
+#[path = "host_workspace/host_settings.rs"]
+mod host_settings;
 #[path = "host_review.rs"]
 mod review;
 
@@ -37,6 +39,10 @@ use gpui::{
 use super::git_actions::{self, GitAction};
 use super::host_view::{primary_button, secondary_button};
 
+#[path = "host_commands.rs"]
+mod commands_ui;
+#[path = "host_group_diff.rs"]
+mod group_diff;
 #[path = "host_chat.rs"]
 mod host_chat;
 #[path = "host_routes.rs"]
@@ -51,6 +57,19 @@ const READ_LIMIT: u32 = 8 * 1024 * 1024;
 pub enum HostWorkspaceEvent {
     /// A terminal asked (OSC 52) to set the clipboard; consent is the app's.
     ClipboardStore(String),
+    /// The palette asked for the settings overlay (app-level entity).
+    OpenSettings,
+    /// The palette asked to toggle the performance HUD.
+    ToggleHud,
+    /// A new in-app toast; the app decides whether it also deserves a
+    /// desktop notification under the per-class policy.
+    Notify {
+        class: flc_ui::notify::EventClass,
+        title: String,
+        session: uuid::Uuid,
+    },
+    /// The user pinned the current surface; the app opens the PiP window.
+    PinRequest,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -157,6 +176,8 @@ pub struct HostWorkspace {
     review: review::ReviewUi,
     sections_ui: sections::SectionsUi,
     routes_ui: routes::RoutesUi,
+    commands_ui: commands_ui::CommandsUi,
+    group_diff_ui: group_diff::GroupDiffUi,
     chat: host_chat::ChatUi,
     banner: Option<SharedString>,
     rtt: Option<Duration>,
@@ -172,6 +193,17 @@ pub struct HostWorkspace {
     palette: Option<host_palette::Ui>,
     /// A palette requested by an app-level keybinding; opened on next render.
     pending_palette: Option<crate::app::palette::Mode>,
+    /// Theme, fonts, terminal palettes and the keymap, shared with the app.
+    settings: Entity<crate::app::settings::Settings>,
+    /// Settings and keymap are kept live in step with the settings entity.
+    _settings: Subscription,
+    /// A settings overlay requested by the app-level keybinding.
+    pending_settings: bool,
+    /// The open settings overlay, if any.
+    settings_ui: Option<host_settings::Ui>,
+    /// Catches the chord a pending rebind is waiting for, ahead of the
+    /// terminal's own input interceptor.
+    _capture: Subscription,
     /// The hover card on screen, and the epoch that cancels pending ones.
     hover: Option<host_hover::Shown>,
     hover_pending: Option<host_hover::Target>,
@@ -245,7 +277,12 @@ fn join(dir: &str, name: &str) -> String {
 }
 
 impl HostWorkspace {
-    pub fn new(sync: Arc<Sync>, home_dir: String, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        sync: Arc<Sync>,
+        home_dir: String,
+        settings: Entity<crate::app::settings::Settings>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         // Process listings (for attaching script terminals) live in the home
         // layout's state.
         let mut processes = sync.workspace_changes();
@@ -295,6 +332,37 @@ impl HostWorkspace {
             }
         });
         let chat = host_chat::ChatUi::new(sync.chats());
+        let settings_watch = cx.observe(&settings, |view, _settings, cx| {
+            view.apply_presentation(cx);
+            cx.notify();
+        });
+        let capture_host = cx.weak_entity();
+        let capture = cx.intercept_keystrokes(move |event, _window, cx| {
+            let active = capture_host
+                .update(cx, |view, _| view.capturing())
+                .unwrap_or(false);
+            if !active {
+                return;
+            }
+            let key = event.keystroke.key.clone();
+            if matches!(key.as_str(), "shift" | "control" | "alt" | "platform") {
+                return;
+            }
+            let modifiers = event.keystroke.modifiers;
+            capture_host
+                .update(cx, |view, cx| {
+                    view.capture_chord(
+                        &key,
+                        modifiers.control,
+                        modifiers.shift,
+                        modifiers.alt,
+                        modifiers.platform,
+                        cx,
+                    );
+                })
+                .ok();
+            cx.stop_propagation();
+        });
         Self {
             state: sync.workspaces(),
             sync,
@@ -313,6 +381,8 @@ impl HostWorkspace {
             review: review::ReviewUi::default(),
             sections_ui: sections::SectionsUi::default(),
             routes_ui: routes::RoutesUi::default(),
+            commands_ui: commands_ui::CommandsUi::default(),
+            group_diff_ui: group_diff::GroupDiffUi::default(),
             chat,
             banner: None,
             rtt: None,
@@ -322,6 +392,11 @@ impl HostWorkspace {
             git_menu: false,
             palette: None,
             pending_palette: None,
+            settings,
+            _settings: settings_watch,
+            pending_settings: false,
+            settings_ui: None,
+            _capture: capture,
             hover: None,
             hover_pending: None,
             hover_epoch: 0,
@@ -364,6 +439,24 @@ impl HostWorkspace {
         }
     }
 
+    pub(crate) fn update_busy(&self, cx: &gpui::App) -> bool {
+        self.chat_update_busy()
+            || self.shells.values().any(|(shell, _)| {
+                let shell = shell.read(cx);
+                shell.model().pending() > 0
+                    || shell
+                        .live_terminals()
+                        .iter()
+                        .any(|(_, status)| matches!(status, flc_sync::MirrorStatus::Syncing))
+            })
+            || self.documents.values().any(|documents| {
+                documents.open.iter().any(|document| match &document.kind {
+                    DocumentKind::File { editor, .. } => editor.read(cx).is_dirty(),
+                    DocumentKind::Diff(_) => false,
+                })
+            })
+    }
+
     fn is_folder(&self, worktree: &Worktree) -> bool {
         self.state.tree.as_ref().is_some_and(|tree| {
             tree.projects
@@ -395,6 +488,191 @@ impl HostWorkspace {
                 }
             }
         }
+        cx.notify();
+    }
+
+    // ---- picture-in-picture, shortcuts and notifications -----------------
+
+    pub(crate) fn scope(&self) -> LayoutScope {
+        self.scope
+    }
+
+    fn surface_scope_label(&self) -> String {
+        match self.scope {
+            LayoutScope::Home => "Home".to_string(),
+            LayoutScope::Worktree(id) => self
+                .state
+                .worktree(id)
+                .map(|worktree| worktree.label.clone())
+                .unwrap_or_else(|| "Worktree".to_string()),
+        }
+    }
+
+    /// The surface the Pin control would put in the PiP window right now.
+    /// `None` when there is no terminal, chat, run or review surface showing.
+    pub(crate) fn pin_surface(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<super::pip::PipContent> {
+        use super::pip::{PipContent, PipKind};
+        let scope = self.scope;
+        let scope_label = self.surface_scope_label();
+        if let Some((session, state)) = self.chat.pip_chat() {
+            let title = state.session(session)?.label.clone();
+            let provider = state.session(session)?.provider.clone();
+            return Some(PipContent::Chat {
+                title,
+                subtitle: format!("{scope_label} · {provider}"),
+                session,
+                state,
+                changes: self.sync.chats_changes(),
+            });
+        }
+        if self.panel_open
+            && self.panel == Panel::Review
+            && let LayoutScope::Worktree(id) = scope
+        {
+            let title = self
+                .state
+                .forges
+                .get(&id)
+                .and_then(|forge| forge.pr.as_ref())
+                .map(|pr| format!("#{} {}", pr.number, pr.title))
+                .unwrap_or_else(|| "Review".to_string());
+            let lines = super::pip::review_lines(
+                self.state.forges.get(&id),
+                self.state.reviews.get(&id),
+                64,
+            );
+            return Some(PipContent::Review {
+                title,
+                subtitle: scope_label,
+                lines,
+            });
+        }
+        if self.panel_open
+            && let LayoutScope::Worktree(id) = scope
+            && matches!(self.script_tab, ScriptKind::Run(_))
+        {
+            let kind = self.script_tab.clone();
+            if let Some(state) = self.script_state(id, &kind).cloned()
+                && let Some(view) = self.script_view(id, &state, window, cx)
+            {
+                let source = view.read(cx).source().clone();
+                let title = script_label(&kind).to_string();
+                return Some(PipContent::Terminal {
+                    kind: PipKind::Run,
+                    title,
+                    subtitle: scope_label,
+                    source,
+                    options: self.script_options(cx),
+                });
+            }
+        }
+        let has_terminal = self
+            .sync
+            .layout(scope)
+            .workspace()
+            .layout
+            .as_ref()
+            .is_some_and(|layout| {
+                layout
+                    .views
+                    .iter()
+                    .any(|view| view.tabs.iter().any(|tab| !tab.panes.is_empty()))
+            });
+        if !has_terminal {
+            return None;
+        }
+        let shell = self.shell(window, cx);
+        let (title, source) = shell.read(cx).pip_surface()?;
+        let options = self.shell_options(cx);
+        Some(PipContent::Terminal {
+            kind: PipKind::Terminal,
+            title,
+            subtitle: scope_label,
+            source,
+            options: TerminalViewOptions {
+                echo_policy: options.echo_policy,
+                font_family: options.font_family,
+                font_size: options.font_size,
+                palette: options.palette,
+                ..Default::default()
+            },
+        })
+    }
+
+    /// Run the adaptive Git action from the keyboard. `alternate` selects the
+    /// route's alternate dispatch mode, exactly like Ctrl+click on the button.
+    pub(crate) fn run_primary_git(
+        &mut self,
+        alternate: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(worktree) = self.selected_worktree().cloned() else {
+            self.show_error("Select a worktree before running a Git action", cx);
+            return;
+        };
+        if self.git_busy.is_some() || self.dispatch_pending(worktree.id) {
+            return;
+        }
+        let Some(context) = self.git_context(&worktree) else {
+            self.show_error("Git status is not available yet", cx);
+            return;
+        };
+        let action = git_actions::primary(context);
+        if action.actionable() {
+            self.run_git_action(action, alternate, window, cx);
+        }
+    }
+
+    /// Open the inbox (Ctrl+Shift+I).
+    pub(crate) fn open_inbox(&mut self, cx: &mut Context<Self>) {
+        self.open_chat_inbox(cx);
+    }
+
+    /// Focus the current scope's terminal and open the scrollback find bar.
+    pub(crate) fn find_scrollback(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let shell = self.shell(window, cx);
+        shell.update(cx, |shell, cx| shell.open_find(window, cx));
+        shell.read(cx).focus_handle().focus(window);
+    }
+
+    /// Start or stop the selected worktree's current run target.
+    pub(crate) fn run_target(&mut self, cx: &mut Context<Self>) {
+        let Some(worktree) = self.selected_worktree().cloned() else {
+            self.show_error("Select a worktree before running a target", cx);
+            return;
+        };
+        let kind = match &self.script_tab {
+            kind @ ScriptKind::Run(_) => kind.clone(),
+            _ => ScriptKind::Run(None),
+        };
+        let running = self
+            .script_state(worktree.id, &kind)
+            .is_some_and(|state| state.state == ScriptRunState::Running);
+        self.run_script(worktree.id, kind, running, cx);
+        cx.notify();
+    }
+
+    /// Ctrl+Tab / Ctrl+Shift+Tab while focus is outside the shell.
+    pub(crate) fn cycle_tab(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let scope = self.scope;
+        if let Some((shell, _)) = self.shells.get(&scope) {
+            shell.update(cx, |shell, cx| shell.cycle_tab(forward, cx));
+        }
+    }
+
+    /// Open a conversation from a desktop notification: select its worktree
+    /// and queue the tab for the next render, where a window is available.
+    pub(crate) fn activate_session(&mut self, session: uuid::Uuid, cx: &mut Context<Self>) {
+        let Some(worktree) = self.chat.worktree_of(session) else {
+            return;
+        };
+        self.select(LayoutScope::Worktree(worktree), cx);
+        self.chat.pending_chat(session);
         cx.notify();
     }
 
@@ -727,8 +1005,8 @@ impl HostWorkspace {
         }
         let sync = self.sync.clone();
         let layout = sync.layout(scope);
-        let shell =
-            cx.new(|cx| ShellView::new(sync, layout, ShellViewOptions::default(), window, cx));
+        let options = self.shell_options(cx);
+        let shell = cx.new(|cx| ShellView::new(sync, layout, options, window, cx));
         let rtt = self.rtt;
         shell.update(cx, |shell, _| shell.set_rtt(rtt));
         let events = cx.subscribe(&shell, |_, _, event: &ShellEvent, cx| match event {
@@ -1024,8 +1302,7 @@ impl HostWorkspace {
         };
         let handle = self.sync.attach(terminal, incarnation, ViewId::new());
         let source = MirrorSource::new(handle);
-        let view =
-            cx.new(|cx| TerminalView::new(source, TerminalViewOptions::default(), window, cx));
+        let view = cx.new(|cx| TerminalView::new(source, self.script_options(cx), window, cx));
         self.script_views.insert(key, view.clone());
         Some(view)
     }
@@ -1306,11 +1583,17 @@ impl HostWorkspace {
     }
 
     fn close_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.sections_ui.busy || self.routes_ui.busy {
+        if self.sections_ui.busy
+            || self.routes_ui.busy
+            || self.commands_ui.busy
+            || self.group_diff_ui.busy
+        {
             return;
         }
         self.sections_ui.close();
         self.routes_ui.close();
+        self.commands_ui.close();
+        self.group_diff_ui.close();
         self.dialog = None;
         window.focus(&self.focus);
         cx.notify();
@@ -1718,6 +2001,19 @@ impl HostWorkspace {
             })
             .child(div().flex_1())
             .children(git_button)
+            .child(
+                div()
+                    .id("pin-surface")
+                    .px(px(8.))
+                    .rounded(t.radius_sm)
+                    .cursor_pointer()
+                    .hover(move |s| s.bg(hover))
+                    .child("Pin surface")
+                    .on_click(cx.listener(|_view, _, _, cx| {
+                        cx.emit(HostWorkspaceEvent::PinRequest);
+                        cx.notify();
+                    })),
+            )
             .when(worktree.is_some(), |d| {
                 d.child(
                     div()
@@ -2344,6 +2640,12 @@ impl HostWorkspace {
         if let Some(dialog) = self.render_routes_dialog(t, cx) {
             return Some(dialog);
         }
+        if let Some(dialog) = self.render_commands_dialog(t, cx) {
+            return Some(dialog);
+        }
+        if let Some(dialog) = self.render_group_diff_dialog(t, cx) {
+            return Some(dialog);
+        }
         let dialog = self.dialog.as_ref()?;
         let card = div()
             .w(px(520.))
@@ -2700,6 +3002,9 @@ impl Render for HostWorkspace {
         if let Some(mode) = self.pending_palette.take() {
             self.open_palette(mode, window, cx);
         }
+        if std::mem::take(&mut self.pending_settings) {
+            self.open_settings(window, cx);
+        }
         let strip = self
             .render_documents_strip(&t, cx)
             .map(IntoElement::into_any_element);
@@ -2735,6 +3040,11 @@ impl Render for HostWorkspace {
         let dispatches = self.render_dispatch_strip(&t, cx);
         div()
             .track_focus(&self.focus)
+            .on_key_down(cx.listener(|host, event: &gpui::KeyDownEvent, window, cx| {
+                if host.settings_key(event, window, cx) {
+                    cx.stop_propagation();
+                }
+            }))
             .relative()
             .size_full()
             .flex()
@@ -2771,5 +3081,6 @@ impl Render for HostWorkspace {
             .children(toasts)
             .children(dialog)
             .children(self.render_palette(&t, cx))
+            .children(self.render_settings(&t, window, cx))
     }
 }

@@ -497,6 +497,7 @@ fn delete_worktrees(connection: &Connection, ids: &[WorktreeId]) -> Result<Vec<T
         .map(|entry| entry.spec.terminal)
         .collect();
     super::sections::prune_memberships(connection, ids)?;
+    super::group::prune_groups(connection, ids)?;
     for id in ids {
         let id = id.as_bytes().as_slice();
         connection.execute("DELETE FROM scripts WHERE worktree=?1", [id])?;

@@ -5,6 +5,7 @@
 //! are serialized and each one publishes `WorkspaceTreeChanged`.
 mod coordination;
 mod forge;
+mod group;
 mod review;
 mod routing;
 mod scripts;
@@ -422,6 +423,16 @@ impl WorkspaceService {
         base: Option<String>,
     ) -> Result<Worktree, RpcError> {
         let _structure = self.structure.lock().await;
+        self.create_worktree_locked(project, branch, base).await
+    }
+
+    /// Create a worktree while the caller already holds the structure lock.
+    async fn create_worktree_locked(
+        self: &Arc<Self>,
+        project: ProjectId,
+        branch: Option<String>,
+        base: Option<String>,
+    ) -> Result<Worktree, RpcError> {
         let tree = self.tree().await?;
         let project = tree
             .projects

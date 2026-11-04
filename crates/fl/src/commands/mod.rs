@@ -2,6 +2,7 @@
 mod agent;
 mod chat;
 mod coordination;
+mod custom;
 mod hook;
 mod instructions;
 mod layout;
@@ -55,6 +56,10 @@ pub async fn run(cli: &Cli) -> Result<(), CliError> {
             coordination::run(&mut client, &reporter, cli, command).await
         }
         Command::Team { command } => team::run(&mut client, &reporter, cli, command).await,
+        Command::Commands { command } => custom::run(&mut client, &reporter, cli, command).await,
+        Command::PromptTemplate { command } => {
+            custom::run_template(&mut client, &reporter, cli, command).await
+        }
         Command::Hook {
             event,
             session,

@@ -12,9 +12,11 @@ the client never ends a running agent or its shell.
 | M0 | SSH + QUIC transports, bootstrap/upgrade, host registry, frameless client shell, nightly Windows release | released |
 | M1 | Durable PTYs, exact terminal checkpoints, reconnecting sync, native terminal surface, tabs/panes/views, predictive echo | released (v0.2.0) |
 | M2 | Projects and worktrees, live git status, file tree and editor, Changes diff view, setup/run scripts | released (v0.3.0) |
-| M3 | GitHub integration, adaptive Git actions, sections, app-managed review threads, routed actions | in progress |
-| M4 | Chat service, Claude and Codex adapters, chat surface, approvals, inbox | in progress |
-| M5–M7 | More adapters, orchestration and `fl`, polish | planned |
+| M3 | GitHub integration, adaptive Git actions, sections, app-managed review threads, routed actions | implemented; v0.4.0 release verification pending |
+| M4 | Chat service, Claude and Codex adapters, chat surface, approvals, inbox | implemented; v0.4.0 release verification pending |
+| M5 | More adapters, chat↔terminal switching, provider profiles | implemented; v0.4.0 release verification pending |
+| M6 | Orchestration, coordination state, hooks and `fl` CLI | implemented; v0.4.0 release verification pending |
+| M7 | Palette, themes, keymap, signed updates, browser, PiP and diagnostics | in progress |
 
 M1 known limits are recorded at the end of
 [`docs/superpowers/plans/2026-11-02-flotilla-m1-terminals.md`](docs/superpowers/plans/2026-11-02-flotilla-m1-terminals.md):
@@ -26,7 +28,7 @@ immediately instead).
 ## Install
 
 Windows: run `Flotilla-Setup-x64.exe` from the
-[v0.2.0 release](https://github.com/The-Coaxys/flotilla/releases/tag/v0.2.0).
+[v0.3.0 release](https://github.com/The-Coaxys/flotilla/releases/tag/v0.3.0).
 The installer is per-user, needs no administrator rights, and the executable
 is statically linked against the C runtime, so no redistributable is required.
 
@@ -47,6 +49,16 @@ writes a user unit running `flotillad serve`, which listens on a Unix socket
 for the SSH transport and on UDP 7443 for QUIC. The client races QUIC and SSH
 and keeps whichever connects first; on an SSH link it re-probes QUIC every
 30 seconds and moves over when UDP gets through.
+
+## M7 diagnostics
+
+`Ctrl+Alt+Shift+P` toggles the performance HUD (also rebindable in Settings).
+It shows CPU-side render cadence and frame interval, selected-host transport
+and RTT, terminal output applied across all connected hosts in KiB/s, and
+process resident memory. Terminal output excludes snapshots, duplicate records
+and compression overhead; this is not a wire-bandwidth meter. Memory queries
+run off the UI thread. Sampling and continuous diagnostic redraws stop when
+the HUD closes. CPU cadence is not GPU execution time.
 
 ## What M4 delivers
 

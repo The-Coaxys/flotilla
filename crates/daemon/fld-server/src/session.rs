@@ -622,6 +622,37 @@ async fn handle_request(
             let sequence = chat.ingest_hook(session, hook).await?;
             Ok(Response::HookRecorded { session, sequence })
         }
+        // --- M7 slice: Shared Context, custom commands and prompt templates ---
+        Request::ListCommands => workspace.command_state().await.map(Response::CommandState),
+        Request::MutateCommand {
+            expected_rev,
+            mutation,
+        } => workspace
+            .mutate_commands(expected_rev, mutation)
+            .await
+            .map(Response::CommandState),
+        Request::DispatchCommand {
+            worktree,
+            name,
+            mode,
+            alternate,
+            context,
+        } => workspace
+            .dispatch_command(worktree, name, mode, alternate, context)
+            .await
+            .map(Response::TaskDispatch),
+        Request::EnsureWorktreeChild { worktree } => workspace
+            .ensure_child(worktree)
+            .await
+            .map(Response::WorktreeChild),
+        Request::GetWorktreeGroup { worktree } => workspace
+            .worktree_group(worktree)
+            .await
+            .map(Response::WorktreeGroup),
+        Request::WorktreeGroupDiff { worktree } => workspace
+            .group_diff(worktree)
+            .await
+            .map(Response::GroupDiff),
     }
 }
 

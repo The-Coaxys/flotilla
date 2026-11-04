@@ -9,7 +9,8 @@ use fl_model::layout::LayoutOp;
 use fl_model::workspace::{
     EntryKind, LayoutScope, ProjectKind, ScriptKind, ScriptRunState, Worktree,
 };
-use fl_model::{PaneId, Size, TabId, TerminalId};
+use fl_model::{PaneId, Size, TabId, TerminalId, WorkspaceId};
+use flc_sync::WorkspacesState;
 use flc_ui::input::{TextInput, TextInputEvent};
 use flc_ui::theme::Theme;
 use gpui::prelude::*;
@@ -18,7 +19,7 @@ use gpui::{
     Subscription, WeakEntity, Window, div, px,
 };
 
-use super::{DocumentKind, HostWorkspace, Panel, join};
+use super::{DocumentKind, HostWorkspace, HostWorkspaceEvent, Panel, join};
 use crate::app::git_actions;
 use crate::app::palette::{
     self, Action, Listing, MAX_VISIBLE, MODES, Mode, Panel as PalettePanel, Source,
@@ -45,6 +46,9 @@ impl HostWorkspace {
     }
 
     pub(super) fn open_palette(&mut self, mode: Mode, window: &mut Window, cx: &mut Context<Self>) {
+        // A stale "nothing matches" banner from the previous search must not
+        // outlive the search that caused it.
+        self.banner = None;
         let input = cx.new(|cx| TextInput::new(cx, mode.placeholder()));
         let events = cx.subscribe_in(
             &input,
@@ -218,6 +222,19 @@ impl HostWorkspace {
         }
     }
 
+    /// The workspace the selected scope belongs to.
+    fn selected_workspace(&self) -> Option<fl_model::WorkspaceId> {
+        let tree = self.state.tree.as_ref()?;
+        match self.selected_worktree() {
+            Some(worktree) => tree
+                .projects
+                .iter()
+                .find(|project| project.id == worktree.project)
+                .map(|project| project.workspace),
+            None => tree.workspaces.first().map(|workspace| workspace.id),
+        }
+    }
+
     fn push_commands(&self, out: &mut Listing) {
         out.push(
             "Add project",
@@ -247,6 +264,58 @@ impl HostWorkspace {
             Source::Command,
             Action::TogglePanel,
         );
+        out.push(
+            "Commands and prompt templates",
+            "Edit scoped commands and routed action prompts",
+            Source::Command,
+            Action::OpenCommands,
+        );
+        out.push(
+            "Branch group diff",
+            "Shared context and per-child changes",
+            Source::Command,
+            Action::OpenGroupDiff,
+        );
+        out.push(
+            "Settings and theme",
+            "Theme, keyboard and notification policy",
+            Source::Command,
+            Action::OpenSettings,
+        );
+        out.push(
+            "Toggle performance HUD",
+            "Frame time, RTT, transport, throughput",
+            Source::Command,
+            Action::ToggleHud,
+        );
+        out.push(
+            "Inbox",
+            "Approvals, questions and finished runs",
+            Source::Command,
+            Action::OpenInbox,
+        );
+        if let Some(workspace) = self.selected_workspace() {
+            out.push(
+                "Sections",
+                "Organize worktrees into manual and filter sections",
+                Source::Command,
+                Action::OpenSections(workspace),
+            );
+            out.push(
+                "Routes",
+                "Providers, profiles and dispatch modes per action",
+                Source::Command,
+                Action::OpenRoutes(workspace),
+            );
+        }
+        if self.selected_worktree().is_some() {
+            out.push(
+                "New chat",
+                "Start a provider conversation in this worktree",
+                Source::Command,
+                Action::NewChat,
+            );
+        }
         for (panel, title, detail) in [
             (
                 PalettePanel::Files,
@@ -514,15 +583,50 @@ impl HostWorkspace {
             Action::CloseTab { view, tab } => {
                 self.apply_layout(LayoutOp::CloseTab { view, tab }, cx)
             }
+            Action::OpenSettings => cx.emit(HostWorkspaceEvent::OpenSettings),
+            Action::ToggleHud => cx.emit(HostWorkspaceEvent::ToggleHud),
+            Action::OpenInbox => self.open_inbox_panel(cx),
+            Action::NewChat => self.open_chat_setup_public(window, cx),
+            Action::OpenSections(workspace) => self.open_sections_editor(workspace, cx),
+            Action::OpenRoutes(workspace) => self.open_routes(workspace, cx),
             Action::RunScript { worktree, kind } => {
                 self.select(LayoutScope::Worktree(worktree), cx);
                 self.run_script(worktree, kind, false, cx);
             }
+            Action::OpenCommands => {
+                let workspace = self
+                    .selected_worktree()
+                    .and_then(|worktree| {
+                        self.state.tree.as_ref().and_then(|tree| {
+                            tree.projects
+                                .iter()
+                                .find(|project| project.id == worktree.project)
+                                .map(|project| project.workspace)
+                        })
+                    })
+                    .or_else(|| Self::tree_workspace(&self.state));
+                match workspace {
+                    Some(workspace) => self.open_commands(workspace, cx),
+                    None => self.show_error("No workspace is loaded yet.", cx),
+                }
+            }
+            Action::OpenGroupDiff => match self.selected_worktree().map(|worktree| worktree.id) {
+                Some(worktree) => self.open_group_diff(worktree, cx),
+                None => self.show_error("Select a worktree to show its branch group diff.", cx),
+            },
             Action::Git { worktree, action } => {
                 self.select(LayoutScope::Worktree(worktree), cx);
                 self.run_git_action(action, false, window, cx);
             }
         }
+    }
+
+    fn tree_workspace(state: &WorkspacesState) -> Option<WorkspaceId> {
+        state
+            .tree
+            .as_ref()
+            .and_then(|tree| tree.workspaces.iter().min_by_key(|w| w.order))
+            .map(|workspace| workspace.id)
     }
 
     /// Add a terminal tab through the layout model (the same operation the
