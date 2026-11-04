@@ -133,6 +133,20 @@ impl Settings {
         self.apply_theme(cx);
     }
 
+    /// The desktop notification policy (spec §8.4).
+    pub fn notifications(&self) -> &flc_ui::notify::NotificationSettings {
+        &self.client.notifications
+    }
+
+    pub fn edit_notifications(
+        &mut self,
+        f: impl FnOnce(&mut flc_ui::notify::NotificationSettings),
+        cx: &mut Context<Self>,
+    ) {
+        f(&mut self.client.notifications);
+        cx.notify();
+    }
+
     pub fn edit_terminal(
         &mut self,
         f: impl FnOnce(&mut crate::settings::TerminalPaletteSettings),
@@ -316,15 +330,6 @@ impl super::Workspace {
         };
         host.update(cx, |host, cx| host.request_settings(cx));
     }
-
-    /// Ctrl+Shift+P is reserved by spec §8.3 for PiP, which is not in this
-    /// build; say so instead of letting the chord do nothing.
-    pub(super) fn pip_reserved(&mut self, cx: &mut Context<Self>) {
-        self.banner = Some(SharedString::from(
-            "Picture-in-picture is reserved for Ctrl+Shift+P (spec §8.3); the PiP window lands in its own slice.",
-        ));
-        cx.notify();
-    }
 }
 
 #[cfg(test)]
@@ -349,13 +354,13 @@ mod tests {
     }
 
     #[test]
-    fn the_pip_chord_is_reserved_and_free_for_pip() {
+    fn the_pip_chord_is_reserved_for_pip_alone() {
         let keymap = Keymap::defaults();
         let action = keymap::ACTIONS
             .iter()
             .find(|action| action.id == "pip.toggle")
             .unwrap();
-        assert_eq!(action.group, Group::Reserved);
+        assert_eq!(action.group, Group::Navigation);
         // The palette no longer answers it.
         assert_eq!(
             keymap.chord("palette.global").unwrap().canonical(),

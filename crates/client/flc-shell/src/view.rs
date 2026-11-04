@@ -13,18 +13,20 @@ use fl_model::{IncarnationId, PaneId, Size, SplitId, TabId, TerminalId, ViewId};
 use flc_sync::{
     ClipboardTarget, LayoutHandle, MirrorEvent, MirrorStatus, Sync, SyncEvent, TerminalNotice,
 };
-use flc_terminal::{EchoPolicy, TerminalView, TerminalViewOptions};
+use flc_terminal::search::SearchOptions;
+use flc_terminal::{EchoPolicy, SearchStatus, TerminalSource, TerminalView, TerminalViewOptions};
 use flc_ui::input::{TextInput, TextInputEvent};
 use flc_ui::theme::{ActiveTheme, Theme};
 use gpui::Focusable as _;
 use gpui::prelude::*;
 use gpui::{
     AsyncApp, Context, Div, Entity, FocusHandle, InteractiveElement, IntoElement, KeyDownEvent,
-    ParentElement, Pixels, Render, SharedString, Styled, Subscription, Task, WeakEntity, Window,
-    div, px, relative,
+    ParentElement, Pixels, Point, Render, SharedString, Styled, Subscription, Task, WeakEntity,
+    Window, div, px, relative,
 };
 use tokio::sync::broadcast;
 
+use crate::dnd::{self, DragSource, DropPlan, DropTarget};
 use crate::model::{Focus, ShellModel};
 use crate::source::MirrorSource;
 
@@ -40,6 +42,56 @@ pub struct ShellViewOptions {
     pub font_size: Option<Pixels>,
     /// `None`: the palette carried by each frame (the engine's).
     pub palette: Option<Vec<u32>>,
+}
+
+/// The drag payload: one tab (optionally lifted by a pane grip).
+#[derive(Debug, Clone)]
+struct DragPayload {
+    workspace: fl_model::WorkspaceId,
+    view: ViewId,
+    tab: TabId,
+    pane: Option<PaneId>,
+    label: SharedString,
+}
+
+impl DragPayload {
+    fn source(&self) -> DragSource {
+        DragSource {
+            workspace: self.workspace,
+            view: self.view,
+            tab: self.tab,
+            pane: self.pane,
+        }
+    }
+}
+
+/// The small pill GPUI draws under the pointer while dragging.
+struct DragGhost {
+    label: SharedString,
+    position: Point<Pixels>,
+}
+
+impl Render for DragGhost {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div().pl(self.position.x).pt(self.position.y).child(
+            div()
+                .px(px(8.))
+                .py(px(3.))
+                .rounded(px(6.))
+                .bg(gpui::black().opacity(0.75))
+                .text_color(gpui::white())
+                .text_size(px(11.))
+                .child(self.label.clone()),
+        )
+    }
+}
+
+/// Where a drag currently hovers. Purely visual: nothing reorders until the
+/// drop handler runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DragHover {
+    target: DropTarget,
+    valid: bool,
 }
 
 /// What the shell asks its host to do outside the layout model.
@@ -68,6 +120,12 @@ pub struct ShellView {
     keyboard_pane: Option<(ViewId, TabId, PaneId)>,
     focus: FocusHandle,
     rename: Option<(TabId, Entity<TextInput>)>,
+    /// The scrollback find bar and the last search's progress.
+    find: Option<Entity<TextInput>>,
+    find_status: Option<SearchStatus>,
+    _find_events: Option<Subscription>,
+    /// The insertion point a drag currently hovers.
+    drag: Option<DragHover>,
     banner: Option<SharedString>,
     /// Link latency published by the supervisor; `None` while disconnected.
     rtt: Option<Duration>,
@@ -146,6 +204,8 @@ pub(crate) enum Shortcut {
     ReorderTab {
         forward: bool,
     },
+    /// Ctrl+Shift+F: search the focused terminal's scrollback.
+    Find,
 }
 
 /// The shortcut a keystroke means, or `None` when the terminal keeps it:
@@ -156,7 +216,10 @@ pub(crate) fn shortcut_for(ctrl: bool, shift: bool, alt: bool, key: &str) -> Opt
     Some(match (ctrl, shift, alt, key) {
         (true, true, false, "t") => NewTerminal,
         (true, true, false, "w") => CloseTab,
-        (true, true, false, "r") => RenameTab,
+        // Ctrl+Shift+R is the app's run-target chord (spec §8.3); rename sits
+        // on Alt+Shift+R so the terminal keeps the spec chord.
+        (false, true, true, "r") => RenameTab,
+        (true, true, false, "f") => Find,
         // Ctrl-Tab cycles forward; Ctrl-Shift-Tab cycles back.
         (true, _, false, "tab") => CycleTab { forward: !shift },
         (true, true, false, "left") => ReorderTab { forward: false },
@@ -222,6 +285,10 @@ impl ShellView {
             keyboard_pane: None,
             focus: cx.focus_handle(),
             rename: None,
+            find: None,
+            find_status: None,
+            _find_events: None,
+            drag: None,
             banner: None,
             rtt: None,
             first_layout_seen: false,
@@ -665,7 +732,12 @@ impl ShellView {
         }
     }
 
-    fn on_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
+    fn on_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
         let keystroke = &event.keystroke;
         let modifiers = &keystroke.modifiers;
         let Some(shortcut) = shortcut_for(
@@ -729,9 +801,99 @@ impl ShellView {
                 }
             }
             Shortcut::ReorderTab { forward } => self.reorder_tab(forward, cx),
+            Shortcut::Find => self.open_find(window, cx),
         }
         cx.notify();
         true
+    }
+
+    /// The focused terminal's label and mirror source, for a PiP window.
+    pub fn pip_surface(&self) -> Option<(String, Arc<dyn TerminalSource>)> {
+        let focus = self.model.focus()?;
+        let layout = self.model.layout()?;
+        let view = layout.view(focus.view)?;
+        let tab = view
+            .tabs
+            .iter()
+            .find(|tab| Some(tab.id) == focus.tab)
+            .or_else(|| view.tabs.iter().find(|tab| Some(tab.id) == view.active))?;
+        let pane = tab
+            .panes
+            .iter()
+            .find(|pane| Some(pane.id) == focus.pane)
+            .or_else(|| tab.panes.iter().find(|pane| pane.id == tab.active))?;
+        let source = self
+            .sources
+            .iter()
+            .find_map(|((terminal, _), source)| (*terminal == pane.terminal).then_some(source))?;
+        let label = tab
+            .name
+            .clone()
+            .or_else(|| {
+                let state = source.handle().state();
+                Some(tab_label(state.title.as_deref(), state.cwd.as_deref()))
+            })
+            .unwrap_or_else(|| "Terminal".to_string());
+        let source: Arc<dyn TerminalSource> = source.clone();
+        Some((label, source))
+    }
+
+    /// Cycle terminal tabs from an app-level shortcut, when the shell itself
+    /// does not own the keystroke.
+    pub fn cycle_tab(&mut self, forward: bool, cx: &mut Context<Self>) {
+        self.next_tab(forward, cx);
+    }
+
+    /// Show the scrollback find bar and focus its field.
+    pub fn open_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let input = match &self.find {
+            Some(input) => input.clone(),
+            None => {
+                let input = cx.new(|cx| TextInput::new(cx, "Find in scrollback"));
+                let events =
+                    cx.subscribe(
+                        &input,
+                        |this, _input, event: &TextInputEvent, cx| match event {
+                            TextInputEvent::Submitted(query) => {
+                                this.run_find(query.to_string(), cx)
+                            }
+                            TextInputEvent::Cancelled => {
+                                this.find = None;
+                                this.find_status = None;
+                                cx.notify();
+                            }
+                        },
+                    );
+                self._find_events = Some(events);
+                self.find = Some(input.clone());
+                input
+            }
+        };
+        input.read(cx).focus_handle(cx).focus(window);
+        self.find_status = None;
+        cx.notify();
+    }
+
+    fn focused_terminal(&self) -> Option<Entity<TerminalView>> {
+        let focus = self.model.focus()?;
+        let pane = focus.pane?;
+        self.terminals.get(&(focus.view, focus.tab?, pane)).cloned()
+    }
+
+    fn run_find(&mut self, query: String, cx: &mut Context<Self>) {
+        let Some(terminal) = self.focused_terminal() else {
+            self.find_status = Some(SearchStatus {
+                current: None,
+                count: 0,
+            });
+            cx.notify();
+            return;
+        };
+        let status = terminal.update(cx, |terminal, cx| {
+            terminal.search(&query, SearchOptions::default(), cx)
+        });
+        self.find_status = Some(status);
+        cx.notify();
     }
 
     /// Open the inline editor for the focused tab's name.
@@ -779,6 +941,33 @@ impl ShellView {
         cx.notify();
     }
 
+    /// A 2 px accent (valid) or warning (refused) ring at an insertion slot.
+    fn render_drop_ring(&self, t: &Theme, valid: bool) -> gpui::AnyElement {
+        div()
+            .flex_none()
+            .w(px(2.))
+            .h(px(18.))
+            .rounded(px(1.))
+            .bg(if valid { t.accent } else { t.danger })
+            .into_any_element()
+    }
+
+    /// Apply exactly one planned operation. Refusals explain themselves in the
+    /// shell banner and never touch the layout.
+    fn apply_drop(&mut self, payload: &DragPayload, target: DropTarget, cx: &mut Context<Self>) {
+        let Some(layout) = self.model.layout().cloned() else {
+            return;
+        };
+        self.drag = None;
+        match dnd::plan(&layout, payload.source(), target) {
+            DropPlan::Apply(op) => self.submit(op, cx),
+            DropPlan::Refuse(reason) => {
+                self.banner = Some(reason.message().into());
+                cx.notify();
+            }
+        }
+    }
+
     fn render_tab_strip(
         &self,
         view: &fl_model::layout::View,
@@ -795,7 +984,13 @@ impl ShellView {
             .bg(t.chrome_bg)
             .border_b_1()
             .border_color(t.border);
-        for tab in &view.tabs {
+        for (index, tab) in view.tabs.iter().enumerate() {
+            if self
+                .drag
+                .is_some_and(|hover| hover.target.view == view.id && hover.target.index == index)
+            {
+                strip = strip.child(self.render_drop_ring(t, self.drag.is_some_and(|h| h.valid)));
+            }
             let active = Some(tab.id) == view.active;
             let tab_id = tab.id;
             let pinned = tab.pinned;
@@ -820,6 +1015,19 @@ impl ShellView {
                     .panes
                     .iter()
                     .any(|pane| self.bells.contains(&pane.terminal));
+            let payload = DragPayload {
+                workspace: self
+                    .model
+                    .layout()
+                    .map(|layout| layout.workspace)
+                    .unwrap_or_default(),
+                view: view.id,
+                tab: tab_id,
+                pane: None,
+                label: SharedString::from(label.clone()),
+            };
+            let drop_view = view.id;
+            let drop_index = index;
             let mut item = div()
                 .id(SharedString::from(format!("tab-{tab_id}")))
                 .flex()
@@ -850,6 +1058,46 @@ impl ShellView {
                         this.submit(op, cx);
                     }
                     this.focus.focus(window);
+                }))
+                .on_drag(payload, |payload: &DragPayload, position, _, cx| {
+                    cx.new(|_| DragGhost {
+                        label: payload.label.clone(),
+                        position,
+                    })
+                })
+                .on_drag_move::<DragPayload>(cx.listener(
+                    move |this, event: &gpui::DragMoveEvent<DragPayload>, _, cx| {
+                        let before = event.event.position.x < event.bounds.center().x;
+                        let slot = if before { drop_index } else { drop_index + 1 };
+                        let target = DropTarget {
+                            workspace: event.drag(cx).workspace,
+                            view: drop_view,
+                            index: slot,
+                        };
+                        let valid = this.model.layout().is_some_and(|layout| {
+                            matches!(
+                                dnd::plan(layout, event.drag(cx).source(), target),
+                                DropPlan::Apply(_)
+                            )
+                        });
+                        let next = DragHover { target, valid };
+                        if this.drag != Some(next) {
+                            this.drag = Some(next);
+                            cx.notify();
+                        }
+                    },
+                ))
+                .on_drop(cx.listener(move |this, payload: &DragPayload, _, cx| {
+                    let target = this
+                        .drag
+                        .filter(|hover| hover.target.view == drop_view)
+                        .map(|hover| hover.target)
+                        .unwrap_or(DropTarget {
+                            workspace: payload.workspace,
+                            view: drop_view,
+                            index: drop_index,
+                        });
+                    this.apply_drop(payload, target, cx);
                 }))
                 .child(if pinned {
                     div().text_color(t.accent).child("•")
@@ -906,7 +1154,68 @@ impl ShellView {
                     }))
                     .child("Split"),
             )
-            .child(div().flex_1())
+            .when(
+                self.drag.is_some_and(|hover| {
+                    hover.target.view == view.id && hover.target.index == view.tabs.len()
+                }),
+                |d| d.child(self.render_drop_ring(t, self.drag.is_some_and(|h| h.valid))),
+            )
+            .child(
+                div()
+                    .id("tab-drop-end")
+                    .flex_1()
+                    .h_full()
+                    .when(
+                        self.drag.is_some_and(|hover| {
+                            hover.target.view == view.id && hover.target.index == view.tabs.len()
+                        }),
+                        |d| d.border_2().border_color(t.accent),
+                    )
+                    .on_drag_move::<DragPayload>(cx.listener({
+                        let view_id = view.id;
+                        move |this, event: &gpui::DragMoveEvent<DragPayload>, _, cx| {
+                            let target = DropTarget {
+                                workspace: event.drag(cx).workspace,
+                                view: view_id,
+                                index: this
+                                    .model
+                                    .view(view_id)
+                                    .map(|view| view.tabs.len())
+                                    .unwrap_or(0),
+                            };
+                            let valid = this.model.layout().is_some_and(|layout| {
+                                matches!(
+                                    dnd::plan(layout, event.drag(cx).source(), target),
+                                    DropPlan::Apply(_)
+                                )
+                            });
+                            let next = DragHover { target, valid };
+                            if this.drag != Some(next) {
+                                this.drag = Some(next);
+                                cx.notify();
+                            }
+                        }
+                    }))
+                    .on_drop(cx.listener({
+                        let view_id = view.id;
+                        move |this, payload: &DragPayload, _, cx| {
+                            let target = this
+                                .drag
+                                .filter(|hover| hover.target.view == view_id)
+                                .map(|hover| hover.target)
+                                .unwrap_or(DropTarget {
+                                    workspace: payload.workspace,
+                                    view: view_id,
+                                    index: this
+                                        .model
+                                        .view(view_id)
+                                        .map(|view| view.tabs.len())
+                                        .unwrap_or(0),
+                                });
+                            this.apply_drop(payload, target, cx);
+                        }
+                    })),
+            )
             .when_some(
                 self.model.pending().gt(&0).then_some("Saving…"),
                 |d, label| d.child(div().mr(px(8.)).text_color(t.text_tertiary).child(label)),
@@ -1003,6 +1312,11 @@ impl ShellView {
         let Some((view_id, tab_id, terminal)) = found else {
             return div().into_any_element();
         };
+        let workspace = self
+            .model
+            .layout()
+            .map(|layout| layout.workspace)
+            .unwrap_or_default();
         let key = (view_id, tab_id, pane_id);
         let body: gpui::AnyElement = match self.terminals.get(&key) {
             Some(terminal_view) => terminal_view.clone().into_any_element(),
@@ -1031,8 +1345,16 @@ impl ShellView {
                     .into_any_element()
             }
         };
+        let payload = DragPayload {
+            workspace,
+            view: view_id,
+            tab: tab_id,
+            pane: Some(pane_id),
+            label: SharedString::from("Pane"),
+        };
         div()
             .id(SharedString::from(format!("pane-{pane_id}")))
+            .relative()
             .size_full()
             .p(px(2.))
             .bg(t.surface_bg)
@@ -1048,6 +1370,41 @@ impl ShellView {
                 // The pane's terminal (if any) takes the keyboard on render.
                 this.keyboard_pane = None;
                 this.focus.focus(window);
+            }))
+            .child(
+                div()
+                    .id(SharedString::from(format!("pane-grip-{pane_id}")))
+                    .absolute()
+                    .top(px(6.))
+                    .left(px(6.))
+                    .w(px(12.))
+                    .h(px(12.))
+                    .rounded(px(3.))
+                    .bg(t.text_tertiary.opacity(0.35))
+                    .cursor_move()
+                    .on_drag(payload, |payload: &DragPayload, position, _, cx| {
+                        cx.new(|_| DragGhost {
+                            label: payload.label.clone(),
+                            position,
+                        })
+                    }),
+            )
+            .on_drop(cx.listener(move |this, payload: &DragPayload, _, cx| {
+                let Some(layout) = this.model.layout().cloned() else {
+                    return;
+                };
+                let target = DropTarget {
+                    workspace: payload.workspace,
+                    view: view_id,
+                    index: 0,
+                };
+                this.drag = None;
+                if let DropPlan::Refuse(reason) =
+                    dnd::plan_pane_drop(&layout, payload.source(), target)
+                {
+                    this.banner = Some(reason.message().into());
+                    cx.notify();
+                }
             }))
             .child(body)
             .into_any_element()
@@ -1216,6 +1573,8 @@ impl Render for ShellView {
                 .into_any_element(),
         };
         let banner = self.banner.clone();
+        let find = self.find.clone();
+        let find_status = self.find_status;
         div()
             .id("shell")
             .key_context("Shell")
@@ -1228,8 +1587,8 @@ impl Render for ShellView {
             .text_color(t.text_primary)
             .font_family(t.font_ui.clone())
             .text_size(t.text_size)
-            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
-                if this.on_key(event, cx) {
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                if this.on_key(event, window, cx) {
                     cx.stop_propagation();
                 }
             }))
@@ -1242,6 +1601,39 @@ impl Render for ShellView {
                         .bg(t.surface_raised)
                         .text_color(t.warning)
                         .child(message),
+                )
+            })
+            .when_some(find, |d, input| {
+                let status: SharedString = match find_status {
+                    None => "Enter to search".into(),
+                    Some(SearchStatus { count: 0, .. }) => "No matches".into(),
+                    Some(SearchStatus { current, count }) => {
+                        format!("{}/{}", current.map(|index| index + 1).unwrap_or(0), count).into()
+                    }
+                };
+                d.child(
+                    div()
+                        .id("scrollback-find")
+                        .absolute()
+                        .top(px(38.))
+                        .right(px(8.))
+                        .flex()
+                        .items_center()
+                        .gap(px(6.))
+                        .px(px(8.))
+                        .py(px(4.))
+                        .rounded(t.radius_sm)
+                        .bg(t.chrome_bg)
+                        .border_1()
+                        .border_color(t.accent)
+                        .shadow_md()
+                        .child(div().w(px(220.)).child(input))
+                        .child(
+                            div()
+                                .text_size(t.text_size_sm)
+                                .text_color(t.text_secondary)
+                                .child(status),
+                        ),
                 )
             })
             .child(content)
@@ -1274,7 +1666,10 @@ mod shortcut_tests {
         use Shortcut::*;
         assert_eq!(chord(true, true, false, "t"), Some(NewTerminal));
         assert_eq!(chord(true, true, false, "w"), Some(CloseTab));
-        assert_eq!(chord(true, true, false, "r"), Some(RenameTab));
+        assert_eq!(chord(false, true, true, "r"), Some(RenameTab));
+        assert_eq!(chord(true, true, false, "f"), Some(Find));
+        // Ctrl+Shift+R is the app's run-target chord, not tab rename.
+        assert_eq!(chord(true, true, false, "r"), None);
         assert_eq!(
             chord(false, true, true, "="),
             Some(SplitPane(Axis::Horizontal))
@@ -1350,7 +1745,7 @@ mod shortcut_tests {
     /// Plain Ctrl+letter and typed text belong to the terminal.
     #[test]
     fn terminal_chords_are_not_workspace_shortcuts() {
-        for key in ["a", "c", "d", "l", "v", "z", "t", "w", "r"] {
+        for key in ["a", "c", "d", "l", "v", "z", "t", "w", "r", "g"] {
             assert_eq!(chord(true, false, false, key), None, "ctrl-{key}");
             assert_eq!(chord(false, false, false, key), None, "{key}");
             assert_eq!(chord(false, true, false, key), None, "shift-{key}");

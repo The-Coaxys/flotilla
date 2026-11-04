@@ -66,6 +66,8 @@ pub struct ClientSettings {
     /// Per-workspace overrides, keyed by the daemon's workspace id.
     pub workspaces: BTreeMap<String, WorkspaceSettings>,
     pub fonts: SurfaceFonts,
+    /// Desktop notification policy (spec §8.4); in-app toasts are unaffected.
+    pub notifications: flc_ui::notify::NotificationSettings,
 }
 
 impl Default for ClientSettings {
@@ -75,6 +77,7 @@ impl Default for ClientSettings {
             default: WorkspaceSettings::default(),
             workspaces: BTreeMap::new(),
             fonts: SurfaceFonts::default(),
+            notifications: flc_ui::notify::NotificationSettings::default(),
         }
     }
 }

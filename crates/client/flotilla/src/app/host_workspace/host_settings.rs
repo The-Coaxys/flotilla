@@ -6,6 +6,7 @@
 use flc_terminal::EchoPolicy;
 use flc_ui::input::{TextInput, TextInputEvent};
 use flc_ui::keymap::{self, Chord};
+use flc_ui::notify::{EventClass, NotificationSettings};
 use flc_ui::theme::Theme;
 use flc_ui::theme_settings::{Mode, format_hex, parse_hex};
 use gpui::Focusable as _;
@@ -43,6 +44,7 @@ const MONO_FAMILIES: [&str; 6] = [
 pub(super) enum Tab {
     Theme,
     Keyboard,
+    Notifications,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -424,14 +426,16 @@ impl HostWorkspace {
         let body = match tab {
             Tab::Theme => self.settings_theme_body(t, cx),
             Tab::Keyboard => self.settings_keymap_body(t, cx),
+            Tab::Notifications => self.settings_notifications_body(t, cx),
         };
-        let tabs = [Tab::Theme, Tab::Keyboard]
+        let tabs = [Tab::Theme, Tab::Keyboard, Tab::Notifications]
             .into_iter()
             .map(|candidate| {
                 let active = candidate == tab;
                 let label = match candidate {
                     Tab::Theme => "Theme",
                     Tab::Keyboard => "Keyboard",
+                    Tab::Notifications => "Notifications",
                 };
                 div()
                     .id(SharedString::from(format!("settings-tab-{label}")))
@@ -627,6 +631,7 @@ impl HostWorkspace {
                     },
                 )),
             ),
+            Tab::Notifications => row,
         };
         if tab == Tab::Theme {
             row = row.child(
@@ -644,6 +649,135 @@ impl HostWorkspace {
             );
         }
         row.into_any_element()
+    }
+
+    fn settings_notifications_body(&mut self, t: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let policy = self.settings.read(cx).notifications().clone();
+        let mut body = div().flex().flex_col().gap(px(10.)).pt(px(8.)).child(
+            div()
+                .text_size(t.text_size_sm)
+                .text_color(t.text_secondary)
+                .child(SharedString::from(
+                    "Desktop notifications are a Windows feature (spec §8.4). The inbox, in-app toasts and banner always stay on.",
+                )),
+        );
+        for (class, title, detail) in [
+            (
+                EventClass::Completion,
+                "Completion",
+                "A turn or session finishes.",
+            ),
+            (
+                EventClass::Input,
+                "Approval or input",
+                "A tool asks for approval or a question waits for an answer.",
+            ),
+        ] {
+            let current = policy.delivery(class);
+            body = body.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(10.))
+                    .child(
+                        div()
+                            .flex_1()
+                            .flex()
+                            .flex_col()
+                            .child(div().text_size(t.text_size_sm).child(title))
+                            .child(
+                                div()
+                                    .text_size(t.text_size_sm)
+                                    .text_color(t.text_tertiary)
+                                    .child(detail),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("notify-{title}",)))
+                            .px(px(10.))
+                            .h(px(24.))
+                            .flex()
+                            .items_center()
+                            .rounded(t.radius_sm)
+                            .bg(t.control_bg)
+                            .cursor_pointer()
+                            .text_size(t.text_size_sm)
+                            .child(current.label())
+                            .on_click(cx.listener(move |host, _, _, cx| {
+                                let next = current.next();
+                                let settings = host.settings.clone();
+                                settings.update(cx, |settings, cx| {
+                                    settings.edit_notifications(
+                                        |policy| policy.set_delivery(class, next),
+                                        cx,
+                                    )
+                                });
+                                cx.notify();
+                            })),
+                    ),
+            );
+        }
+        let sounds = policy.sounds;
+        body = body.child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(10.))
+                .pt(px(6.))
+                .child(div().flex_1().text_size(t.text_size_sm).child("Sounds"))
+                .child(
+                    div()
+                        .id("notify-sounds")
+                        .px(px(10.))
+                        .h(px(24.))
+                        .flex()
+                        .items_center()
+                        .rounded(t.radius_sm)
+                        .bg(if sounds { t.accent } else { t.control_bg })
+                        .text_color(if sounds {
+                            gpui::white()
+                        } else {
+                            t.text_secondary
+                        })
+                        .cursor_pointer()
+                        .text_size(t.text_size_sm)
+                        .child(if sounds { "On" } else { "Off" })
+                        .on_click(cx.listener(move |host, _, _, cx| {
+                            let settings = host.settings.clone();
+                            settings.update(cx, |settings, cx| {
+                                settings
+                                    .edit_notifications(|policy| policy.sounds = !policy.sounds, cx)
+                            });
+                            cx.notify();
+                        })),
+                ),
+        );
+        let defaults = NotificationSettings::default();
+        let settings = self.settings.clone();
+        body = body.child(div().pt(px(10.)).child(
+            secondary_button("notify-defaults", "Restore defaults", t).on_click(cx.listener(
+                move |host, _, _, cx| {
+                    let settings = settings.clone();
+                    settings.update(cx, |settings, cx| {
+                        settings.edit_notifications(
+                            |policy| *policy = NotificationSettings::default(),
+                            cx,
+                        );
+                    });
+                    if let Some(ui) = host.settings_ui.as_mut() {
+                        ui.message = Some(SharedString::from(format!(
+                            "Notifications: completion {}, input {}, sounds {}.",
+                            defaults.completion.label(),
+                            defaults.input.label(),
+                            if defaults.sounds { "on" } else { "off" }
+                        )));
+                    }
+                    cx.notify();
+                },
+            )),
+        ));
+        body.into_any_element()
     }
 
     fn settings_theme_body(&mut self, t: &Theme, cx: &mut Context<Self>) -> AnyElement {

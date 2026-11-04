@@ -88,9 +88,58 @@ pub const ACTIONS: &[ActionSpec] = &[
     ActionSpec {
         id: "pip.toggle",
         label: "Picture-in-picture",
-        group: Group::Reserved,
+        group: Group::Navigation,
         default: "ctrl-shift-p",
-        note: "Reserved by spec §8.3; the PiP window lands in its own slice.",
+        note: "Always-on-top window for the pinned terminal, chat, run or review surface.",
+    },
+    ActionSpec {
+        id: "git.primary",
+        label: "Run the Git action",
+        group: Group::Navigation,
+        default: "ctrl-shift-g",
+        note: "The adaptive action on the bottom bar (spec §8.3).",
+    },
+    ActionSpec {
+        id: "git.alternate",
+        label: "Run the Git action (alternate)",
+        group: Group::Navigation,
+        default: "ctrl-alt-g",
+        note: "Same action, dispatched with the route's alternate mode.",
+    },
+    ActionSpec {
+        id: "inbox.open",
+        label: "Open the inbox",
+        group: Group::Navigation,
+        default: "ctrl-shift-i",
+        note: "Running, Ready and Open conversations.",
+    },
+    ActionSpec {
+        id: "terminal.find",
+        label: "Find in terminal scrollback",
+        group: Group::Navigation,
+        default: "ctrl-shift-f",
+        note: "Searches the focused terminal's retained scrollback.",
+    },
+    ActionSpec {
+        id: "run.target",
+        label: "Run the selected target",
+        group: Group::Navigation,
+        default: "ctrl-shift-r",
+        note: "Starts or stops the worktree's current run target.",
+    },
+    ActionSpec {
+        id: "tab.next",
+        label: "Next tab",
+        group: Group::Navigation,
+        default: "ctrl-tab",
+        note: "Terminal tabs of the current scope; the terminal keeps it while focused.",
+    },
+    ActionSpec {
+        id: "tab.previous",
+        label: "Previous tab",
+        group: Group::Navigation,
+        default: "ctrl-shift-tab",
+        note: "Cycles backwards through the terminal tabs.",
     },
 ];
 
@@ -765,22 +814,84 @@ mod tests {
     }
 
     #[test]
-    fn the_palette_no_longer_claims_the_pip_chord() {
+    fn the_pip_chord_is_its_own_action_and_the_palette_keeps_k() {
         let keymap = Keymap::defaults();
         assert_eq!(
             keymap.chord("pip.toggle").unwrap().canonical(),
             "ctrl-shift-p"
         );
         let pip = ACTIONS.iter().find(|a| a.id == "pip.toggle").unwrap();
-        assert_eq!(pip.group, Group::Reserved);
-        assert!(pip.note.contains("spec §8.3"));
-        // No other action may use it: the collision that prompted this slice.
-        let users: Vec<_> = keymap
-            .bindings
-            .iter()
-            .filter(|(_, chord)| chord.canonical() == "ctrl-shift-p")
-            .map(|(id, _)| *id)
-            .collect();
-        assert_eq!(users, vec!["pip.toggle"]);
+        assert_eq!(pip.group, Group::Navigation);
+        assert!(pip.note.contains("Always-on-top"));
+        // The palette no longer answers it.
+        assert_eq!(
+            keymap.chord("palette.global").unwrap().canonical(),
+            "ctrl-shift-k"
+        );
+        // And it cannot be stolen by another action.
+        let conflict = keymap
+            .check(
+                "settings.open",
+                &Chord::parse("ctrl-shift-p").unwrap(),
+                terminal_owned,
+            )
+            .unwrap();
+        assert_eq!(conflict.kind, ConflictKind::OtherAction);
+    }
+
+    /// Every application chord in spec §8.3 that the client dispatches, and
+    /// the terminal-first rule: none of them is a plain `Ctrl+<letter>` (or
+    /// unmodified), because the terminal consumes those first.
+    #[test]
+    fn the_shortcut_table_matches_the_spec_and_never_shadows_the_terminal() {
+        let keymap = Keymap::defaults();
+        let expected = [
+            ("app.quit", "alt-f4"),
+            ("host.add", "ctrl-shift-n"),
+            ("palette.global", "ctrl-shift-k"),
+            ("palette.files", "ctrl-shift-o"),
+            ("settings.open", "ctrl-,"),
+            ("performance.toggle", "ctrl-alt-shift-p"),
+            ("pip.toggle", "ctrl-shift-p"),
+            ("git.primary", "ctrl-shift-g"),
+            ("git.alternate", "ctrl-alt-g"),
+            ("inbox.open", "ctrl-shift-i"),
+            ("terminal.find", "ctrl-shift-f"),
+            ("run.target", "ctrl-shift-r"),
+            ("tab.next", "ctrl-tab"),
+            ("tab.previous", "ctrl-shift-tab"),
+        ];
+        for (id, chord) in expected {
+            assert_eq!(
+                keymap.chord(id).map(Chord::canonical).as_deref(),
+                Some(chord),
+                "{id}"
+            );
+            let parsed = Chord::parse(chord).unwrap();
+            assert!(parsed.has_modifier(), "{chord} must keep a modifier");
+            assert!(
+                !terminal_owned(&parsed),
+                "{chord} belongs to the terminal (spec §8.3)"
+            );
+        }
+        // Nothing else is bound, so the table cannot drift silently.
+        assert_eq!(keymap.bindings.len(), expected.len());
+        // Alt-F4 is the one chord the terminal must still pass to the OS.
+        assert!(!Chord::parse("alt-f4").unwrap().control);
+    }
+
+    #[test]
+    fn a_plain_ctrl_letter_still_loses_to_the_terminal() {
+        // The rule the whole table exists to respect: a new binding on a plain
+        // Ctrl+letter is refused; the API documents why.
+        let keymap = Keymap::defaults();
+        let refused = keymap
+            .check(
+                "run.target",
+                &Chord::parse("ctrl-r").unwrap(),
+                terminal_owned,
+            )
+            .unwrap();
+        assert_eq!(refused.kind, ConflictKind::Terminal);
     }
 }
