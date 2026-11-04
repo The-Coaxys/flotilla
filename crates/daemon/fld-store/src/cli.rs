@@ -5,8 +5,8 @@
 use super::tree::load_tree;
 use super::*;
 use crate::{Result, StoreError};
-use fl_model::workspace::WorkspaceInfo;
 use fl_model::WorkspaceId;
+use fl_model::workspace::WorkspaceInfo;
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 
 pub(crate) const SCHEMA_V8: &str = "
@@ -42,7 +42,10 @@ impl Database {
         let id = WorkspaceId::from_bytes(bytes.as_slice().try_into().map_err(|_| {
             StoreError::Invalid("stored CLI workspace ID has the wrong length".into())
         })?);
-        Ok(tree.workspaces.into_iter().find(|workspace| workspace.id == id))
+        Ok(tree
+            .workspaces
+            .into_iter()
+            .find(|workspace| workspace.id == id))
     }
 
     /// Select an existing workspace and return it.

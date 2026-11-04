@@ -9,13 +9,14 @@ pub struct ProviderRegistry {
 impl Default for ProviderRegistry {
     fn default() -> Self {
         let mut entries = BTreeMap::new();
-        for (id, name, adapter, resume, hook_support) in [
+        for (id, name, adapter, resume, hook_support, command) in [
             (
                 "claude",
                 "Claude Code",
                 AdapterKind::ClaudeStream,
                 ResumeStrategy::ClaudeSession,
                 true,
+                "claude",
             ),
             (
                 "codex",
@@ -23,6 +24,7 @@ impl Default for ProviderRegistry {
                 AdapterKind::CodexAppServer,
                 ResumeStrategy::CodexThread,
                 true,
+                "codex",
             ),
             (
                 "cursor",
@@ -30,6 +32,7 @@ impl Default for ProviderRegistry {
                 AdapterKind::CursorStreamJson,
                 ResumeStrategy::CursorChat,
                 false,
+                "cursor-agent",
             ),
             (
                 "pi",
@@ -37,6 +40,7 @@ impl Default for ProviderRegistry {
                 AdapterKind::PiRpc,
                 ResumeStrategy::PiSession,
                 true,
+                "pi",
             ),
             (
                 "omp",
@@ -44,6 +48,7 @@ impl Default for ProviderRegistry {
                 AdapterKind::PiRpc,
                 ResumeStrategy::PiSession,
                 true,
+                "omp",
             ),
         ] {
             entries.insert(
@@ -51,7 +56,7 @@ impl Default for ProviderRegistry {
                 ProviderSpec {
                     id: id.into(),
                     name: name.into(),
-                    command: PathBuf::from(id),
+                    command: PathBuf::from(command),
                     args: Vec::new(),
                     env: BTreeMap::new(),
                     adapter,
@@ -267,7 +272,12 @@ mod tests {
     fn builtins_cover_cursor_pi_and_omp_with_matching_strategies() {
         let registry = ProviderRegistry::default();
         for (id, adapter, resume, command) in [
-            ("cursor", AdapterKind::CursorStreamJson, ResumeStrategy::CursorChat, "cursor-agent"),
+            (
+                "cursor",
+                AdapterKind::CursorStreamJson,
+                ResumeStrategy::CursorChat,
+                "cursor-agent",
+            ),
             ("pi", AdapterKind::PiRpc, ResumeStrategy::PiSession, "pi"),
             ("omp", AdapterKind::PiRpc, ResumeStrategy::PiSession, "omp"),
         ] {

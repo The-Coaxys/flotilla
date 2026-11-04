@@ -278,7 +278,10 @@ async fn commands_round_trip_with_durable_effects() {
     assert!(sections["rev"].as_u64().unwrap() >= 1);
 
     let tree = fixture.fl_json(&["worktree", "status", "--json"]).await;
-    assert_eq!(string(&tree["worktree"], "id"), fixture.worktree.to_string());
+    assert_eq!(
+        string(&tree["worktree"], "id"),
+        fixture.worktree.to_string()
+    );
     assert_eq!(tree["status"]["summary"]["branch"], "main");
 
     let labelled = fixture
@@ -327,7 +330,9 @@ async fn commands_round_trip_with_durable_effects() {
     assert_eq!(added["review"]["threads"].as_array().unwrap().len(), 1);
     assert_eq!(added["thread"]["status"], "Pending");
 
-    let listed = fixture.fl_json(&["worktree", "review-list", "--json"]).await;
+    let listed = fixture
+        .fl_json(&["worktree", "review-list", "--json"])
+        .await;
     assert_eq!(listed["review"]["threads"].as_array().unwrap().len(), 1);
 
     let fetched = fixture
@@ -431,8 +436,16 @@ async fn commands_round_trip_with_durable_effects() {
     assert!(help.status.success());
     let help_text = String::from_utf8_lossy(&help.stdout);
     for command in [
-        "status", "workspace", "section", "worktree", "project", "tab", "layout", "chat",
-        "history", "agent",
+        "status",
+        "workspace",
+        "section",
+        "worktree",
+        "project",
+        "tab",
+        "layout",
+        "chat",
+        "history",
+        "agent",
     ] {
         assert!(help_text.contains(command), "root help omits {command}");
     }

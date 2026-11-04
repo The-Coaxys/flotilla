@@ -3,9 +3,8 @@ use std::io::Read;
 
 use fl_model::layout::{Axis, Layout, LayoutOp, SplitNode, Tab, View};
 use fl_model::{PaneId, Size, SplitId, TabId, TerminalId, ViewId};
-use fl_proto::{Request, Response};
 
-use super::{apply_layout, current_layout, resolve_worktree, unexpected, worktree_scope};
+use super::{apply_layout, current_layout, resolve_worktree, worktree_scope};
 use crate::cli::{Cli, LayoutCommand, SplitDirection, TabCommand};
 use crate::client::DaemonClient;
 use crate::error::CliError;
@@ -31,7 +30,7 @@ fn view_of(layout: &Layout, view: Option<ViewId>) -> Result<&View, CliError> {
         .ok_or_else(|| CliError::not_found(format!("layout view {id} not found")))
 }
 
-fn tab_of<'a>(view: &'a View, tab: Option<TabId>) -> Result<&'a Tab, CliError> {
+fn tab_of(view: &View, tab: Option<TabId>) -> Result<&Tab, CliError> {
     let id = tab.or(view.active).ok_or_else(|| {
         CliError::invalid(format!(
             "view {} has no tabs; use `fl tab split` first",
@@ -44,11 +43,11 @@ fn tab_of<'a>(view: &'a View, tab: Option<TabId>) -> Result<&'a Tab, CliError> {
         .ok_or_else(|| CliError::not_found(format!("tab {id} not found in view {}", view.id)))
 }
 
-fn locate_tab<'a>(
-    layout: &'a Layout,
+fn locate_tab(
+    layout: &Layout,
     view: Option<ViewId>,
     tab: Option<TabId>,
-) -> Result<(&'a View, &'a Tab), CliError> {
+) -> Result<(&View, &Tab), CliError> {
     match (view, tab) {
         (Some(view_id), Some(tab_id)) => {
             let view = layout
@@ -91,28 +90,18 @@ pub async fn run_tab(
             direction,
             columns,
             rows,
-        } => split_tab(
-            client,
-            reporter,
-            cli,
-            *view,
-            *tab,
-            *direction,
-            *columns,
-            *rows,
-        )
-        .await,
+        } => {
+            split_tab(
+                client, reporter, cli, *view, *tab, *direction, *columns, *rows,
+            )
+            .await
+        }
         TabCommand::SplitView {
             view,
             direction,
             columns,
             rows,
-        } => {
-            split_view(
-                client, reporter, cli, *view, *direction, *columns, *rows,
-            )
-            .await
-        }
+        } => split_view(client, reporter, cli, *view, *direction, *columns, *rows).await,
     }
 }
 
@@ -241,10 +230,7 @@ async fn split_view(
             "layout": layout,
         }));
     }
-    reporter.text(format!(
-        "split view {} with terminal {}",
-        source, terminal
-    ));
+    reporter.text(format!("split view {} with terminal {}", source, terminal));
     Ok(())
 }
 
@@ -264,11 +250,7 @@ pub async fn run_layout(
     }
 }
 
-async fn views(
-    client: &mut DaemonClient,
-    reporter: &Reporter,
-    cli: &Cli,
-) -> Result<(), CliError> {
+async fn views(client: &mut DaemonClient, reporter: &Reporter, cli: &Cli) -> Result<(), CliError> {
     let (worktree, _project) = resolve_worktree(client, cli).await?;
     let layout = current_layout(client, worktree_scope(&worktree)).await?;
     if reporter.json {
@@ -277,12 +259,19 @@ async fn views(
             "layout": layout,
         }));
     }
-    reporter.text(format!("layout rev {} active view {}", layout.rev, layout.active));
+    reporter.text(format!(
+        "layout rev {} active view {}",
+        layout.rev, layout.active
+    ));
     for view in &layout.views {
         reporter.text(format!(
             "view {}{}",
             view.id,
-            if view.id == layout.active { " (active)" } else { "" }
+            if view.id == layout.active {
+                " (active)"
+            } else {
+                ""
+            }
         ));
         for tab in &view.tabs {
             reporter.text(format!(
@@ -301,7 +290,11 @@ async fn views(
                     "    pane {} terminal {}{}",
                     pane.id,
                     pane.terminal,
-                    if pane.id == tab.active { " (active)" } else { "" }
+                    if pane.id == tab.active {
+                        " (active)"
+                    } else {
+                        ""
+                    }
                 ));
             }
         }
@@ -311,13 +304,24 @@ async fn views(
             id, axis, ratio, ..
         } = node
         {
-            reporter.text(format!(
-                "split {id} {:?} ratio {ratio}",
-                axis
-            ));
+            reporter.text(format!("split {id} {:?} ratio {ratio}", axis));
         }
     }
     Ok(())
+}
+
+/// The split whose direct child is the leaf holding `view`.
+fn split_parent(tree: &fl_model::layout::SplitTree<ViewId>, view: ViewId) -> Option<SplitId> {
+    let leaf = |index: u16| match tree.nodes.get(index as usize) {
+        Some(SplitNode::Leaf(candidate)) => *candidate == view,
+        _ => false,
+    };
+    tree.nodes.iter().find_map(|node| match node {
+        SplitNode::Branch {
+            id, first, second, ..
+        } if leaf(*first) || leaf(*second) => Some(*id),
+        _ => None,
+    })
 }
 
 async fn set(
@@ -339,21 +343,11 @@ async fn set(
                     "split ratio must be between 1000 and 9000 basis points",
                 ));
             }
-            let split = layout
-                .split
-                .nodes
-                .iter()
-                .find_map(|node| match node {
-                    SplitNode::Branch {
-                        id, first, second, ..
-                    } if *first == view || *second == view => Some(*id),
-                    _ => None,
-                })
-                .ok_or_else(|| {
-                    CliError::invalid(format!(
-                        "view {view} is not part of a split; nothing to ratio"
-                    ))
-                })?;
+            let split = split_parent(&layout.split, view).ok_or_else(|| {
+                CliError::invalid(format!(
+                    "view {view} is not part of a split; nothing to ratio"
+                ))
+            })?;
             LayoutOp::SetViewRatio { split, ratio }
         }
         None => LayoutOp::SelectView { view },
@@ -433,7 +427,9 @@ async fn compose(
         serde_json::from_value(ops)?
     };
     if ops.len() > 128 {
-        return Err(CliError::invalid("at most 128 layout operations are accepted"));
+        return Err(CliError::invalid(
+            "at most 128 layout operations are accepted",
+        ));
     }
     let base_rev = layout.rev;
     let mut simulated = layout;
@@ -475,4 +471,3 @@ async fn compose(
     }
     Ok(())
 }
-

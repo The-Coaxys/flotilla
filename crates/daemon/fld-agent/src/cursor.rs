@@ -6,7 +6,7 @@
 //! queries are surfaced as diagnostics and never auto-approved. Read-only mode
 //! uses Cursor's own `--mode plan`; `--force`/`--yolo` are rejected arguments.
 
-use crate::{host, process, *};
+use crate::{host, process, process::Machine, *};
 use futures::StreamExt;
 use serde_json::Value;
 use std::{
@@ -14,10 +14,7 @@ use std::{
     process::Stdio,
     time::{Duration, Instant},
 };
-use tokio::{
-    process::Child,
-    sync::mpsc,
-};
+use tokio::{process::Child, sync::mpsc};
 use tokio_util::codec::{FramedRead, LinesCodec};
 
 const TURN_TIMEOUT: Duration = Duration::from_secs(600);
@@ -73,18 +70,12 @@ pub(crate) async fn launch(provider: ProviderSpec, config: SessionConfig) -> Res
 }
 
 async fn create_chat(provider: &ProviderSpec) -> Result<String> {
-    let output = host::capture(
-        provider,
-        &["create-chat"],
-        host::CURSOR_HANDSHAKE_TIMEOUT,
-    )
-    .await
-    .map_err(|error| match error {
-        AdapterError::Timeout => {
-            AdapterError::Timeout
-        }
-        other => AdapterError::Unsupported(format!("cursor create-chat handshake: {other}")),
-    })?;
+    let output = host::capture(provider, &["create-chat"], host::CURSOR_HANDSHAKE_TIMEOUT)
+        .await
+        .map_err(|error| match error {
+            AdapterError::Timeout => AdapterError::Timeout,
+            other => AdapterError::Unsupported(format!("cursor create-chat handshake: {other}")),
+        })?;
     let session = output
         .lines()
         .map(str::trim)
@@ -125,22 +116,19 @@ async fn run(mut machine: Machine, mut commands: mpsc::Receiver<Command>, sessio
                         let turn_id = uuid::Uuid::new_v4().to_string();
                         machine.active_turn = Some(turn_id);
                         machine.turn_started = Some(Instant::now());
-                        let _ = machine.user_event(
-                            machine.active_turn.clone().unwrap_or_default(),
-                            text,
-                        );
+                        let _ = machine
+                            .user_event(machine.active_turn.clone().unwrap_or_default(), text);
                         let _ = machine.set_state(SessionState::Running);
                         match drive(&mut machine, &mut commands, child, &session).await {
                             TurnEnd::Done | TurnEnd::Cancelled => {
-                                if machine.state.borrow().clone() == SessionState::Failed {
+                                if matches!(*machine.state.borrow(), SessionState::Failed { .. }) {
                                     break;
                                 }
                             }
                             TurnEnd::Failed => break,
                             TurnEnd::Shutdown => {
                                 machine.state.send_replace(SessionState::Closed);
-                                let _ =
-                                    machine.emit(ChatEvent::StateChanged(SessionState::Closed));
+                                let _ = machine.emit(ChatEvent::StateChanged(SessionState::Closed));
                                 return;
                             }
                         }
@@ -151,9 +139,7 @@ async fn run(mut machine: Machine, mut commands: mpsc::Receiver<Command>, sessio
                 }
             }
             Operation::Cancel => {
-                let _ = command
-                    .reply
-                    .send(Err(AdapterError::NoActiveTurn));
+                let _ = command.reply.send(Err(AdapterError::NoActiveTurn));
             }
             Operation::Steer(_) => {
                 let _ = command.reply.send(Err(AdapterError::Unsupported(
@@ -431,9 +417,12 @@ fn cursor_event(
             let raw = &value["tool_call"];
             let case = raw["tool"]["case"]
                 .as_str()
-                .or_else(|| raw["tool"].as_object().and_then(|tool| {
-                    tool.keys().find(|key| key.as_str() != "case")
-                }).map(String::as_str))
+                .or_else(|| {
+                    raw["tool"]
+                        .as_object()
+                        .and_then(|tool| tool.keys().find(|key| key.as_str() != "case"))
+                        .map(String::as_str)
+                })
                 .or_else(|| raw["case"].as_str())
                 .unwrap_or("tool");
             let payload = raw["tool"]["value"]
@@ -442,7 +431,10 @@ fn cursor_event(
                 .or_else(|| raw["tool"].get(case))
                 .unwrap_or(raw);
             let lower = case.to_ascii_lowercase();
-            let kind = if lower.contains("shell") || lower.contains("terminal") || lower.contains("command") {
+            let kind = if lower.contains("shell")
+                || lower.contains("terminal")
+                || lower.contains("command")
+            {
                 ToolKind::Exec
             } else if lower.contains("edit") || lower.contains("diff") || lower.contains("write") {
                 ToolKind::Edit
@@ -468,8 +460,8 @@ fn cursor_event(
                 .map(|_| &payload["args"])
                 .unwrap_or(payload);
             let completed = value["subtype"] == "completed";
-            let error = payload["isError"].as_bool().unwrap_or(false)
-                || !payload["error"].is_null();
+            let error =
+                payload["isError"].as_bool().unwrap_or(false) || !payload["error"].is_null();
             let output = host::text_content(&payload["result"]);
             let output = if output.is_empty() {
                 host::text_content(&payload["output"])
@@ -497,7 +489,10 @@ fn cursor_event(
             if !output.is_empty() {
                 tool.output = Some(bounded(output));
             }
-            if let Some(path) = payload["path"].as_str().or_else(|| payload["filePath"].as_str()) {
+            if let Some(path) = payload["path"]
+                .as_str()
+                .or_else(|| payload["filePath"].as_str())
+            {
                 let patch = payload["diff"]
                     .as_str()
                     .or_else(|| payload["patch"].as_str())
@@ -543,7 +538,11 @@ fn cursor_event(
                     text: pending_text.clone(),
                 })?;
                 pending_text.clear();
-            } else if !*emitted && value["result"].as_str().is_some_and(|text| !text.is_empty()) {
+            } else if !*emitted
+                && value["result"]
+                    .as_str()
+                    .is_some_and(|text| !text.is_empty())
+            {
                 machine.emit(ChatEvent::AssistantText {
                     id,
                     update: TextUpdate::Final,
@@ -551,7 +550,9 @@ fn cursor_event(
                 })?;
             }
             let error = value["is_error"].as_bool().unwrap_or(false)
-                || value["subtype"].as_str().is_some_and(|subtype| subtype != "success");
+                || value["subtype"]
+                    .as_str()
+                    .is_some_and(|subtype| subtype != "success");
             if error {
                 machine.emit(ChatEvent::Error {
                     code: "provider_turn_failed".into(),
@@ -775,10 +776,7 @@ mod tests {
                 _ => {}
             }
         }
-        assert_eq!(
-            error,
-            Some(("unanswerable_permission".to_string(), false))
-        );
+        assert_eq!(error, Some(("unanswerable_permission".to_string(), false)));
         assert!(!approval);
     }
 

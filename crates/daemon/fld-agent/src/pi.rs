@@ -9,15 +9,12 @@
 
 use crate::{
     host::{self, Wire},
-    process::{Interaction, Pending, PendingKind, checked_answers, nonempty, valid_text},
+    process::{Interaction, Machine, Pending, PendingKind, checked_answers, nonempty, valid_text},
     *,
 };
 use futures::StreamExt;
 use serde_json::{Value, json};
-use std::{
-    collections::HashMap,
-    time::Instant,
-};
+use std::{collections::HashMap, time::Instant};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::codec::LinesCodec;
 
@@ -55,7 +52,12 @@ impl Pi {
         id
     }
 
-    fn pending(machine: &mut Machine, id: &str, kind: PendingKind, reply: Option<oneshot::Sender<Result<()>>>) {
+    fn pending(
+        machine: &mut Machine,
+        id: &str,
+        kind: PendingKind,
+        reply: Option<oneshot::Sender<Result<()>>>,
+    ) {
         machine.pending.insert(
             id.into(),
             Pending {
@@ -201,10 +203,18 @@ impl Pi {
                 message: bounded(value.to_string()).text,
                 fatal: false,
             })?,
-            "auto_retry_start" | "auto_retry_end" | "compaction_start" | "compaction_end"
-            | "summarization_retry_scheduled" | "summarization_retry_attempt_start"
-            | "summarization_retry_finished" | "queue_update" | "entry_appended"
-            | "session_info_changed" | "thinking_level_changed" | "bash_execution_update" => {}
+            "auto_retry_start"
+            | "auto_retry_end"
+            | "compaction_start"
+            | "compaction_end"
+            | "summarization_retry_scheduled"
+            | "summarization_retry_attempt_start"
+            | "summarization_retry_finished"
+            | "queue_update"
+            | "entry_appended"
+            | "session_info_changed"
+            | "thinking_level_changed"
+            | "bash_execution_update" => {}
             other => machine.emit(ChatEvent::Diagnostic {
                 stream: "pi".into(),
                 output: bounded(format!("unhandled Pi event {other}")),
@@ -440,15 +450,13 @@ impl Wire for Pi {
                     Ok(())
                 }
             }),
-            Operation::Steer(text) => {
-                valid_text(text).and_then(|_| {
-                    if machine.active_turn.is_none() {
-                        Err(AdapterError::NoActiveTurn)
-                    } else {
-                        Ok(())
-                    }
-                })
-            }
+            Operation::Steer(text) => valid_text(text).and_then(|_| {
+                if machine.active_turn.is_none() {
+                    Err(AdapterError::NoActiveTurn)
+                } else {
+                    Ok(())
+                }
+            }),
             Operation::Cancel => {
                 if machine.active_turn.is_none() {
                     Err(AdapterError::NoActiveTurn)
@@ -611,7 +619,9 @@ impl Pi {
                     message,
                     fatal: false,
                 })?;
-                return machine.end_turn(None, 1, TurnOutcome::Failed).map(|_| Vec::new());
+                return machine
+                    .end_turn(None, 1, TurnOutcome::Failed)
+                    .map(|_| Vec::new());
             }
             return Ok(Vec::new());
         }
@@ -624,12 +634,12 @@ impl Pi {
                     .ok_or_else(|| AdapterError::Protocol("Pi get_state lacks sessionId".into()))?
                     .to_owned();
                 new_session_id(&session)?;
-                if let Some(target) = &self.resume {
-                    if target != &session {
-                        return Err(AdapterError::InvalidResume(
-                            "Pi resumed a different session ID".into(),
-                        ));
-                    }
+                if let Some(target) = &self.resume
+                    && target != &session
+                {
+                    return Err(AdapterError::InvalidResume(
+                        "Pi resumed a different session ID".into(),
+                    ));
                 }
                 if machine.info.model.is_none()
                     && let Some(model) = data["model"]["id"].as_str()
@@ -659,9 +669,7 @@ impl Pi {
                 }
                 Ok(Vec::new())
             }
-            _ => Err(AdapterError::Protocol(
-                "unexpected Pi response kind".into(),
-            )),
+            _ => Err(AdapterError::Protocol("unexpected Pi response kind".into())),
         }
     }
 }
@@ -696,7 +704,10 @@ pub(crate) async fn launch(provider: ProviderSpec, config: SessionConfig) -> Res
             "Pi/OMP rpc settings go through provider args or env".into(),
         ));
     }
-    let resume = config.resume.as_ref().map(|target| target.native_id.clone());
+    let resume = config
+        .resume
+        .as_ref()
+        .map(|target| target.native_id.clone());
     if let Some(resume) = &resume {
         host::uuid(resume, "Pi")?;
     }
@@ -920,18 +931,20 @@ mod tests {
             let (wire, machine, mut events) = ready(fixture);
             assert_eq!(machine.info.resume.native_id, session);
             assert_eq!(wire.resume, None);
-            assert!(drain(&mut events).iter().any(|record| matches!(
-                record.event,
-                ChatEvent::SessionReady(_)
-            )));
+            assert!(
+                drain(&mut events)
+                    .iter()
+                    .any(|record| matches!(record.event, ChatEvent::SessionReady(_)))
+            );
             assert_eq!(machine.state.borrow().clone(), SessionState::Idle);
         }
     }
 
     #[test]
     fn synthetic_turn_normalizes_text_thinking_tools_and_usage() {
-        let (mut wire, mut machine, mut events) =
-            ready(include_str!("../tests/fixtures/pi-handshake.recorded.jsonl"));
+        let (mut wire, mut machine, mut events) = ready(include_str!(
+            "../tests/fixtures/pi-handshake.recorded.jsonl"
+        ));
         let (reply, _) = tokio::sync::oneshot::channel();
         wire.operation(&mut machine, Operation::Send("pwd".into()), reply)
             .unwrap();
@@ -970,8 +983,9 @@ mod tests {
 
     #[test]
     fn extension_confirmation_requires_an_explicit_denial() {
-        let (mut wire, mut machine, mut events) =
-            ready(include_str!("../tests/fixtures/pi-handshake.recorded.jsonl"));
+        let (mut wire, mut machine, mut events) = ready(include_str!(
+            "../tests/fixtures/pi-handshake.recorded.jsonl"
+        ));
         wire.incoming(
             &mut machine,
             serde_json::json!({
@@ -1031,9 +1045,9 @@ mod tests {
         assert!(matches!(
             wire.incoming(
                 &mut machine,
-                serde_json::from_str(
-                    include_str!("../tests/fixtures/pi-handshake.recorded.jsonl")
-                )
+                serde_json::from_str(include_str!(
+                    "../tests/fixtures/pi-handshake.recorded.jsonl"
+                ))
                 .unwrap()
             ),
             Err(AdapterError::InvalidResume(_))
@@ -1042,8 +1056,9 @@ mod tests {
 
     #[test]
     fn rejected_prompt_ends_the_turn_as_failed() {
-        let (mut wire, mut machine, mut events) =
-            ready(include_str!("../tests/fixtures/pi-handshake.recorded.jsonl"));
+        let (mut wire, mut machine, mut events) = ready(include_str!(
+            "../tests/fixtures/pi-handshake.recorded.jsonl"
+        ));
         let (reply, _) = tokio::sync::oneshot::channel();
         wire.operation(&mut machine, Operation::Send("hi".into()), reply)
             .unwrap();

@@ -541,7 +541,12 @@ mod tests {
             vec!["fl", "worktree", "checks"],
             vec!["fl", "worktree", "diff-summary"],
             vec!["fl", "worktree", "review-list"],
-            vec!["fl", "worktree", "review-get", "00000000-0000-0000-0000-000000000001"],
+            vec![
+                "fl",
+                "worktree",
+                "review-get",
+                "00000000-0000-0000-0000-000000000001",
+            ],
             vec![
                 "fl",
                 "worktree",
@@ -636,7 +641,12 @@ mod tests {
             vec!["fl", "chat", "close"],
             vec!["fl", "history", "list"],
             vec!["fl", "history", "list", "--query", "fix"],
-            vec!["fl", "history", "get", "00000000-0000-0000-0000-000000000001"],
+            vec![
+                "fl",
+                "history",
+                "get",
+                "00000000-0000-0000-0000-000000000001",
+            ],
             vec!["fl", "agent", "send", "hello"],
             vec!["fl", "agent", "send", "--interrupt", "stop"],
             vec!["fl", "agent", "send", "--queue", "--wait-until-idle", "hi"],
@@ -654,8 +664,16 @@ mod tests {
         let mut root = Cli::command();
         let help = root.render_long_help().to_string();
         for command in [
-            "status", "workspace", "section", "worktree", "project", "tab", "layout", "chat",
-            "history", "agent",
+            "status",
+            "workspace",
+            "section",
+            "worktree",
+            "project",
+            "tab",
+            "layout",
+            "chat",
+            "history",
+            "agent",
         ] {
             assert!(help.contains(command), "root help omits {command}:\n{help}");
         }
@@ -677,7 +695,10 @@ mod tests {
             "set-label",
             "set-target-branch",
         ] {
-            assert!(help.contains(command), "worktree help omits {command}:\n{help}");
+            assert!(
+                help.contains(command),
+                "worktree help omits {command}:\n{help}"
+            );
         }
     }
 
@@ -691,14 +712,8 @@ mod tests {
             Cli::try_parse_from(["fl", "agent", "send", "--queue", "--interrupt", "hi"]).is_err()
         );
         assert!(
-            Cli::try_parse_from([
-                "fl",
-                "worktree",
-                "set-target-branch",
-                "main",
-                "--clear"
-            ])
-            .is_err()
+            Cli::try_parse_from(["fl", "worktree", "set-target-branch", "main", "--clear"])
+                .is_err()
         );
     }
 }

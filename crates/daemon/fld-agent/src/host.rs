@@ -6,7 +6,7 @@
 //! `acp.rs`, `pi.rs` and `cursor.rs`; this module only moves bytes, enforces
 //! limits and drives the common lifecycle.
 
-use crate::*;
+use crate::{process::Machine, *};
 use futures::StreamExt;
 use serde_json::Value;
 use std::{collections::HashMap, process::Stdio, time::Duration};
@@ -193,15 +193,33 @@ pub(crate) async fn serve(
 ) {
     let group = Guard::new(&child);
     let Some(mut input) = child.stdin.take() else {
-        finalize(machine, None, false, Some(AdapterError::Closed("missing stdin".into()))).await;
+        finalize(
+            machine,
+            None,
+            false,
+            Some(AdapterError::Closed("missing stdin".into())),
+        )
+        .await;
         return;
     };
     let Some(stdout) = child.stdout.take() else {
-        finalize(machine, None, false, Some(AdapterError::Closed("missing stdout".into()))).await;
+        finalize(
+            machine,
+            None,
+            false,
+            Some(AdapterError::Closed("missing stdout".into())),
+        )
+        .await;
         return;
     };
     let Some(stderr) = child.stderr.take() else {
-        finalize(machine, None, false, Some(AdapterError::Closed("missing stderr".into()))).await;
+        finalize(
+            machine,
+            None,
+            false,
+            Some(AdapterError::Closed("missing stderr".into())),
+        )
+        .await;
         return;
     };
     let mut output = FramedRead::new(stdout, LinesCodec::new_with_max_length(MAX_WIRE_LINE));
@@ -341,10 +359,7 @@ pub(crate) async fn capture(
     args: &[&str],
     timeout: Duration,
 ) -> Result<String> {
-    let mut child = command(provider)
-        .args(args)
-        .stdin(Stdio::null())
-        .spawn()?;
+    let mut child = command(provider).args(args).stdin(Stdio::null()).spawn()?;
     let group = Guard::new(&child);
     let stdout = child
         .stdout
@@ -398,10 +413,7 @@ pub(crate) fn text_content(value: &Value) -> String {
             if let Some(text) = object.get("text").and_then(Value::as_str) {
                 return text.to_owned();
             }
-            object
-                .get("content")
-                .map(text_content)
-                .unwrap_or_default()
+            object.get("content").map(text_content).unwrap_or_default()
         }
         _ => String::new(),
     }

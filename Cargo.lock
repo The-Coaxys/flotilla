@@ -2360,6 +2360,7 @@ dependencies = [
  "bytes",
  "postcard",
  "serde",
+ "serde_json",
  "smallvec",
  "thiserror 2.0.21",
  "uuid",

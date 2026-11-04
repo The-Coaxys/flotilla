@@ -90,6 +90,8 @@ pub struct Welcome {
     pub server_session_id: [u8; 16],
 }
 
+/// See `ServerMsg`: wire enums stay unboxed so the bytes remain stable.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ClientMsg {
     Hello(Hello),
@@ -98,6 +100,9 @@ pub enum ClientMsg {
     BindChannel(ChannelHello),
 }
 
+/// Wire enums keep their variants unboxed: postcard encodes the variant index
+/// first, and boxing a payload would change the bytes peers already exchange.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ServerMsg {
     Welcome(Welcome),
@@ -379,6 +384,8 @@ pub enum Request {
     GetSelectedWorkspace,
 }
 
+/// See `ServerMsg`: wire enums stay unboxed so the bytes remain stable.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Response {
     DaemonInfo(DaemonInfo),
@@ -1595,9 +1602,7 @@ mod tests {
             .validate()
             .is_err()
         );
-        assert!(
-            Request::ListChatHistory { limit: 0 }.validate().is_err()
-        );
+        assert!(Request::ListChatHistory { limit: 0 }.validate().is_err());
         assert!(
             Request::SetWorktreeTarget {
                 worktree,

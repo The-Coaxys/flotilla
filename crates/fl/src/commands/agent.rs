@@ -144,8 +144,11 @@ async fn target_session(
             "agent groups are not implemented in this daemon yet; address sessions with --session or label:<label>",
         ));
     }
-    Uuid::parse_str(target)
-        .map_err(|_| CliError::invalid(format!("`{target}` is not an id:<uuid> or label:<name> target")))
+    Uuid::parse_str(target).map_err(|_| {
+        CliError::invalid(format!(
+            "`{target}` is not an id:<uuid> or label:<name> target"
+        ))
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -185,7 +188,10 @@ async fn send(
             "agent steer",
         )?;
     } else {
-        if matches!(&session.status, SessionState::Starting | SessionState::Running) {
+        if matches!(
+            &session.status,
+            SessionState::Starting | SessionState::Running
+        ) {
             if !wait_until_idle {
                 return Err(CliError::unsupported(format!(
                     "session {} is {:?}; this daemon has no durable send queue yet — pass --interrupt or --wait-until-idle",

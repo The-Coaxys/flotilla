@@ -87,9 +87,9 @@ async fn get(
     let tree = tree(client).await?;
     let workspace = match needle {
         Some(needle) => find_workspace(&tree, needle)?,
-        None => selected(client)
-            .await?
-            .ok_or_else(|| CliError::not_found("no workspace is selected; run `fl workspace select <id|name>`"))?,
+        None => selected(client).await?.ok_or_else(|| {
+            CliError::not_found("no workspace is selected; run `fl workspace select <id|name>`")
+        })?,
     };
     let projects: Vec<_> = tree
         .projects
@@ -154,7 +154,10 @@ async fn select(
     if reporter.json {
         return reporter.value(&serde_json::json!({ "selected": selected }));
     }
-    reporter.text(format!("selected workspace {} ({})", selected.name, selected.id));
+    reporter.text(format!(
+        "selected workspace {} ({})",
+        selected.name, selected.id
+    ));
     Ok(())
 }
 

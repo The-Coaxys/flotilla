@@ -629,7 +629,7 @@ impl WorkspaceService {
         target: Option<String>,
     ) -> Result<Worktree, RpcError> {
         let _structure = self.structure.lock().await;
-        let (worktree, project) = self.worktree(id).await?;
+        let (_, project) = self.worktree(id).await?;
         if project.kind != ProjectKind::Git {
             return Err(invalid(format!(
                 "{} is a folder project; it has no target branch",

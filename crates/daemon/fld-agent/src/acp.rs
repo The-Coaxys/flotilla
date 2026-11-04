@@ -9,15 +9,12 @@
 
 use crate::{
     host::{self, Wire},
-    process::{Interaction, Pending, PendingKind, nonempty},
+    process::{Interaction, Machine, Pending, PendingKind, nonempty, valid_text},
     *,
 };
 use futures::StreamExt;
 use serde_json::{Value, json};
-use std::{
-    collections::HashMap,
-    time::Instant,
-};
+use std::{collections::HashMap, time::Instant};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::codec::LinesCodec;
 
@@ -146,8 +143,12 @@ impl Acp {
                 self.tools.insert(tool.id.clone(), tool.clone());
                 machine.emit(ChatEvent::ToolCall(tool))?;
             }
-            "plan" | "available_commands_update" | "current_mode_update"
-            | "config_option_update" | "session_info_update" | "usage_update" => {}
+            "plan"
+            | "available_commands_update"
+            | "current_mode_update"
+            | "config_option_update"
+            | "session_info_update"
+            | "usage_update" => {}
             other => machine.emit(ChatEvent::Diagnostic {
                 stream: "acp".into(),
                 output: bounded(format!("unhandled ACP session update {other}")),
@@ -179,13 +180,17 @@ impl Acp {
             Some("execute") => ToolKind::Exec,
             Some("fetch") => ToolKind::Web,
             Some(_) => ToolKind::Other,
-            None => existing.map(|tool| tool.kind).unwrap_or(ToolKind::Other),
+            None => existing
+                .map(|tool| tool.kind.clone())
+                .unwrap_or(ToolKind::Other),
         };
         let status = match update["status"].as_str() {
             Some("pending" | "in_progress") => ToolStatus::Running,
             Some("completed") => ToolStatus::Completed,
             Some("failed") => ToolStatus::Failed,
-            Some(_) | None => existing.map(|tool| tool.status).unwrap_or(ToolStatus::Running),
+            Some(_) | None => existing
+                .map(|tool| tool.status.clone())
+                .unwrap_or(ToolStatus::Running),
         };
         let input_summary = update["rawInput"]
             .is_null()
@@ -257,7 +262,9 @@ impl Wire for Acp {
             return Ok(Vec::new());
         }
         let Some(wire_id) = value.get("id") else {
-            return Err(AdapterError::Protocol("ACP message lacks method or id".into()));
+            return Err(AdapterError::Protocol(
+                "ACP message lacks method or id".into(),
+            ));
         };
         let key = wire_key(wire_id);
         if self.prompt_wire.as_deref() == Some(key.as_str()) {
@@ -265,7 +272,8 @@ impl Wire for Acp {
             self.permissions.clear();
             self.tools.clear();
             if let Some(error) = value.get("error") {
-                return self.fail(machine, error.to_string());
+                self.fail(machine, error.to_string())?;
+                return Ok(Vec::new());
             }
             let result = &value["result"];
             let stop = string(result, "stopReason");
@@ -317,13 +325,11 @@ impl Wire for Acp {
                         "ACP agent speaks protocol {version}, adapter speaks {VERSION}"
                     )));
                 }
-                if let Some(info) = result.get("agentInfo") {
-                    if machine.info.model.is_none() {
-                        if let Some(model) = result["models"]["currentModelId"].as_str() {
-                            machine.info.model = Some(model.into());
-                        }
-                    }
-                    let _ = info;
+                if result.get("agentInfo").is_some()
+                    && machine.info.model.is_none()
+                    && let Some(model) = result["models"]["currentModelId"].as_str()
+                {
+                    machine.info.model = Some(model.into());
                 }
                 let load = result["agentCapabilities"]["loadSession"]
                     .as_bool()
@@ -375,12 +381,12 @@ impl Wire for Acp {
                     .map(str::to_owned)
                     .or_else(|| machine.config.resume.as_ref().map(|r| r.native_id.clone()))
                     .ok_or_else(|| AdapterError::Protocol("ACP session lacks sessionId".into()))?;
-                if let Some(target) = &machine.config.resume {
-                    if session != target.native_id {
-                        return Err(AdapterError::InvalidResume(
-                            "ACP agent resumed a different session ID".into(),
-                        ));
-                    }
+                if let Some(target) = &machine.config.resume
+                    && session != target.native_id
+                {
+                    return Err(AdapterError::InvalidResume(
+                        "ACP agent resumed a different session ID".into(),
+                    ));
                 }
                 if let Some(model) = result["models"]["currentModelId"].as_str() {
                     machine.info.model = Some(model.into());
@@ -535,7 +541,12 @@ impl Wire for Acp {
 }
 
 impl Acp {
-    fn request(&mut self, machine: &mut Machine, method: &str, value: &Value) -> Result<Vec<Value>> {
+    fn request(
+        &mut self,
+        machine: &mut Machine,
+        method: &str,
+        value: &Value,
+    ) -> Result<Vec<Value>> {
         let wire_id = value
             .get("id")
             .filter(|id| id.is_string() || id.is_number())
@@ -563,10 +574,7 @@ impl Acp {
             })]);
         }
         let tool = &params["toolCall"];
-        let readish = matches!(
-            tool["kind"].as_str(),
-            Some("read" | "search" | "fetch")
-        );
+        let readish = matches!(tool["kind"].as_str(), Some("read" | "search" | "fetch"));
         if machine.config.permission_mode == PermissionMode::ReadOnly && !readish {
             machine.emit(ChatEvent::Error {
                 code: "permission_denied".into(),
@@ -989,7 +997,10 @@ mod tests {
         assert!(out.is_empty());
         assert!(drain(&mut events).iter().any(|record| matches!(
             record.event,
-            ChatEvent::TurnEnd { outcome: TurnOutcome::Completed, .. }
+            ChatEvent::TurnEnd {
+                outcome: TurnOutcome::Completed,
+                ..
+            }
         )));
     }
 
@@ -1022,16 +1033,17 @@ mod tests {
 
     #[test]
     fn malformed_updates_and_wrong_protocol_fail_closed() {
-        let (mut wire, mut machine, _) = ready();
+        let (mut wire, mut state_machine, _) = ready();
         assert!(matches!(
-            wire.update(&mut machine, &serde_json::json!({})),
+            wire.update(&mut state_machine, &serde_json::json!({})),
             Err(AdapterError::Protocol(_))
         ));
-        let (mut wire, mut machine, _) = machine();
-        wire.start(&mut machine).unwrap();
+        let (mut accepted, _) = machine();
+        let mut wire = Acp::new();
+        wire.start(&mut accepted).unwrap();
         assert!(matches!(
             wire.incoming(
-                &mut machine,
+                &mut accepted,
                 serde_json::json!({
                     "jsonrpc": "2.0", "id": 1,
                     "result": {"protocolVersion": 2, "agentCapabilities": {}}
@@ -1043,7 +1055,8 @@ mod tests {
 
     #[test]
     fn resume_without_an_advertised_capability_is_rejected() {
-        let (mut wire, mut machine, _) = machine();
+        let (mut machine, _) = machine();
+        let mut wire = Acp::new();
         machine.config.resume = Some(ResumeTarget {
             provider_id: "opencode".into(),
             adapter: AdapterKind::Acp,
@@ -1064,7 +1077,7 @@ mod tests {
     }
 
     #[test]
-    fn read_only_denies_ACP_execution_without_an_approval_card() {
+    fn read_only_denies_acp_execution_without_an_approval_card() {
         let (mut wire, mut machine, mut events) = ready();
         let session = wire.session.clone();
         machine.config.permission_mode = PermissionMode::ReadOnly;
@@ -1082,10 +1095,11 @@ mod tests {
             )
             .unwrap();
         assert_eq!(out[0]["result"]["outcome"]["outcome"], "cancelled");
-        assert!(!drain(&mut events).iter().any(|record| matches!(
-            record.event,
-            ChatEvent::ApprovalRequest { .. }
-        )));
+        assert!(
+            !drain(&mut events)
+                .iter()
+                .any(|record| matches!(record.event, ChatEvent::ApprovalRequest { .. }))
+        );
     }
 
     #[test]
@@ -1100,9 +1114,10 @@ mod tests {
             }),
         )
         .unwrap();
-        assert!(drain(&mut events).iter().any(|record| matches!(
-            &record.event,
-            ChatEvent::Diagnostic { .. }
-        )));
+        assert!(
+            drain(&mut events)
+                .iter()
+                .any(|record| matches!(&record.event, ChatEvent::Diagnostic { .. }))
+        );
     }
 }

@@ -22,7 +22,18 @@ pub async fn run(
             model,
             thinking,
             permission_mode,
-        } => new(client, reporter, cli, provider, model, thinking, *permission_mode).await,
+        } => {
+            new(
+                client,
+                reporter,
+                cli,
+                provider,
+                model,
+                thinking,
+                *permission_mode,
+            )
+            .await
+        }
         ChatCommand::Send { session, message } => {
             send(client, reporter, cli, *session, message).await
         }
@@ -65,11 +76,7 @@ async fn providers(client: &mut DaemonClient, reporter: &Reporter) -> Result<(),
     Ok(())
 }
 
-async fn list(
-    client: &mut DaemonClient,
-    reporter: &Reporter,
-    cli: &Cli,
-) -> Result<(), CliError> {
+async fn list(client: &mut DaemonClient, reporter: &Reporter, cli: &Cli) -> Result<(), CliError> {
     let (worktree, _project) = resolve_worktree(client, cli).await?;
     let sessions = list_sessions(client, worktree.id).await?;
     if reporter.json {
@@ -153,9 +160,7 @@ async fn send(
         return Err(CliError::invalid("message is empty"));
     }
     done(
-        client
-            .rpc(Request::SendChat { session, text })
-            .await?,
+        client.rpc(Request::SendChat { session, text }).await?,
         "chat send",
     )?;
     if reporter.json {
@@ -248,7 +253,6 @@ async fn close(
 pub async fn run_history(
     client: &mut DaemonClient,
     reporter: &Reporter,
-    cli: &Cli,
     command: &HistoryCommand,
 ) -> Result<(), CliError> {
     match command {
@@ -354,7 +358,10 @@ fn event_summary(event: &ChatEvent) -> String {
             format!("question {id} ({} parts)", questions.len())
         }
         ChatEvent::RequestResolved { id } => format!("request {id} resolved"),
-        ChatEvent::Subagent { parent_tool_id, events } => {
+        ChatEvent::Subagent {
+            parent_tool_id,
+            events,
+        } => {
             format!("subagent {parent_tool_id} ({} events)", events.len())
         }
         ChatEvent::TurnEnd { outcome, turns, .. } => {

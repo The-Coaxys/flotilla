@@ -296,7 +296,10 @@ mod tests {
             let json = serde_json::to_string(&adapter).unwrap();
             assert_eq!(serde_json::from_str::<AdapterKind>(&json).unwrap(), adapter);
             let bytes = postcard::to_stdvec(&adapter).unwrap();
-            assert_eq!(postcard::from_bytes::<AdapterKind>(&bytes).unwrap(), adapter);
+            assert_eq!(
+                postcard::from_bytes::<AdapterKind>(&bytes).unwrap(),
+                adapter
+            );
             let json = serde_json::to_string(&resume).unwrap();
             assert_eq!(
                 serde_json::from_str::<ResumeStrategy>(&json).unwrap(),

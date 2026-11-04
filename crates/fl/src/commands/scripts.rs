@@ -23,11 +23,7 @@ pub async fn run(
     }
 }
 
-async fn check(
-    client: &mut DaemonClient,
-    reporter: &Reporter,
-    cli: &Cli,
-) -> Result<(), CliError> {
+async fn check(client: &mut DaemonClient, reporter: &Reporter, cli: &Cli) -> Result<(), CliError> {
     let (worktree, _project) = resolve_worktree(client, cli).await?;
     let check: ProjectScriptCheck = match client
         .rpc(Request::CheckProjectScripts {
@@ -39,10 +35,7 @@ async fn check(
         other => return Err(unexpected("script check", &other)),
     };
     if let Some(error) = &check.error {
-        return Err(CliError::invalid(format!(
-            "{}: {error}",
-            check.config_path
-        )));
+        return Err(CliError::invalid(format!("{}: {error}", check.config_path)));
     }
     if reporter.json {
         return reporter.value(&serde_json::json!({

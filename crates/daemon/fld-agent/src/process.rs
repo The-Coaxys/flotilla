@@ -554,11 +554,9 @@ impl Machine {
         match self.provider.adapter {
             AdapterKind::ClaudeStream => self.claude_incoming(value),
             AdapterKind::CodexAppServer => self.codex_incoming(value),
-            AdapterKind::Acp | AdapterKind::CursorStreamJson | AdapterKind::PiRpc => {
-                Err(AdapterError::Unsupported(
-                    "legacy machine does not speak this adapter".into(),
-                ))
-            }
+            AdapterKind::Acp | AdapterKind::CursorStreamJson | AdapterKind::PiRpc => Err(
+                AdapterError::Unsupported("legacy machine does not speak this adapter".into()),
+            ),
         }
     }
     fn operation(
@@ -569,11 +567,9 @@ impl Machine {
         match self.provider.adapter {
             AdapterKind::ClaudeStream => self.claude_operation(operation, reply),
             AdapterKind::CodexAppServer => self.codex_operation(operation, reply),
-            AdapterKind::Acp | AdapterKind::CursorStreamJson | AdapterKind::PiRpc => {
-                Err(AdapterError::Unsupported(
-                    "legacy machine does not speak this adapter".into(),
-                ))
-            }
+            AdapterKind::Acp | AdapterKind::CursorStreamJson | AdapterKind::PiRpc => Err(
+                AdapterError::Unsupported("legacy machine does not speak this adapter".into()),
+            ),
         }
     }
 }

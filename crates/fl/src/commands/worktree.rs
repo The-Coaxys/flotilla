@@ -1,11 +1,11 @@
 //! `fl worktree …`: status, checks, diff summaries and reviews.
 use std::collections::BTreeMap;
 
+use fl_model::WorktreeId;
 use fl_model::review::{
     LineRange, ReviewAnchor, ReviewMutation, ReviewOrigin, ReviewState, ReviewStatus, ReviewThread,
 };
 use fl_model::workspace::{ChangeKind, WorktreeStatus};
-use fl_model::WorktreeId;
 use fl_proto::{Request, Response};
 use uuid::Uuid;
 
@@ -26,21 +26,14 @@ pub async fn run(
         WorktreeCommand::Checks => checks(client, reporter, cli).await,
         WorktreeCommand::DiffSummary => diff_summary(client, reporter, cli).await,
         WorktreeCommand::ReviewList => review_list(client, reporter, cli).await,
-        WorktreeCommand::ReviewGet { thread } => {
-            review_get(client, reporter, cli, *thread).await
-        }
+        WorktreeCommand::ReviewGet { thread } => review_get(client, reporter, cli, *thread).await,
         WorktreeCommand::ReviewAdd {
             path,
             start,
             end,
             body,
             origin,
-        } => {
-            review_add(
-                client, reporter, cli, path, *start, *end, body, *origin,
-            )
-            .await
-        }
+        } => review_add(client, reporter, cli, path, *start, *end, body, *origin).await,
         WorktreeCommand::ReviewReply {
             thread,
             body,
@@ -63,20 +56,13 @@ async fn worktree_status(
     client: &mut DaemonClient,
     worktree: WorktreeId,
 ) -> Result<WorktreeStatus, CliError> {
-    match client
-        .rpc(Request::WorktreeStatus { worktree })
-        .await?
-    {
+    match client.rpc(Request::WorktreeStatus { worktree }).await? {
         Response::WorktreeStatus(status) => Ok(status),
         other => Err(unexpected("worktree status", &other)),
     }
 }
 
-async fn status(
-    client: &mut DaemonClient,
-    reporter: &Reporter,
-    cli: &Cli,
-) -> Result<(), CliError> {
+async fn status(client: &mut DaemonClient, reporter: &Reporter, cli: &Cli) -> Result<(), CliError> {
     let (worktree, _project) = resolve_worktree(client, cli).await?;
     let status = worktree_status(client, worktree.id).await?;
     if reporter.json {
@@ -122,11 +108,7 @@ async fn status(
     Ok(())
 }
 
-async fn checks(
-    client: &mut DaemonClient,
-    reporter: &Reporter,
-    cli: &Cli,
-) -> Result<(), CliError> {
+async fn checks(client: &mut DaemonClient, reporter: &Reporter, cli: &Cli) -> Result<(), CliError> {
     let (worktree, _project) = resolve_worktree(client, cli).await?;
     let forge = match client
         .rpc(Request::ForgeStatus {
@@ -168,7 +150,16 @@ async fn checks(
                 checks_status.map_or("none".into(), |status| format!("{status:?}"))
             ));
             for check in &pr.checks {
-                reporter.text(format!("  {:?} {}{}", check.status, check.name, check.url.as_deref().map(|url| format!(" {url}")).unwrap_or_default()));
+                reporter.text(format!(
+                    "  {:?} {}{}",
+                    check.status,
+                    check.name,
+                    check
+                        .url
+                        .as_deref()
+                        .map(|url| format!(" {url}"))
+                        .unwrap_or_default()
+                ));
             }
         }
     }
@@ -278,8 +269,14 @@ async fn review_list(
             thread.triage,
             thread.origin,
             thread.anchor.path,
-            thread.anchor.lines.map_or("-".into(), |lines| lines.start.to_string()),
-            thread.anchor.lines.map_or(String::new(), |lines| format!("-{}", lines.end)),
+            thread
+                .anchor
+                .lines
+                .map_or("-".into(), |lines| lines.start.to_string()),
+            thread
+                .anchor
+                .lines
+                .map_or(String::new(), |lines| format!("-{}", lines.end)),
             thread.comments.len()
         ));
     }

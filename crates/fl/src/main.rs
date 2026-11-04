@@ -19,7 +19,8 @@ fn main() -> ExitCode {
     {
         Ok(runtime) => runtime,
         Err(error) => {
-            error::CliError::internal(format!("cannot start the async runtime: {error}")).print(json);
+            error::CliError::internal(format!("cannot start the async runtime: {error}"))
+                .print(json);
             return ExitCode::FAILURE;
         }
     };

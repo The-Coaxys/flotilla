@@ -26,11 +26,11 @@ pub fn socket_path() -> Result<PathBuf, CliError> {
 }
 
 #[cfg(unix)]
-use std::time::Duration;
-#[cfg(unix)]
 use fl_proto::{ClientMsg, Hello, PRODUCT_VERSION, PROTO, ServerMsg};
 #[cfg(unix)]
 use fl_transport::conn::{FrameReader, FrameWriter, framed};
+#[cfg(unix)]
+use std::time::Duration;
 #[cfg(unix)]
 use tokio::net::UnixStream;
 

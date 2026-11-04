@@ -3,8 +3,8 @@ mod agent;
 mod chat;
 mod layout;
 mod scripts;
-mod worktree;
 mod workspace;
+mod worktree;
 
 use std::io::Read;
 
@@ -32,25 +32,19 @@ pub async fn run(cli: &Cli) -> Result<(), CliError> {
         Command::Section { command } => {
             workspace::run_section(&mut client, &reporter, cli, command).await
         }
-        Command::Worktree { command } => {
-            worktree::run(&mut client, &reporter, cli, command).await
-        }
+        Command::Worktree { command } => worktree::run(&mut client, &reporter, cli, command).await,
         Command::Project { command } => scripts::run(&mut client, &reporter, cli, command).await,
         Command::Tab { command } => layout::run_tab(&mut client, &reporter, cli, command).await,
         Command::Layout { command } => {
             layout::run_layout(&mut client, &reporter, cli, command).await
         }
         Command::Chat { command } => chat::run(&mut client, &reporter, cli, command).await,
-        Command::History { command } => chat::run_history(&mut client, &reporter, cli, command).await,
+        Command::History { command } => chat::run_history(&mut client, &reporter, command).await,
         Command::Agent { command } => agent::run(&mut client, &reporter, cli, command).await,
     }
 }
 
-async fn status(
-    client: &mut DaemonClient,
-    reporter: &Reporter,
-    cli: &Cli,
-) -> Result<(), CliError> {
+async fn status(client: &mut DaemonClient, reporter: &Reporter, cli: &Cli) -> Result<(), CliError> {
     let daemon = match client.rpc(Request::DaemonInfo).await? {
         Response::DaemonInfo(info) => info,
         other => return Err(unexpected("daemon info", &other)),
@@ -109,10 +103,7 @@ pub async fn caller(client: &mut DaemonClient, _cli: &Cli) -> Result<CallerConte
     // A malformed environment value must not break commands that do not need
     // a chat session; commands that do call `env_session` themselves.
     let session = env_session().ok().flatten();
-    match client
-        .rpc(Request::ResolveCaller { cwd, session })
-        .await?
-    {
+    match client.rpc(Request::ResolveCaller { cwd, session }).await? {
         Response::Caller(caller) => Ok(caller),
         other => Err(unexpected("caller context", &other)),
     }
@@ -120,13 +111,13 @@ pub async fn caller(client: &mut DaemonClient, _cli: &Cli) -> Result<CallerConte
 
 pub fn env_session() -> Result<Option<Uuid>, CliError> {
     match std::env::var("FLOTILLA_SESSION_ID") {
-        Ok(value) if !value.trim().is_empty() => Uuid::parse_str(value.trim())
-            .map(Some)
-            .map_err(|_| {
+        Ok(value) if !value.trim().is_empty() => {
+            Uuid::parse_str(value.trim()).map(Some).map_err(|_| {
                 CliError::invalid(format!(
                     "FLOTILLA_SESSION_ID `{value}` is not a chat session id"
                 ))
-            }),
+            })
+        }
         _ => Ok(None),
     }
 }
@@ -318,19 +309,20 @@ pub async fn get_session(client: &mut DaemonClient, id: Uuid) -> Result<ChatSess
     }
 }
 
-pub fn session_from(
-    explicit: Option<Uuid>,
-    caller: &CallerContext,
-) -> Result<Uuid, CliError> {
+pub fn session_from(explicit: Option<Uuid>, caller: &CallerContext) -> Result<Uuid, CliError> {
     if let Some(id) = explicit {
         return Ok(id);
     }
     if let Some(id) = env_session()? {
         return Ok(id);
     }
-    caller.session.as_ref().map(|session| session.id).ok_or_else(|| {
-        CliError::invalid("no chat session; pass --session <uuid> or set FLOTILLA_SESSION_ID")
-    })
+    caller
+        .session
+        .as_ref()
+        .map(|session| session.id)
+        .ok_or_else(|| {
+            CliError::invalid("no chat session; pass --session <uuid> or set FLOTILLA_SESSION_ID")
+        })
 }
 
 pub fn read_message(message: &str) -> Result<String, CliError> {
@@ -351,7 +343,9 @@ pub fn read_message(message: &str) -> Result<String, CliError> {
 }
 
 pub fn unexpected(what: &str, response: &Response) -> CliError {
-    CliError::internal(format!("unexpected daemon response for {what}: {response:?}"))
+    CliError::internal(format!(
+        "unexpected daemon response for {what}: {response:?}"
+    ))
 }
 
 pub fn done(response: Response, what: &str) -> Result<(), CliError> {
