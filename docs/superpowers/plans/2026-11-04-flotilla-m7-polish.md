@@ -98,7 +98,6 @@ holds; no new wire calls.
   CRUD, performance HUD, keymap editor. Ctrl+Shift+P currently opens the palette; it is the
   documented PiP key and should move when PiP lands.
 
-<<<<<<< HEAD
 ### Slice: theme editor, keymap editor, and the Ctrl+Shift+P decision
 
 Native client only (`crates/client/flc-ui`, `flc-terminal`, `flc-shell`, `flc-editor`,
