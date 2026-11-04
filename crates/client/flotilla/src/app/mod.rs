@@ -3,6 +3,8 @@ mod add_host;
 mod git_actions;
 mod host_view;
 mod host_workspace;
+mod hover_card;
+mod palette;
 mod sidebar;
 mod titlebar;
 
@@ -21,7 +23,7 @@ use gpui::{
 use crate::hosts::HostStore;
 use crate::secrets::SecretStore;
 
-actions!(flotilla, [Quit, AddHost]);
+actions!(flotilla, [Quit, AddHost, PaletteGlobal, PaletteFiles]);
 
 /// The networking runtime, reachable from every view.
 pub struct Tokio(pub tokio::runtime::Handle);
@@ -31,10 +33,17 @@ impl Global for Tokio {}
 pub fn run(rt: tokio::runtime::Handle) {
     Application::new().run(move |cx: &mut App| {
         flc_ui::theme::init(cx);
+        flc_ui::input::bind_keys(cx);
         cx.set_global(Tokio(rt));
         cx.bind_keys([
             KeyBinding::new("alt-f4", Quit, None),
             KeyBinding::new("ctrl-shift-n", AddHost, None),
+            // Spec §8.3: Global on Ctrl+Shift+K; Ctrl+Shift+O goes straight to
+            // Files. Ctrl+Shift+P is the documented PiP key and opens the same
+            // palette until PiP lands.
+            KeyBinding::new("ctrl-shift-k", PaletteGlobal, None),
+            KeyBinding::new("ctrl-shift-p", PaletteGlobal, None),
+            KeyBinding::new("ctrl-shift-o", PaletteFiles, None),
         ]);
         cx.on_action(|_: &Quit, cx: &mut App| cx.quit());
         let bounds = Bounds::centered(None, size(px(1200.), px(780.)), cx);
@@ -440,6 +449,12 @@ impl Render for Workspace {
             .id("workspace")
             .key_context("Workspace")
             .on_action(cx.listener(|ws, _: &AddHost, window, cx| ws.open_add_host(window, cx)))
+            .on_action(cx.listener(|ws, _: &PaletteGlobal, _, cx| {
+                ws.request_palette(palette::Mode::Global, cx)
+            }))
+            .on_action(cx.listener(|ws, _: &PaletteFiles, _, cx| {
+                ws.request_palette(palette::Mode::Files, cx)
+            }))
             .size_full()
             .flex()
             .flex_col()
@@ -480,5 +495,6 @@ impl Render for Workspace {
                             .child(self.render_center(window, cx)),
                     ),
             )
+            .children(self.render_hover_card(cx))
     }
 }

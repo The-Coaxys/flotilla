@@ -4,6 +4,12 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
+#[path = "host_workspace/host_hover.rs"]
+mod host_hover;
+#[path = "host_workspace/host_launcher.rs"]
+mod host_launcher;
+#[path = "host_workspace/host_palette.rs"]
+mod host_palette;
 #[path = "host_review.rs"]
 mod review;
 
@@ -162,6 +168,14 @@ pub struct HostWorkspace {
     /// A direct git or forge action in flight ("Pushing…").
     git_busy: Option<&'static str>,
     git_menu: bool,
+    /// An open command palette, with its query input.
+    palette: Option<host_palette::Ui>,
+    /// A palette requested by an app-level keybinding; opened on next render.
+    pending_palette: Option<crate::app::palette::Mode>,
+    /// The hover card on screen, and the epoch that cancels pending ones.
+    hover: Option<host_hover::Shown>,
+    hover_pending: Option<host_hover::Target>,
+    hover_epoch: u64,
     /// Keeps the selected worktree's forge state fresh.
     _forge_poll: Option<Task<()>>,
     _follow: Task<()>,
@@ -306,6 +320,11 @@ impl HostWorkspace {
             refreshed_for: HashSet::new(),
             git_busy: None,
             git_menu: false,
+            palette: None,
+            pending_palette: None,
+            hover: None,
+            hover_pending: None,
+            hover_epoch: 0,
             _forge_poll: None,
             _follow: follow,
             _chat_follow: chat_follow,
@@ -1395,9 +1414,11 @@ impl HostWorkspace {
         });
         let hover = t.raised_hover;
         let primary = worktree.is_primary;
+        let card = host_hover::watch(cx.entity().downgrade(), host_hover::Target::Worktree(id));
         div()
             .id(SharedString::from(format!("worktree-{id}")))
             .group("worktree-row")
+            .on_hover(card)
             .h(px(28.))
             .pl(px(20.))
             .pr(px(8.))
@@ -2676,6 +2697,9 @@ impl Render for HostWorkspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = cx.theme().clone();
         self.apply_pending_chat(window, cx);
+        if let Some(mode) = self.pending_palette.take() {
+            self.open_palette(mode, window, cx);
+        }
         let strip = self
             .render_documents_strip(&t, cx)
             .map(IntoElement::into_any_element);
@@ -2688,10 +2712,12 @@ impl Render for HostWorkspace {
                 DocumentKind::Diff(diff) => diff.clone().into_any_element(),
             });
         let chat_session = self.chat.active_for(self.scope);
+        let launcher = self.launcher_visible();
         let content = match chat_session {
             Some(session) => self.render_chat_surface(session, window, cx),
             None => match active_document {
                 Some(document) => document,
+                None if launcher => self.render_launcher(window, &t, cx),
                 None => self.shell(window, cx).into_any_element(),
             },
         };
@@ -2744,5 +2770,6 @@ impl Render for HostWorkspace {
             .children(git_menu)
             .children(toasts)
             .children(dialog)
+            .children(self.render_palette(&t, cx))
     }
 }
